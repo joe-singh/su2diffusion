@@ -11,9 +11,20 @@ class DiffusionSchedule:
     T: int = 200
     beta_start: float = 1e-4
     beta_end: float = 0.005
+    kind: str = "linear"
 
     def tensors(self, device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        betas = torch.linspace(self.beta_start, self.beta_end, self.T, device=device)
+        if self.kind == "linear":
+            betas = torch.linspace(self.beta_start, self.beta_end, self.T, device=device)
+        elif self.kind == "cosine":
+            steps = torch.linspace(0.0, 1.0, self.T + 1, device=device)
+            sigma2_end = torch.tensor(self.beta_end * self.T, device=device)
+            interp = 1.0 - torch.cos(0.5 * math.pi * steps)
+            sigma2_edges = sigma2_end * interp
+            betas = (sigma2_edges[1:] - sigma2_edges[:-1]).clamp_min(1e-8)
+        else:
+            raise ValueError(f"Unknown diffusion schedule kind {self.kind!r}")
+
         sigma2 = torch.cumsum(betas, dim=0)
         sigmas = torch.sqrt(sigma2)
         return betas, sigma2, sigmas

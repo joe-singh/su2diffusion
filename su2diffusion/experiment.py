@@ -20,6 +20,7 @@ class ExperimentConfig:
     sample_count: int = 5000
     reference_count: int = 5000
     eta: float = 0.7
+    deterministic_eta: float = 0.0
 
 
 @dataclass
@@ -38,7 +39,15 @@ def get_experiment_config(name: str) -> ExperimentConfig:
     configs = {
         "smoke": ExperimentConfig(
             name="smoke",
-            schedule=DiffusionSchedule(T=30, beta_start=1e-4, beta_end=0.005),
+            schedule=DiffusionSchedule(T=30, beta_start=1e-4, beta_end=0.005, kind="linear"),
+            train=TrainConfig(batch_size=256, num_steps=20, hidden=64, n_terms=16),
+            sample_count=512,
+            reference_count=512,
+            eta=0.7,
+        ),
+        "smoke-cosine": ExperimentConfig(
+            name="smoke-cosine",
+            schedule=DiffusionSchedule(T=30, beta_start=1e-4, beta_end=0.005, kind="cosine"),
             train=TrainConfig(batch_size=256, num_steps=20, hidden=64, n_terms=16),
             sample_count=512,
             reference_count=512,
@@ -46,7 +55,15 @@ def get_experiment_config(name: str) -> ExperimentConfig:
         ),
         "medium": ExperimentConfig(
             name="medium",
-            schedule=DiffusionSchedule(T=100, beta_start=1e-4, beta_end=0.005),
+            schedule=DiffusionSchedule(T=100, beta_start=1e-4, beta_end=0.005, kind="linear"),
+            train=TrainConfig(batch_size=1024, num_steps=500, hidden=256, n_terms=64),
+            sample_count=2000,
+            reference_count=2000,
+            eta=0.7,
+        ),
+        "medium-cosine": ExperimentConfig(
+            name="medium-cosine",
+            schedule=DiffusionSchedule(T=100, beta_start=1e-4, beta_end=0.005, kind="cosine"),
             train=TrainConfig(batch_size=1024, num_steps=500, hidden=256, n_terms=64),
             sample_count=2000,
             reference_count=2000,
@@ -54,7 +71,15 @@ def get_experiment_config(name: str) -> ExperimentConfig:
         ),
         "baseline": ExperimentConfig(
             name="baseline",
-            schedule=DiffusionSchedule(T=200, beta_start=1e-4, beta_end=0.005),
+            schedule=DiffusionSchedule(T=200, beta_start=1e-4, beta_end=0.005, kind="linear"),
+            train=TrainConfig(batch_size=2048, num_steps=2000, hidden=512, n_terms=128),
+            sample_count=5000,
+            reference_count=5000,
+            eta=0.7,
+        ),
+        "baseline-cosine": ExperimentConfig(
+            name="baseline-cosine",
+            schedule=DiffusionSchedule(T=200, beta_start=1e-4, beta_end=0.005, kind="cosine"),
             train=TrainConfig(batch_size=2048, num_steps=2000, hidden=512, n_terms=128),
             sample_count=5000,
             reference_count=5000,
@@ -99,7 +124,7 @@ def run_experiment(
             model,
             config.schedule,
             n_samples=config.sample_count,
-            eta=0.0,
+            eta=config.deterministic_eta,
             device=device,
         )
         q_gen_sto = sample_reverse(
