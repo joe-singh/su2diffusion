@@ -1,7 +1,13 @@
 """Tools for toy diffusion experiments on SU(2)."""
 
-from .data import BlobConfig, DataConfig, gate_centers, sample_clean, sample_clean_blobs
-from .diagnostics import SampleDiagnostics, diagnose_samples, print_diagnostics_table, print_per_center_table
+from .data import BlobConfig, DataConfig, center_names_for_config, gate_centers, sample_clean, sample_clean_blobs
+from .diagnostics import (
+    SampleDiagnostics,
+    diagnose_samples,
+    print_center_mass_table,
+    print_diagnostics_table,
+    print_per_center_table,
+)
 from .diffusion import DiffusionSchedule, brownian_forward_heat_target, heat_epsilon_target
 from .experiment import ExperimentConfig, ExperimentResult, get_experiment_config, run_experiment
 from .forward_checks import ForwardProcessDiagnostics, diagnose_forward_process, print_forward_diagnostics
@@ -22,11 +28,13 @@ __all__ = [
     "SU2Denoiser",
     "TrainConfig",
     "brownian_forward_heat_target",
+    "center_names_for_config",
     "diagnose_samples",
     "diagnose_forward_process",
     "gate_centers",
     "get_experiment_config",
     "heat_epsilon_target",
+    "print_center_mass_table",
     "print_diagnostics_table",
     "print_per_center_table",
     "print_forward_diagnostics",

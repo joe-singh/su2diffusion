@@ -3,7 +3,7 @@ import torch
 from matplotlib import animation
 from typing import TYPE_CHECKING
 
-from .data import centers_for_config, default_centers, sample_clean_blobs
+from .data import center_names_for_config, centers_for_config, default_centers, sample_clean_blobs
 from .quaternion import sample_haar, su2_distance
 
 if TYPE_CHECKING:
@@ -82,6 +82,7 @@ def plot_loss(losses: list[float], title: str = "Training loss") -> None:
 def plot_center_mass(
     diagnostics: dict[str, "SampleDiagnostics"],
     title: str = "Nearest-center mass",
+    center_names: list[str] | None = None,
 ) -> None:
     names = list(diagnostics)
     if not names:
@@ -96,6 +97,12 @@ def plot_center_mass(
         offset = (i - (len(names) - 1) / 2) * width
         plt.bar((x + offset).tolist(), masses[i].tolist(), width=width, label=name)
 
+    if center_names is not None:
+        if len(center_names) != masses.shape[1]:
+            raise ValueError(f"Expected {masses.shape[1]} center names, got {len(center_names)}")
+        plt.xticks(x.tolist(), center_names)
+    else:
+        plt.xticks(x.tolist(), [str(i) for i in range(masses.shape[1])])
     plt.xlabel("nearest center")
     plt.ylabel("sample fraction")
     plt.ylim(0.0, max(1.0, float(masses.max().item()) * 1.15))
@@ -138,6 +145,7 @@ def plot_diagnostics_bars(
 def plot_experiment_report(result) -> None:
     """Render standard plots for an ExperimentResult."""
     centers = centers_for_config(result.config.data, device=result.clean_reference.device)
+    center_names = center_names_for_config(result.config.data)
     center_label = f"nearest {result.config.data.kind} center"
     plot_loss(result.losses, title=f"{result.config.name} training loss")
     plot_nearest_center_histogram(
@@ -152,7 +160,7 @@ def plot_experiment_report(result) -> None:
         center_label=center_label,
     )
     plot_diagnostics_bars(result.diagnostics)
-    plot_center_mass(result.diagnostics)
+    plot_center_mass(result.diagnostics, center_names=center_names)
 
 
 def animate_reverse_histogram(

@@ -47,6 +47,14 @@ def gate_centers(device: torch.device | str | None = None) -> torch.Tensor:
     return q_normalize(centers)
 
 
+def center_names_for_config(config: DataConfig | BlobConfig | None = None) -> list[str]:
+    if config is None or isinstance(config, BlobConfig) or config.kind == "blobs":
+        return ["blob 0", "blob 1", "blob 2", "blob 3"]
+    if config.kind == "gates":
+        return ["I", "X", "Y", "Z", "sqrt(X)", "sqrt(Y)", "sqrt(Z)"]
+    raise ValueError(f"Unknown data kind {config.kind!r}")
+
+
 def sample_clean_blobs(
     batch_size: int,
     centers: torch.Tensor | None = None,

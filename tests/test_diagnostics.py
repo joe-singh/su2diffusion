@@ -4,6 +4,7 @@ from su2diffusion.data import default_centers, sample_clean_blobs
 from su2diffusion.diagnostics import (
     diagnose_samples,
     nearest_center_mass,
+    print_center_mass_table,
     projective_nearest_center_dist,
     wasserstein_1d,
 )
@@ -70,3 +71,18 @@ def test_projective_distance_treats_antipodes_as_equivalent():
     distances = projective_nearest_center_dist(q, centers=centers)
 
     assert distances.item() < 1e-6
+
+
+def test_print_center_mass_table_uses_center_names(capsys):
+    centers = default_centers(device="cpu")
+    q_clean, _ = sample_clean_blobs(16, centers=centers)
+    q_haar = sample_haar(16, device="cpu")
+    diagnostics = diagnose_samples(q_clean, q_clean, q_haar, centers=centers)
+
+    print_center_mass_table({"generated": diagnostics}, center_names=["a", "b", "c", "d"])
+
+    output = capsys.readouterr().out
+    assert "center" in output
+    assert "generated" in output
+    assert "a" in output
+    assert "delta" in output
