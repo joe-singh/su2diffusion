@@ -3,7 +3,7 @@ import torch
 from matplotlib import animation
 from typing import TYPE_CHECKING
 
-from .data import default_centers, sample_clean_blobs
+from .data import centers_for_config, default_centers, sample_clean_blobs
 from .quaternion import sample_haar, su2_distance
 
 if TYPE_CHECKING:
@@ -50,20 +50,22 @@ def plot_nearest_center_histogram(
     q_haar: torch.Tensor,
     generated: dict[str, torch.Tensor],
     centers: torch.Tensor | None = None,
+    clean_label: str = "Clean reference",
+    center_label: str = "nearest center",
 ) -> None:
     centers = centers if centers is not None else default_centers(device=q_clean.device)
 
     plt.figure(figsize=(7, 4))
     plt.hist(nearest_center_dist(q_haar, centers).cpu(), bins=60, alpha=0.4, density=True, label="Haar")
-    plt.hist(nearest_center_dist(q_clean, centers).cpu(), bins=60, alpha=0.4, density=True, label="Clean blobs")
+    plt.hist(nearest_center_dist(q_clean, centers).cpu(), bins=60, alpha=0.4, density=True, label=clean_label)
 
     for label, q in generated.items():
         plt.hist(nearest_center_dist(q, centers).cpu(), bins=60, alpha=0.4, density=True, label=label)
 
-    plt.xlabel("distance to nearest blob center")
+    plt.xlabel(f"distance to {center_label}")
     plt.ylabel("density")
     plt.legend()
-    plt.title("Generated samples should match clean blob distances")
+    plt.title(f"Generated samples should match {center_label} distances")
     plt.show()
 
 
@@ -134,6 +136,8 @@ def plot_diagnostics_bars(
 
 def plot_experiment_report(result) -> None:
     """Render standard plots for an ExperimentResult."""
+    centers = centers_for_config(result.config.data, device=result.clean_reference.device)
+    center_label = f"nearest {result.config.data.kind} center"
     plot_loss(result.losses, title=f"{result.config.name} training loss")
     plot_nearest_center_histogram(
         result.clean_reference,
@@ -142,6 +146,9 @@ def plot_experiment_report(result) -> None:
             "Generated deterministic": result.generated_deterministic,
             f"Generated stochastic eta={result.config.eta}": result.generated_stochastic,
         },
+        centers=centers,
+        clean_label=f"Clean {result.config.data.kind}",
+        center_label=center_label,
     )
     plot_diagnostics_bars(result.diagnostics)
     plot_center_mass(result.diagnostics)
