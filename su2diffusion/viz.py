@@ -1,9 +1,13 @@
 import matplotlib.pyplot as plt
 import torch
 from matplotlib import animation
+from typing import TYPE_CHECKING
 
 from .data import default_centers, sample_clean_blobs
 from .quaternion import sample_haar, su2_distance
+
+if TYPE_CHECKING:
+    from .diagnostics import SampleDiagnostics
 
 
 @torch.no_grad()
@@ -61,6 +65,86 @@ def plot_nearest_center_histogram(
     plt.legend()
     plt.title("Generated samples should match clean blob distances")
     plt.show()
+
+
+def plot_loss(losses: list[float], title: str = "Training loss") -> None:
+    plt.figure(figsize=(6, 4))
+    plt.plot(losses)
+    plt.yscale("log")
+    plt.xlabel("training step")
+    plt.ylabel("MSE loss")
+    plt.title(title)
+    plt.show()
+
+
+def plot_center_mass(
+    diagnostics: dict[str, "SampleDiagnostics"],
+    title: str = "Nearest-center mass",
+) -> None:
+    names = list(diagnostics)
+    if not names:
+        raise ValueError("plot_center_mass needs at least one diagnostics entry")
+
+    masses = torch.tensor([diagnostics[name].nearest_center_mass for name in names])
+    x = torch.arange(masses.shape[1]).float()
+    width = min(0.8 / len(names), 0.35)
+
+    plt.figure(figsize=(7, 4))
+    for i, name in enumerate(names):
+        offset = (i - (len(names) - 1) / 2) * width
+        plt.bar((x + offset).tolist(), masses[i].tolist(), width=width, label=name)
+
+    plt.xlabel("nearest center")
+    plt.ylabel("sample fraction")
+    plt.ylim(0.0, max(1.0, float(masses.max().item()) * 1.15))
+    plt.title(title)
+    plt.legend()
+    plt.show()
+
+
+def plot_diagnostics_bars(
+    diagnostics: dict[str, "SampleDiagnostics"],
+    title: str = "Sample diagnostics",
+) -> None:
+    names = list(diagnostics)
+    if not names:
+        raise ValueError("plot_diagnostics_bars needs at least one diagnostics entry")
+
+    metrics = {
+        "W1 clean": [diagnostics[name].distance_to_clean_w1 for name in names],
+        "W1 Haar": [diagnostics[name].distance_to_haar_w1 for name in names],
+        "dist mean": [diagnostics[name].nearest_center_distance.mean for name in names],
+    }
+
+    x = torch.arange(len(metrics)).float()
+    width = min(0.8 / len(names), 0.35)
+
+    plt.figure(figsize=(7, 4))
+    for i, name in enumerate(names):
+        offset = (i - (len(names) - 1) / 2) * width
+        values = [metrics[metric][i] for metric in metrics]
+        plt.bar((x + offset).tolist(), values, width=width, label=name)
+
+    plt.xticks(x.tolist(), list(metrics))
+    plt.ylabel("metric value")
+    plt.title(title)
+    plt.legend()
+    plt.show()
+
+
+def plot_experiment_report(result) -> None:
+    """Render standard plots for an ExperimentResult."""
+    plot_loss(result.losses, title=f"{result.config.name} training loss")
+    plot_nearest_center_histogram(
+        result.clean_reference,
+        result.haar_reference,
+        {
+            "Generated deterministic": result.generated_deterministic,
+            f"Generated stochastic eta={result.config.eta}": result.generated_stochastic,
+        },
+    )
+    plot_diagnostics_bars(result.diagnostics)
+    plot_center_mass(result.diagnostics)
 
 
 def animate_reverse_histogram(
