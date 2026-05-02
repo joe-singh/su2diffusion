@@ -1,6 +1,14 @@
 """Tools for toy diffusion experiments on SU(2)."""
 
-from .data import BlobConfig, DataConfig, center_names_for_config, gate_centers, sample_clean, sample_clean_blobs
+from .data import (
+    BlobConfig,
+    DataConfig,
+    center_names_for_config,
+    gate_centers,
+    sample_balanced_labels,
+    sample_clean,
+    sample_clean_blobs,
+)
 from .diagnostics import (
     SampleDiagnostics,
     diagnose_samples,
@@ -46,6 +54,7 @@ __all__ = [
     "q_normalize",
     "run_experiment",
     "sample_clean",
+    "sample_balanced_labels",
     "sample_clean_blobs",
     "sample_haar",
     "sample_reverse",

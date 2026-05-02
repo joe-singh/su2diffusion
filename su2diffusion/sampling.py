@@ -10,16 +10,22 @@ def sample_reverse(
     schedule: DiffusionSchedule,
     n_samples: int = 5000,
     eta: float = 1.0,
+    labels: torch.Tensor | None = None,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
     """DDPM-style reverse sampler on SU(2)."""
     device = device or next(model.parameters()).device
+    if labels is not None:
+        labels = labels.to(device=device, dtype=torch.long)
+        if labels.shape != (n_samples,):
+            raise ValueError(f"Expected labels with shape ({n_samples},), got {tuple(labels.shape)}")
+
     betas, _, sigmas = schedule.tensors(device)
     q = sample_haar(n_samples, device=device)
 
     for s in reversed(range(schedule.T)):
         t_idx = torch.full((n_samples,), s + 1, device=device, dtype=torch.long)
-        eps_pred = model(q, t_idx)
+        eps_pred = model(q, t_idx, labels=labels)
 
         beta = betas[s]
         sigma = sigmas[s]
@@ -44,10 +50,16 @@ def sample_reverse_trajectory(
     n_samples: int = 3000,
     eta: float = 1.0,
     record_every: int = 2,
+    labels: torch.Tensor | None = None,
     device: torch.device | str | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor], list[int]]:
     """Run reverse sampling and record intermediate samples."""
     device = device or next(model.parameters()).device
+    if labels is not None:
+        labels = labels.to(device=device, dtype=torch.long)
+        if labels.shape != (n_samples,):
+            raise ValueError(f"Expected labels with shape ({n_samples},), got {tuple(labels.shape)}")
+
     betas, _, sigmas = schedule.tensors(device)
     q = sample_haar(n_samples, device=device)
 
@@ -56,7 +68,7 @@ def sample_reverse_trajectory(
 
     for s in reversed(range(schedule.T)):
         t_idx = torch.full((n_samples,), s + 1, device=device, dtype=torch.long)
-        eps_pred = model(q, t_idx)
+        eps_pred = model(q, t_idx, labels=labels)
 
         beta = betas[s]
         sigma = sigmas[s]

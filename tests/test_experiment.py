@@ -34,6 +34,15 @@ def test_get_experiment_config_returns_gate_variant():
     assert config.data.label_strategy == "balanced"
 
 
+def test_get_experiment_config_returns_conditional_gate_variant():
+    config = get_experiment_config("smoke-gates-cond")
+
+    assert config.name == "smoke-gates-cond"
+    assert config.data.kind == "gates"
+    assert config.train.conditional is True
+    assert config.conditional_sampling is True
+
+
 def test_get_experiment_config_rejects_unknown_name():
     with pytest.raises(ValueError, match="Unknown experiment config"):
         get_experiment_config("missing")
@@ -58,3 +67,53 @@ def test_run_experiment_returns_expected_shapes():
     assert result.generated_stochastic.shape == (6, 4)
     assert sorted(result.diagnostics) == ["deterministic", "stochastic"]
     assert result.diagnostics["deterministic"].distance_to_clean_w1 >= 0.0
+    assert result.deterministic_labels is None
+    assert result.stochastic_labels is None
+
+
+def test_run_conditional_experiment_returns_sampling_labels():
+    config = ExperimentConfig(
+        name="test-cond",
+        schedule=DiffusionSchedule(T=3, beta_start=1e-4, beta_end=0.005),
+        train=TrainConfig(batch_size=4, num_steps=1, hidden=8, n_terms=4, conditional=True, label_dim=4),
+        sample_count=6,
+        reference_count=7,
+        eta=0.5,
+        conditional_sampling=True,
+    )
+
+    result = run_experiment(config, device="cpu", show_progress=False)
+
+    assert result.generated_deterministic.shape == (6, 4)
+    assert result.deterministic_labels is not None
+    assert result.stochastic_labels is not None
+    assert result.deterministic_labels.shape == (6,)
+    assert result.stochastic_labels.shape == (6,)
+
+
+def test_run_experiment_rejects_conditional_training_without_conditional_sampling():
+    config = ExperimentConfig(
+        name="bad-cond",
+        schedule=DiffusionSchedule(T=3, beta_start=1e-4, beta_end=0.005),
+        train=TrainConfig(batch_size=4, num_steps=1, hidden=8, n_terms=4, conditional=True),
+        sample_count=6,
+        reference_count=7,
+        conditional_sampling=False,
+    )
+
+    with pytest.raises(ValueError, match="Conditional training requires conditional_sampling"):
+        run_experiment(config, device="cpu", show_progress=False)
+
+
+def test_run_experiment_rejects_conditional_sampling_without_conditional_training():
+    config = ExperimentConfig(
+        name="bad-sampling",
+        schedule=DiffusionSchedule(T=3, beta_start=1e-4, beta_end=0.005),
+        train=TrainConfig(batch_size=4, num_steps=1, hidden=8, n_terms=4, conditional=False),
+        sample_count=6,
+        reference_count=7,
+        conditional_sampling=True,
+    )
+
+    with pytest.raises(ValueError, match="conditional_sampling=True requires train.conditional=True"):
+        run_experiment(config, device="cpu", show_progress=False)
