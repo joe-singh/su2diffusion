@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .data import BlobConfig, default_centers, sample_clean_blobs
+from .data import BlobConfig, DataConfig, centers_for_config, sample_clean
 from .diagnostics import wasserstein_1d
 from .diffusion import DiffusionSchedule, brownian_forward_heat_target
 from .quaternion import sample_haar
@@ -23,7 +23,7 @@ class ForwardProcessDiagnostics:
 @torch.no_grad()
 def diagnose_forward_process(
     schedule: DiffusionSchedule | None = None,
-    blob_config: BlobConfig | None = None,
+    blob_config: BlobConfig | DataConfig | None = None,
     batch_size: int = 1024,
     timesteps: list[int] | None = None,
     n_terms: int = 64,
@@ -32,13 +32,13 @@ def diagnose_forward_process(
     schedule = schedule or DiffusionSchedule()
     blob_config = blob_config or BlobConfig()
     device = torch.device(device)
-    centers = default_centers(device=device)
+    centers = centers_for_config(blob_config, device=device)
 
     if timesteps is None:
         timesteps = [1, max(1, schedule.T // 4), max(1, schedule.T // 2), schedule.T]
     timesteps = sorted(set(max(1, min(schedule.T, int(t))) for t in timesteps))
 
-    q0, _ = sample_clean_blobs(batch_size, centers=centers, config=blob_config)
+    q0, _ = sample_clean(batch_size, centers=centers, config=blob_config)
 
     mean_distances = []
     norm_errors = []

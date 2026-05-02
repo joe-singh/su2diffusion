@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from .data import BlobConfig, default_centers, sample_clean_blobs
+from .data import BlobConfig, DataConfig, centers_for_config, sample_clean
 from .device import get_default_device
 from .diffusion import DiffusionSchedule, brownian_forward_heat_target
 from .model import SU2Denoiser
@@ -24,7 +24,7 @@ class TrainConfig:
 def train_heat_kernel_model(
     train_config: TrainConfig | None = None,
     schedule: DiffusionSchedule | None = None,
-    blob_config: BlobConfig | None = None,
+    blob_config: BlobConfig | DataConfig | None = None,
     device: torch.device | str | None = None,
     show_progress: bool = True,
 ) -> tuple[SU2Denoiser, list[float]]:
@@ -35,7 +35,7 @@ def train_heat_kernel_model(
 
     torch.manual_seed(train_config.seed)
 
-    centers = default_centers(device=device)
+    centers = centers_for_config(blob_config, device=device)
     model = SU2Denoiser(T=schedule.T, hidden=train_config.hidden).to(device)
     opt = torch.optim.AdamW(
         model.parameters(),
@@ -49,7 +49,7 @@ def train_heat_kernel_model(
         iterator = tqdm(iterator, desc="Training heat-kernel target", dynamic_ncols=True)
 
     for step in iterator:
-        q0, _ = sample_clean_blobs(
+        q0, _ = sample_clean(
             train_config.batch_size,
             centers=centers,
             config=blob_config,
