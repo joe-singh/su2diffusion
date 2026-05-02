@@ -31,6 +31,7 @@ def test_get_experiment_config_returns_gate_variant():
     assert config.name == "smoke-gates"
     assert config.data.kind == "gates"
     assert config.data.sigma_data == 0.12
+    assert config.data.label_strategy == "balanced"
 
 
 def test_get_experiment_config_rejects_unknown_name():
