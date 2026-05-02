@@ -14,6 +14,7 @@ class BlobConfig:
 class DataConfig:
     kind: str = "blobs"
     sigma_data: float = 0.18
+    label_strategy: str = "random"
 
 
 def default_centers(device: torch.device | str | None = None) -> torch.Tensor:
@@ -51,19 +52,45 @@ def sample_clean_blobs(
     centers: torch.Tensor | None = None,
     config: BlobConfig | None = None,
     device: torch.device | str | None = None,
+    label_strategy: str = "random",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sample clean data U_0 from a mixture of local SU(2) blobs."""
     config = config or BlobConfig()
     centers = centers if centers is not None else default_centers(device=device)
     device = centers.device
 
-    labels = torch.randint(0, centers.shape[0], (batch_size,), device=device)
+    labels = _sample_labels(
+        batch_size=batch_size,
+        n_centers=centers.shape[0],
+        device=device,
+        strategy=label_strategy,
+    )
     c = centers[labels]
 
     noise = config.sigma_data * torch.randn(batch_size, 3, device=device)
     u = q_mul(c, q_exp(noise))
 
     return q_normalize(u), labels
+
+
+def _sample_labels(
+    batch_size: int,
+    n_centers: int,
+    device: torch.device | str,
+    strategy: str = "random",
+) -> torch.Tensor:
+    if strategy == "random":
+        return torch.randint(0, n_centers, (batch_size,), device=device)
+
+    if strategy == "balanced":
+        if batch_size == 0:
+            return torch.empty(0, dtype=torch.long, device=device)
+
+        repeats = (batch_size + n_centers - 1) // n_centers
+        labels = torch.arange(n_centers, device=device).repeat(repeats)[:batch_size]
+        return labels[torch.randperm(batch_size, device=device)]
+
+    raise ValueError(f"Unknown label strategy {strategy!r}")
 
 
 def centers_for_config(config: DataConfig | BlobConfig | None = None, device: torch.device | str | None = None) -> torch.Tensor:
@@ -92,4 +119,5 @@ def sample_clean(
         batch_size=batch_size,
         centers=centers,
         config=BlobConfig(sigma_data=data_config.sigma_data),
+        label_strategy=data_config.label_strategy,
     )

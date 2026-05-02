@@ -22,6 +22,27 @@ def test_sample_clean_gate_data_shapes():
     assert torch.allclose(q.norm(dim=-1), torch.ones(32), atol=1e-5)
 
 
+def test_balanced_label_strategy_has_nearly_equal_center_counts():
+    config = DataConfig(kind="gates", sigma_data=0.12, label_strategy="balanced")
+    centers = centers_for_config(config, device="cpu")
+
+    _, labels = sample_clean(32, centers=centers, config=config)
+    counts = torch.bincount(labels.cpu(), minlength=centers.shape[0])
+
+    assert counts.max().item() - counts.min().item() <= 1
+
+
+def test_unknown_label_strategy_raises_value_error():
+    config = DataConfig(kind="gates", label_strategy="missing")
+
+    try:
+        sample_clean(8, config=config, device="cpu")
+    except ValueError as exc:
+        assert "Unknown label strategy" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
 def test_unknown_data_kind_raises_value_error():
     config = DataConfig(kind="missing")
 
