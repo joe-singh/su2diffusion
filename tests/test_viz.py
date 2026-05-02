@@ -19,6 +19,8 @@ def _diagnostics():
             distance_to_haar_w1=0.4,
             nearest_center_distance=summary,
             nearest_center_mass=[0.25, 0.25, 0.25, 0.25],
+            clean_center_mass=[0.25, 0.25, 0.25, 0.25],
+            center_mass_l1=0.0,
         ),
         "stochastic": SampleDiagnostics(
             norm_error_mean=0.0,
@@ -26,6 +28,8 @@ def _diagnostics():
             distance_to_haar_w1=0.3,
             nearest_center_distance=summary,
             nearest_center_mass=[0.2, 0.3, 0.3, 0.2],
+            clean_center_mass=[0.25, 0.25, 0.25, 0.25],
+            center_mass_l1=0.2,
         ),
     }
 

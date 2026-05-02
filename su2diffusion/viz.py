@@ -115,6 +115,7 @@ def plot_diagnostics_bars(
     metrics = {
         "W1 clean": [diagnostics[name].distance_to_clean_w1 for name in names],
         "W1 Haar": [diagnostics[name].distance_to_haar_w1 for name in names],
+        "mass L1": [diagnostics[name].center_mass_l1 for name in names],
         "dist mean": [diagnostics[name].nearest_center_distance.mean for name in names],
     }
 
