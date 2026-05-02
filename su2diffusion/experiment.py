@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .data import BlobConfig, default_centers, sample_clean_blobs
+from .data import DataConfig, centers_for_config, sample_clean
 from .diagnostics import SampleDiagnostics, diagnose_samples
 from .device import get_default_device
 from .diffusion import DiffusionSchedule
@@ -16,7 +16,7 @@ class ExperimentConfig:
     name: str
     schedule: DiffusionSchedule
     train: TrainConfig
-    blob: BlobConfig = BlobConfig()
+    data: DataConfig = DataConfig()
     sample_count: int = 5000
     reference_count: int = 5000
     eta: float = 0.7
@@ -41,6 +41,16 @@ def get_experiment_config(name: str) -> ExperimentConfig:
             name="smoke",
             schedule=DiffusionSchedule(T=30, beta_start=1e-4, beta_end=0.005, kind="linear"),
             train=TrainConfig(batch_size=256, num_steps=20, hidden=64, n_terms=16),
+            data=DataConfig(kind="blobs", sigma_data=0.18),
+            sample_count=512,
+            reference_count=512,
+            eta=0.7,
+        ),
+        "smoke-gates": ExperimentConfig(
+            name="smoke-gates",
+            schedule=DiffusionSchedule(T=30, beta_start=1e-4, beta_end=0.005, kind="linear"),
+            train=TrainConfig(batch_size=256, num_steps=20, hidden=64, n_terms=16),
+            data=DataConfig(kind="gates", sigma_data=0.12),
             sample_count=512,
             reference_count=512,
             eta=0.7,
@@ -49,6 +59,7 @@ def get_experiment_config(name: str) -> ExperimentConfig:
             name="smoke-cosine",
             schedule=DiffusionSchedule(T=30, beta_start=1e-4, beta_end=0.005, kind="cosine"),
             train=TrainConfig(batch_size=256, num_steps=20, hidden=64, n_terms=16),
+            data=DataConfig(kind="blobs", sigma_data=0.18),
             sample_count=512,
             reference_count=512,
             eta=0.7,
@@ -57,6 +68,16 @@ def get_experiment_config(name: str) -> ExperimentConfig:
             name="medium",
             schedule=DiffusionSchedule(T=100, beta_start=1e-4, beta_end=0.005, kind="linear"),
             train=TrainConfig(batch_size=1024, num_steps=500, hidden=256, n_terms=64),
+            data=DataConfig(kind="blobs", sigma_data=0.18),
+            sample_count=2000,
+            reference_count=2000,
+            eta=0.7,
+        ),
+        "medium-gates": ExperimentConfig(
+            name="medium-gates",
+            schedule=DiffusionSchedule(T=100, beta_start=1e-4, beta_end=0.005, kind="linear"),
+            train=TrainConfig(batch_size=1024, num_steps=500, hidden=256, n_terms=64),
+            data=DataConfig(kind="gates", sigma_data=0.12),
             sample_count=2000,
             reference_count=2000,
             eta=0.7,
@@ -65,6 +86,7 @@ def get_experiment_config(name: str) -> ExperimentConfig:
             name="medium-cosine",
             schedule=DiffusionSchedule(T=100, beta_start=1e-4, beta_end=0.005, kind="cosine"),
             train=TrainConfig(batch_size=1024, num_steps=500, hidden=256, n_terms=64),
+            data=DataConfig(kind="blobs", sigma_data=0.18),
             sample_count=2000,
             reference_count=2000,
             eta=0.7,
@@ -73,6 +95,16 @@ def get_experiment_config(name: str) -> ExperimentConfig:
             name="baseline",
             schedule=DiffusionSchedule(T=200, beta_start=1e-4, beta_end=0.005, kind="linear"),
             train=TrainConfig(batch_size=2048, num_steps=2000, hidden=512, n_terms=128),
+            data=DataConfig(kind="blobs", sigma_data=0.18),
+            sample_count=5000,
+            reference_count=5000,
+            eta=0.7,
+        ),
+        "baseline-gates": ExperimentConfig(
+            name="baseline-gates",
+            schedule=DiffusionSchedule(T=200, beta_start=1e-4, beta_end=0.005, kind="linear"),
+            train=TrainConfig(batch_size=2048, num_steps=2000, hidden=512, n_terms=128),
+            data=DataConfig(kind="gates", sigma_data=0.12),
             sample_count=5000,
             reference_count=5000,
             eta=0.7,
@@ -81,6 +113,7 @@ def get_experiment_config(name: str) -> ExperimentConfig:
             name="baseline-cosine",
             schedule=DiffusionSchedule(T=200, beta_start=1e-4, beta_end=0.005, kind="cosine"),
             train=TrainConfig(batch_size=2048, num_steps=2000, hidden=512, n_terms=128),
+            data=DataConfig(kind="blobs", sigma_data=0.18),
             sample_count=5000,
             reference_count=5000,
             eta=0.7,
@@ -103,21 +136,21 @@ def run_experiment(
         config = get_experiment_config(config)
 
     device = torch.device(device) if device is not None else get_default_device()
-    centers = default_centers(device=device)
+    centers = centers_for_config(config.data, device=device)
 
     model, losses = train_heat_kernel_model(
         train_config=config.train,
         schedule=config.schedule,
-        blob_config=config.blob,
+        blob_config=config.data,
         device=device,
         show_progress=show_progress,
     )
 
     with torch.no_grad():
-        q_clean, _ = sample_clean_blobs(
+        q_clean, _ = sample_clean(
             config.reference_count,
             centers=centers,
-            config=config.blob,
+            config=config.data,
         )
         q_haar = sample_haar(config.reference_count, device=device)
         q_gen_det = sample_reverse(

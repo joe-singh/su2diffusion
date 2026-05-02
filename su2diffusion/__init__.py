@@ -1,6 +1,6 @@
 """Tools for toy diffusion experiments on SU(2)."""
 
-from .data import BlobConfig, sample_clean_blobs
+from .data import BlobConfig, DataConfig, gate_centers, sample_clean, sample_clean_blobs
 from .diagnostics import SampleDiagnostics, diagnose_samples, print_diagnostics_table
 from .diffusion import DiffusionSchedule, brownian_forward_heat_target, heat_epsilon_target
 from .experiment import ExperimentConfig, ExperimentResult, get_experiment_config, run_experiment
@@ -13,6 +13,7 @@ from .viz import plot_experiment_report
 
 __all__ = [
     "BlobConfig",
+    "DataConfig",
     "DiffusionSchedule",
     "ExperimentConfig",
     "ExperimentResult",
@@ -23,6 +24,7 @@ __all__ = [
     "brownian_forward_heat_target",
     "diagnose_samples",
     "diagnose_forward_process",
+    "gate_centers",
     "get_experiment_config",
     "heat_epsilon_target",
     "print_diagnostics_table",
@@ -34,6 +36,7 @@ __all__ = [
     "q_mul",
     "q_normalize",
     "run_experiment",
+    "sample_clean",
     "sample_clean_blobs",
     "sample_haar",
     "sample_reverse",

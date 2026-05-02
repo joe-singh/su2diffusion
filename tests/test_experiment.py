@@ -25,6 +25,14 @@ def test_get_experiment_config_returns_cosine_variant():
     assert config.deterministic_eta == 0.0
 
 
+def test_get_experiment_config_returns_gate_variant():
+    config = get_experiment_config("smoke-gates")
+
+    assert config.name == "smoke-gates"
+    assert config.data.kind == "gates"
+    assert config.data.sigma_data == 0.12
+
+
 def test_get_experiment_config_rejects_unknown_name():
     with pytest.raises(ValueError, match="Unknown experiment config"):
         get_experiment_config("missing")
