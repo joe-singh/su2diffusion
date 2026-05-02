@@ -1,8 +1,11 @@
 from types import SimpleNamespace
 
+import torch
+
 from su2diffusion.diagnostics import DistanceSummary, SampleDiagnostics
 from su2diffusion.experiment import ExperimentConfig
 from su2diffusion.diffusion import DiffusionSchedule
+from su2diffusion.data import DataConfig
 from su2diffusion.train import TrainConfig
 from su2diffusion import viz
 
@@ -33,20 +36,26 @@ def test_plot_experiment_report_calls_standard_plots(monkeypatch):
         name="test",
         schedule=DiffusionSchedule(T=3),
         train=TrainConfig(num_steps=1),
+        data=DataConfig(kind="gates"),
         eta=0.7,
     )
     result = SimpleNamespace(
         config=config,
         losses=[1.0],
-        clean_reference="clean",
-        haar_reference="haar",
-        generated_deterministic="det",
-        generated_stochastic="sto",
+        clean_reference=torch.zeros(1, 4),
+        haar_reference=torch.zeros(1, 4),
+        generated_deterministic=torch.zeros(1, 4),
+        generated_stochastic=torch.zeros(1, 4),
         diagnostics=_diagnostics(),
     )
 
     monkeypatch.setattr(viz, "plot_loss", lambda *args, **kwargs: calls.append("loss"))
-    monkeypatch.setattr(viz, "plot_nearest_center_histogram", lambda *args, **kwargs: calls.append("hist"))
+    def fake_hist(*args, **kwargs):
+        assert kwargs["centers"].shape == (7, 4)
+        assert kwargs["clean_label"] == "Clean gates"
+        calls.append("hist")
+
+    monkeypatch.setattr(viz, "plot_nearest_center_histogram", fake_hist)
     monkeypatch.setattr(viz, "plot_diagnostics_bars", lambda *args, **kwargs: calls.append("bars"))
     monkeypatch.setattr(viz, "plot_center_mass", lambda *args, **kwargs: calls.append("mass"))
 
