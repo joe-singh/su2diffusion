@@ -53,7 +53,7 @@ def test_get_experiment_config_returns_conditional_clifford_variant():
     assert config.data.sigma_data == 0.08
     assert config.train.conditional is True
     assert config.conditional_sampling is True
-    assert config.eta == 1.0
+    assert config.eta == 0.7
 
 
 def test_get_experiment_config_rejects_unknown_name():
