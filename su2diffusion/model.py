@@ -24,13 +24,27 @@ def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class SU2Denoiser(nn.Module):
-    def __init__(self, T: int = 200, time_dim: int = 64, hidden: int = 512):
+    def __init__(
+        self,
+        T: int = 200,
+        time_dim: int = 64,
+        hidden: int = 512,
+        num_labels: int | None = None,
+        label_dim: int = 32,
+    ):
         super().__init__()
         self.T = T
         self.time_dim = time_dim
+        self.num_labels = num_labels
+        self.label_dim = label_dim if num_labels is not None else 0
+
+        if num_labels is None:
+            self.label_embedding = None
+        else:
+            self.label_embedding = nn.Embedding(num_labels, label_dim)
 
         self.net = nn.Sequential(
-            nn.Linear(4 + time_dim, hidden),
+            nn.Linear(4 + time_dim + self.label_dim, hidden),
             nn.SiLU(),
             nn.Linear(hidden, hidden),
             nn.SiLU(),
@@ -39,8 +53,17 @@ class SU2Denoiser(nn.Module):
             nn.Linear(hidden, 3),
         )
 
-    def forward(self, q: torch.Tensor, t_idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, q: torch.Tensor, t_idx: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
         t_scaled = t_idx.float() / self.T
         temb = timestep_embedding(t_scaled, self.time_dim)
-        x = torch.cat([q, temb], dim=-1)
+        parts = [q, temb]
+
+        if self.label_embedding is not None:
+            if labels is None:
+                raise ValueError("Conditional SU2Denoiser requires labels")
+            parts.append(self.label_embedding(labels))
+        elif labels is not None:
+            raise ValueError("Unconditional SU2Denoiser does not accept labels")
+
+        x = torch.cat(parts, dim=-1)
         return self.net(x)

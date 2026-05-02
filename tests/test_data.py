@@ -1,6 +1,13 @@
 import torch
 
-from su2diffusion.data import DataConfig, center_names_for_config, centers_for_config, gate_centers, sample_clean
+from su2diffusion.data import (
+    DataConfig,
+    center_names_for_config,
+    centers_for_config,
+    gate_centers,
+    sample_balanced_labels,
+    sample_clean,
+)
 
 
 def test_gate_centers_are_unit_quaternions():
@@ -35,6 +42,13 @@ def test_balanced_label_strategy_has_nearly_equal_center_counts():
 
     _, labels = sample_clean(32, centers=centers, config=config)
     counts = torch.bincount(labels.cpu(), minlength=centers.shape[0])
+
+    assert counts.max().item() - counts.min().item() <= 1
+
+
+def test_sample_balanced_labels_has_nearly_equal_counts():
+    labels = sample_balanced_labels(32, n_centers=7, device="cpu")
+    counts = torch.bincount(labels.cpu(), minlength=7)
 
     assert counts.max().item() - counts.min().item() <= 1
 

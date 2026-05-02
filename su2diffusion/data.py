@@ -101,6 +101,19 @@ def _sample_labels(
     raise ValueError(f"Unknown label strategy {strategy!r}")
 
 
+def sample_balanced_labels(
+    batch_size: int,
+    n_centers: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    return _sample_labels(
+        batch_size=batch_size,
+        n_centers=n_centers,
+        device=device,
+        strategy="balanced",
+    )
+
+
 def centers_for_config(config: DataConfig | BlobConfig | None = None, device: torch.device | str | None = None) -> torch.Tensor:
     if config is None or isinstance(config, BlobConfig) or config.kind == "blobs":
         return default_centers(device=device)
