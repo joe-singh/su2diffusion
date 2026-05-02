@@ -1,6 +1,6 @@
 import torch
 
-from su2diffusion.data import DataConfig, centers_for_config, gate_centers, sample_clean
+from su2diffusion.data import DataConfig, center_names_for_config, centers_for_config, gate_centers, sample_clean
 
 
 def test_gate_centers_are_unit_quaternions():
@@ -8,6 +8,13 @@ def test_gate_centers_are_unit_quaternions():
 
     assert centers.shape == (7, 4)
     assert torch.allclose(centers.norm(dim=-1), torch.ones(7), atol=1e-6)
+
+
+def test_gate_center_names_match_gate_centers():
+    config = DataConfig(kind="gates")
+
+    assert center_names_for_config(config) == ["I", "X", "Y", "Z", "sqrt(X)", "sqrt(Y)", "sqrt(Z)"]
+    assert len(center_names_for_config(config)) == gate_centers(device="cpu").shape[0]
 
 
 def test_sample_clean_gate_data_shapes():

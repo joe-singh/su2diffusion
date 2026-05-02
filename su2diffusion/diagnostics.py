@@ -193,10 +193,41 @@ def print_diagnostics_table(results: dict[str, SampleDiagnostics]) -> None:
         )
 
 
-def print_per_center_table(results: dict[str, SampleDiagnostics]) -> None:
+def _format_center_names(n_centers: int, center_names: list[str] | None = None) -> list[str]:
+    if center_names is None:
+        return [str(i) for i in range(n_centers)]
+    if len(center_names) != n_centers:
+        raise ValueError(f"Expected {n_centers} center names, got {len(center_names)}")
+    return center_names
+
+
+def print_center_mass_table(results: dict[str, SampleDiagnostics], center_names: list[str] | None = None) -> None:
+    if not results:
+        raise ValueError("print_center_mass_table needs at least one diagnostics entry")
+
+    first = next(iter(results.values()))
+    names = _format_center_names(len(first.clean_center_mass), center_names=center_names)
+    sample_names = list(results)
+    header = f"{'center':<10} {'clean':>8}"
+    for sample_name in sample_names:
+        header += f" {sample_name[:13]:>13} {'delta':>9}"
+
+    print(header)
+    print("-" * len(header))
+    for i, center_name in enumerate(names):
+        clean_mass = first.clean_center_mass[i]
+        row = f"{center_name:<10} {clean_mass:>8.4f}"
+        for sample_name in sample_names:
+            generated_mass = results[sample_name].nearest_center_mass[i]
+            row += f" {generated_mass:>13.4f} {generated_mass - clean_mass:>+9.4f}"
+        print(row)
+
+
+def print_per_center_table(results: dict[str, SampleDiagnostics], center_names: list[str] | None = None) -> None:
     for name, diag in results.items():
         if diag.per_center_distance is None:
             print(f"{name} per-center nearest-distance mean: not computed")
             continue
+        names = _format_center_names(len(diag.per_center_distance), center_names=center_names)
         print(f"{name} per-center nearest-distance mean:")
-        print("  " + " ".join(f"{i}:{summary.mean:.4f}" for i, summary in enumerate(diag.per_center_distance)))
+        print("  " + " ".join(f"{center}:{summary.mean:.4f}" for center, summary in zip(names, diag.per_center_distance)))
