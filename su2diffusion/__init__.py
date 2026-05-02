@@ -17,7 +17,7 @@ from .diagnostics import (
     print_per_center_table,
 )
 from .diffusion import DiffusionSchedule, brownian_forward_heat_target, heat_epsilon_target
-from .experiment import ExperimentConfig, ExperimentResult, get_experiment_config, run_experiment
+from .experiment import ExperimentConfig, ExperimentResult, ResampleResult, get_experiment_config, resample_experiment, run_experiment
 from .forward_checks import ForwardProcessDiagnostics, diagnose_forward_process, print_forward_diagnostics
 from .model import SU2Denoiser
 from .quaternion import q_exp, q_inv, q_log, q_mul, q_normalize, sample_haar, su2_distance
@@ -32,6 +32,7 @@ __all__ = [
     "ExperimentConfig",
     "ExperimentResult",
     "ForwardProcessDiagnostics",
+    "ResampleResult",
     "SampleDiagnostics",
     "SU2Denoiser",
     "TrainConfig",
@@ -52,6 +53,7 @@ __all__ = [
     "q_log",
     "q_mul",
     "q_normalize",
+    "resample_experiment",
     "run_experiment",
     "sample_clean",
     "sample_balanced_labels",
