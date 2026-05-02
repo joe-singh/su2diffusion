@@ -5,6 +5,7 @@ from su2diffusion import (
     ExperimentConfig,
     TrainConfig,
     get_experiment_config,
+    resample_experiment,
     run_experiment,
 )
 
@@ -89,6 +90,27 @@ def test_run_conditional_experiment_returns_sampling_labels():
     assert result.stochastic_labels is not None
     assert result.deterministic_labels.shape == (6,)
     assert result.stochastic_labels.shape == (6,)
+
+
+def test_resample_experiment_reuses_model_for_eta_sweep():
+    config = ExperimentConfig(
+        name="test-resample",
+        schedule=DiffusionSchedule(T=3, beta_start=1e-4, beta_end=0.005),
+        train=TrainConfig(batch_size=4, num_steps=1, hidden=8, n_terms=4, conditional=True, label_dim=4),
+        sample_count=6,
+        reference_count=7,
+        eta=0.5,
+        conditional_sampling=True,
+    )
+    result = run_experiment(config, device="cpu", show_progress=False)
+
+    sweep = resample_experiment(result, etas=[0.0, 0.5], device="cpu")
+
+    assert sorted(sweep) == ["eta=0", "eta=0.5"]
+    assert sweep["eta=0"].eta == 0.0
+    assert sweep["eta=0"].generated.shape == (6, 4)
+    assert sweep["eta=0"].labels is not None
+    assert sweep["eta=0"].diagnostics.distance_to_clean_w1 >= 0.0
 
 
 def test_run_experiment_rejects_conditional_training_without_conditional_sampling():

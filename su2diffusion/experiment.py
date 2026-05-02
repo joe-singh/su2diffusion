@@ -38,6 +38,14 @@ class ExperimentResult:
     stochastic_labels: torch.Tensor | None = None
 
 
+@dataclass
+class ResampleResult:
+    eta: float
+    generated: torch.Tensor
+    diagnostics: SampleDiagnostics
+    labels: torch.Tensor | None = None
+
+
 def get_experiment_config(name: str) -> ExperimentConfig:
     configs = {
         "smoke": ExperimentConfig(
@@ -224,6 +232,41 @@ def run_experiment(
         deterministic_labels=deterministic_labels.detach().cpu() if deterministic_labels is not None else None,
         stochastic_labels=stochastic_labels.detach().cpu() if stochastic_labels is not None else None,
     )
+
+
+@torch.no_grad()
+def resample_experiment(
+    result: ExperimentResult,
+    etas: list[float] | tuple[float, ...],
+    device: torch.device | str | None = None,
+) -> dict[str, ResampleResult]:
+    device = torch.device(device) if device is not None else next(result.model.parameters()).device
+    config = result.config
+    centers = centers_for_config(config.data, device=device)
+    clean_reference = result.clean_reference.to(device)
+    haar_reference = result.haar_reference.to(device)
+
+    outputs = {}
+    for eta in etas:
+        labels = _sample_condition_labels(config, centers.shape[0], device=device)
+        generated = sample_reverse(
+            result.model,
+            config.schedule,
+            n_samples=config.sample_count,
+            eta=eta,
+            labels=labels,
+            device=device,
+        )
+        diagnostics = diagnose_samples(generated, clean_reference, haar_reference, centers=centers)
+        key = f"eta={eta:g}"
+        outputs[key] = ResampleResult(
+            eta=eta,
+            generated=generated,
+            diagnostics=diagnostics,
+            labels=labels.detach().cpu() if labels is not None else None,
+        )
+
+    return outputs
 
 
 def _sample_condition_labels(
