@@ -17,6 +17,14 @@ def test_get_experiment_config_returns_named_config():
     assert config.reference_count == 512
 
 
+def test_get_experiment_config_returns_cosine_variant():
+    config = get_experiment_config("smoke-cosine")
+
+    assert config.name == "smoke-cosine"
+    assert config.schedule.kind == "cosine"
+    assert config.deterministic_eta == 0.0
+
+
 def test_get_experiment_config_rejects_unknown_name():
     with pytest.raises(ValueError, match="Unknown experiment config"):
         get_experiment_config("missing")
