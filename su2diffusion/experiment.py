@@ -73,7 +73,7 @@ def get_experiment_config(name: str) -> ExperimentConfig:
             data=DataConfig(kind="gates", sigma_data=0.12, label_strategy="balanced"),
             sample_count=512,
             reference_count=512,
-            eta=0.7,
+            eta=1.0,
             conditional_sampling=True,
         ),
         "smoke-cosine": ExperimentConfig(
@@ -110,7 +110,7 @@ def get_experiment_config(name: str) -> ExperimentConfig:
             data=DataConfig(kind="gates", sigma_data=0.12, label_strategy="balanced"),
             sample_count=2000,
             reference_count=2000,
-            eta=0.7,
+            eta=1.0,
             conditional_sampling=True,
         ),
         "medium-cosine": ExperimentConfig(
@@ -147,7 +147,7 @@ def get_experiment_config(name: str) -> ExperimentConfig:
             data=DataConfig(kind="gates", sigma_data=0.12, label_strategy="balanced"),
             sample_count=5000,
             reference_count=5000,
-            eta=0.7,
+            eta=1.0,
             conditional_sampling=True,
         ),
         "baseline-cosine": ExperimentConfig(

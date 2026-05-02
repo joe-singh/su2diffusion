@@ -42,6 +42,7 @@ def test_get_experiment_config_returns_conditional_gate_variant():
     assert config.data.kind == "gates"
     assert config.train.conditional is True
     assert config.conditional_sampling is True
+    assert config.eta == 1.0
 
 
 def test_get_experiment_config_rejects_unknown_name():
