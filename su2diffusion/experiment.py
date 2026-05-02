@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 
 from .data import DataConfig, centers_for_config, sample_balanced_labels, sample_clean
-from .diagnostics import SampleDiagnostics, diagnose_samples
+from .diagnostics import ConditionalLabelDiagnostics, SampleDiagnostics, diagnose_conditional_labels, diagnose_samples
 from .device import get_default_device
 from .diffusion import DiffusionSchedule
 from .sampling import sample_reverse
@@ -34,6 +34,7 @@ class ExperimentResult:
     generated_deterministic: torch.Tensor
     generated_stochastic: torch.Tensor
     diagnostics: dict[str, SampleDiagnostics]
+    conditional_diagnostics: dict[str, ConditionalLabelDiagnostics] | None = None
     deterministic_labels: torch.Tensor | None = None
     stochastic_labels: torch.Tensor | None = None
 
@@ -43,6 +44,7 @@ class ResampleResult:
     eta: float
     generated: torch.Tensor
     diagnostics: SampleDiagnostics
+    conditional_diagnostics: ConditionalLabelDiagnostics | None = None
     labels: torch.Tensor | None = None
 
 
@@ -219,6 +221,11 @@ def run_experiment(
         "deterministic": diagnose_samples(q_gen_det, q_clean, q_haar, centers=centers),
         "stochastic": diagnose_samples(q_gen_sto, q_clean, q_haar, centers=centers),
     }
+    conditional_diagnostics = _diagnose_conditionals(
+        generated={"deterministic": q_gen_det, "stochastic": q_gen_sto},
+        labels={"deterministic": deterministic_labels, "stochastic": stochastic_labels},
+        centers=centers,
+    )
 
     return ExperimentResult(
         config=config,
@@ -229,6 +236,7 @@ def run_experiment(
         generated_deterministic=q_gen_det,
         generated_stochastic=q_gen_sto,
         diagnostics=diagnostics,
+        conditional_diagnostics=conditional_diagnostics,
         deterministic_labels=deterministic_labels.detach().cpu() if deterministic_labels is not None else None,
         stochastic_labels=stochastic_labels.detach().cpu() if stochastic_labels is not None else None,
     )
@@ -258,11 +266,15 @@ def resample_experiment(
             device=device,
         )
         diagnostics = diagnose_samples(generated, clean_reference, haar_reference, centers=centers)
+        conditional_diagnostics = None
+        if labels is not None:
+            conditional_diagnostics = diagnose_conditional_labels(generated, labels, centers=centers)
         key = f"eta={eta:g}"
         outputs[key] = ResampleResult(
             eta=eta,
             generated=generated,
             diagnostics=diagnostics,
+            conditional_diagnostics=conditional_diagnostics,
             labels=labels.detach().cpu() if labels is not None else None,
         )
 
@@ -281,6 +293,20 @@ def _sample_condition_labels(
         n_centers=n_centers,
         device=device,
     )
+
+
+def _diagnose_conditionals(
+    generated: dict[str, torch.Tensor],
+    labels: dict[str, torch.Tensor | None],
+    centers: torch.Tensor,
+) -> dict[str, ConditionalLabelDiagnostics] | None:
+    output = {}
+    for name, samples in generated.items():
+        requested = labels[name]
+        if requested is None:
+            continue
+        output[name] = diagnose_conditional_labels(samples, requested, centers=centers)
+    return output or None
 
 
 def _validate_experiment_config(config: ExperimentConfig) -> None:

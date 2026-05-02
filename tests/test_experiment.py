@@ -87,6 +87,8 @@ def test_run_conditional_experiment_returns_sampling_labels():
     result = run_experiment(config, device="cpu", show_progress=False)
 
     assert result.generated_deterministic.shape == (6, 4)
+    assert result.conditional_diagnostics is not None
+    assert sorted(result.conditional_diagnostics) == ["deterministic", "stochastic"]
     assert result.deterministic_labels is not None
     assert result.stochastic_labels is not None
     assert result.deterministic_labels.shape == (6,)
@@ -111,6 +113,7 @@ def test_resample_experiment_reuses_model_for_eta_sweep():
     assert sweep["eta=0"].eta == 0.0
     assert sweep["eta=0"].generated.shape == (6, 4)
     assert sweep["eta=0"].labels is not None
+    assert sweep["eta=0"].conditional_diagnostics is not None
     assert sweep["eta=0"].diagnostics.distance_to_clean_w1 >= 0.0
 
 

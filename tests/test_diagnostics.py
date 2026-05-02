@@ -2,9 +2,11 @@ import torch
 
 from su2diffusion.data import default_centers, sample_clean_blobs
 from su2diffusion.diagnostics import (
+    diagnose_conditional_labels,
     diagnose_samples,
     nearest_center_mass,
     print_center_mass_table,
+    print_conditional_label_table,
     projective_nearest_center_dist,
     wasserstein_1d,
 )
@@ -86,3 +88,39 @@ def test_print_center_mass_table_uses_center_names(capsys):
     assert "generated" in output
     assert "a" in output
     assert "delta" in output
+
+
+def test_diagnose_conditional_labels_detects_requested_centers():
+    centers = default_centers(device="cpu")
+    labels = torch.arange(centers.shape[0])
+
+    diagnostics = diagnose_conditional_labels(centers, labels, centers=centers)
+
+    assert diagnostics.accuracy == 1.0
+    assert diagnostics.per_label_accuracy == [1.0, 1.0, 1.0, 1.0]
+    assert all(summary.mean < 1e-6 for summary in diagnostics.requested_center_distance)
+
+
+def test_diagnose_conditional_labels_rejects_label_shape_mismatch():
+    centers = default_centers(device="cpu")
+
+    try:
+        diagnose_conditional_labels(centers, torch.tensor([0, 1]), centers=centers)
+    except ValueError as exc:
+        assert "Expected requested_labels" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_print_conditional_label_table_uses_center_names(capsys):
+    centers = default_centers(device="cpu")
+    labels = torch.arange(centers.shape[0])
+    diagnostics = diagnose_conditional_labels(centers, labels, centers=centers)
+
+    print_conditional_label_table({"generated": diagnostics}, center_names=["a", "b", "c", "d"])
+
+    output = capsys.readouterr().out
+    assert "requested" in output
+    assert "generated" in output
+    assert "overall" in output
+    assert "a" in output
