@@ -29,6 +29,13 @@ class SampleDiagnostics:
     projective_distance_to_clean_w1: float | None = None
 
 
+@dataclass(frozen=True)
+class ConditionalLabelDiagnostics:
+    accuracy: float
+    per_label_accuracy: list[float]
+    requested_center_distance: list[DistanceSummary]
+
+
 def wasserstein_1d(x: torch.Tensor, y: torch.Tensor) -> float:
     """Empirical 1-Wasserstein distance between two 1D samples."""
     x = x.detach().flatten().float().cpu().sort().values
@@ -177,6 +184,40 @@ def diagnose_samples(
     )
 
 
+@torch.no_grad()
+def diagnose_conditional_labels(
+    generated: torch.Tensor,
+    requested_labels: torch.Tensor,
+    centers: torch.Tensor | None = None,
+) -> ConditionalLabelDiagnostics:
+    centers = centers if centers is not None else default_centers(device=generated.device)
+    requested_labels = requested_labels.to(device=generated.device, dtype=torch.long)
+    if requested_labels.shape != (generated.shape[0],):
+        raise ValueError(f"Expected requested_labels with shape ({generated.shape[0]},), got {tuple(requested_labels.shape)}")
+
+    dists = _center_distance_matrix(generated, centers=centers)
+    predicted_labels = dists.argmin(dim=1)
+    correct = predicted_labels == requested_labels
+    requested_distances = dists.gather(1, requested_labels.view(-1, 1)).squeeze(1)
+
+    per_label_accuracy = []
+    per_label_distance = []
+    for label in range(centers.shape[0]):
+        mask = requested_labels == label
+        if mask.any():
+            per_label_accuracy.append(correct[mask].float().mean().item())
+            per_label_distance.append(summarize_distances(requested_distances[mask]))
+        else:
+            per_label_accuracy.append(float("nan"))
+            per_label_distance.append(summarize_distances(torch.tensor([float("nan")], device=generated.device)))
+
+    return ConditionalLabelDiagnostics(
+        accuracy=correct.float().mean().item(),
+        per_label_accuracy=per_label_accuracy,
+        requested_center_distance=per_label_distance,
+    )
+
+
 def print_diagnostics_table(results: dict[str, SampleDiagnostics]) -> None:
     header = "sample                 W1 clean   W1 Haar   mass L1   dist mean   dist q50   norm err"
     print(header)
@@ -231,3 +272,31 @@ def print_per_center_table(results: dict[str, SampleDiagnostics], center_names: 
         names = _format_center_names(len(diag.per_center_distance), center_names=center_names)
         print(f"{name} per-center nearest-distance mean:")
         print("  " + " ".join(f"{center}:{summary.mean:.4f}" for center, summary in zip(names, diag.per_center_distance)))
+
+
+def print_conditional_label_table(
+    results: dict[str, ConditionalLabelDiagnostics],
+    center_names: list[str] | None = None,
+) -> None:
+    if not results:
+        raise ValueError("print_conditional_label_table needs at least one diagnostics entry")
+
+    first = next(iter(results.values()))
+    names = _format_center_names(len(first.per_label_accuracy), center_names=center_names)
+    header = f"{'requested':<10}"
+    for sample_name in results:
+        header += f" {sample_name[:13]:>13} {'dist mean':>10}"
+
+    print(header)
+    print("-" * len(header))
+    for i, center_name in enumerate(names):
+        row = f"{center_name:<10}"
+        for diag in results.values():
+            row += f" {diag.per_label_accuracy[i]:>13.4f} {diag.requested_center_distance[i].mean:>10.4f}"
+        print(row)
+
+    print()
+    summary = "overall   "
+    for diag in results.values():
+        summary += f" {diag.accuracy:>13.4f} {'':>10}"
+    print(summary.rstrip())
