@@ -47,11 +47,72 @@ def gate_centers(device: torch.device | str | None = None) -> torch.Tensor:
     return q_normalize(centers)
 
 
+def clifford_centers(device: torch.device | str | None = None) -> torch.Tensor:
+    inv_sqrt2 = 2.0**-0.5
+    centers = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0],  # identity
+            [inv_sqrt2, inv_sqrt2, 0.0, 0.0],  # +/- pi/2 coordinate-axis rotations
+            [inv_sqrt2, -inv_sqrt2, 0.0, 0.0],
+            [inv_sqrt2, 0.0, inv_sqrt2, 0.0],
+            [inv_sqrt2, 0.0, -inv_sqrt2, 0.0],
+            [inv_sqrt2, 0.0, 0.0, inv_sqrt2],
+            [inv_sqrt2, 0.0, 0.0, -inv_sqrt2],
+            [0.0, 1.0, 0.0, 0.0],  # pi coordinate-axis rotations
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.5, 0.5, 0.5, 0.5],  # +/- 2pi/3 body-diagonal rotations
+            [0.5, 0.5, 0.5, -0.5],
+            [0.5, 0.5, -0.5, 0.5],
+            [0.5, 0.5, -0.5, -0.5],
+            [0.5, -0.5, 0.5, 0.5],
+            [0.5, -0.5, 0.5, -0.5],
+            [0.5, -0.5, -0.5, 0.5],
+            [0.5, -0.5, -0.5, -0.5],
+            [0.0, 0.0, inv_sqrt2, inv_sqrt2],  # pi edge-axis rotations
+            [0.0, 0.0, -inv_sqrt2, inv_sqrt2],
+            [0.0, inv_sqrt2, 0.0, inv_sqrt2],
+            [0.0, -inv_sqrt2, 0.0, inv_sqrt2],
+            [0.0, inv_sqrt2, inv_sqrt2, 0.0],
+            [0.0, -inv_sqrt2, inv_sqrt2, 0.0],
+        ],
+        device=device,
+    )
+    return q_normalize(centers)
+
+
 def center_names_for_config(config: DataConfig | BlobConfig | None = None) -> list[str]:
     if config is None or isinstance(config, BlobConfig) or config.kind == "blobs":
         return ["blob 0", "blob 1", "blob 2", "blob 3"]
     if config.kind == "gates":
         return ["I", "X", "Y", "Z", "sqrt(X)", "sqrt(Y)", "sqrt(Z)"]
+    if config.kind == "clifford":
+        return [
+            "I",
+            "X90",
+            "X-90",
+            "Y90",
+            "Y-90",
+            "Z90",
+            "Z-90",
+            "X180",
+            "Y180",
+            "Z180",
+            "B+++",
+            "B++-",
+            "B+-+",
+            "B+--",
+            "B-++",
+            "B-+-",
+            "B--+",
+            "B---",
+            "E0++",
+            "E0-+",
+            "E+0+",
+            "E-0+",
+            "E++0",
+            "E-+0",
+        ]
     raise ValueError(f"Unknown data kind {config.kind!r}")
 
 
@@ -119,6 +180,8 @@ def centers_for_config(config: DataConfig | BlobConfig | None = None, device: to
         return default_centers(device=device)
     if config.kind == "gates":
         return gate_centers(device=device)
+    if config.kind == "clifford":
+        return clifford_centers(device=device)
     raise ValueError(f"Unknown data kind {config.kind!r}")
 
 

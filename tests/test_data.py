@@ -4,10 +4,12 @@ from su2diffusion.data import (
     DataConfig,
     center_names_for_config,
     centers_for_config,
+    clifford_centers,
     gate_centers,
     sample_balanced_labels,
     sample_clean,
 )
+from su2diffusion.quaternion import q_mul
 
 
 def test_gate_centers_are_unit_quaternions():
@@ -24,12 +26,54 @@ def test_gate_center_names_match_gate_centers():
     assert len(center_names_for_config(config)) == gate_centers(device="cpu").shape[0]
 
 
+def test_clifford_centers_are_unit_projective_quaternions():
+    centers = clifford_centers(device="cpu")
+
+    assert centers.shape == (24, 4)
+    assert torch.allclose(centers.norm(dim=-1), torch.ones(24), atol=1e-6)
+
+    projective_dots = centers @ centers.T
+    projective_dots = projective_dots.abs()
+    projective_dots.fill_diagonal_(0.0)
+    assert projective_dots.max().item() < 1.0 - 1e-6
+
+
+def test_clifford_centers_are_closed_under_multiplication_up_to_sign():
+    centers = clifford_centers(device="cpu")
+
+    for left in centers:
+        for right in centers:
+            product = q_mul(left.view(1, 4), right.view(1, 4))
+            projective_dots = (product @ centers.T).abs()
+            assert projective_dots.max().item() > 1.0 - 1e-5
+
+
+def test_clifford_center_names_match_clifford_centers():
+    config = DataConfig(kind="clifford")
+
+    assert center_names_for_config(config)[:3] == ["I", "X90", "X-90"]
+    assert len(center_names_for_config(config)) == clifford_centers(device="cpu").shape[0]
+
+
 def test_sample_clean_gate_data_shapes():
     config = DataConfig(kind="gates", sigma_data=0.12)
     centers = centers_for_config(config, device="cpu")
 
     q, labels = sample_clean(32, centers=centers, config=config)
 
+    assert q.shape == (32, 4)
+    assert labels.shape == (32,)
+    assert labels.max().item() < centers.shape[0]
+    assert torch.allclose(q.norm(dim=-1), torch.ones(32), atol=1e-5)
+
+
+def test_sample_clean_clifford_data_shapes():
+    config = DataConfig(kind="clifford", sigma_data=0.08)
+    centers = centers_for_config(config, device="cpu")
+
+    q, labels = sample_clean(32, centers=centers, config=config)
+
+    assert centers.shape == (24, 4)
     assert q.shape == (32, 4)
     assert labels.shape == (32,)
     assert labels.max().item() < centers.shape[0]

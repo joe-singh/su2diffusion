@@ -45,6 +45,17 @@ def test_get_experiment_config_returns_conditional_gate_variant():
     assert config.eta == 1.0
 
 
+def test_get_experiment_config_returns_conditional_clifford_variant():
+    config = get_experiment_config("smoke-clifford-cond")
+
+    assert config.name == "smoke-clifford-cond"
+    assert config.data.kind == "clifford"
+    assert config.data.sigma_data == 0.08
+    assert config.train.conditional is True
+    assert config.conditional_sampling is True
+    assert config.eta == 1.0
+
+
 def test_get_experiment_config_rejects_unknown_name():
     with pytest.raises(ValueError, match="Unknown experiment config"):
         get_experiment_config("missing")
