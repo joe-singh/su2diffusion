@@ -5,8 +5,11 @@ from su2diffusion.synthesis import (
     compose_local_entangler_local,
     local_layer,
     make_synthesis_report,
+    make_hidden_shallow_circuit_targets,
+    print_hidden_shallow_circuit_benchmark,
     print_synthesis_summary,
     quaternion_to_unitary,
+    run_hidden_shallow_circuit_benchmark,
     slot_labels_for_named_target,
     synthesize_bell_state,
     synthesize_bell_state_report,
@@ -16,6 +19,8 @@ from su2diffusion.synthesis import (
     synthesize_named_gate_report,
     synthesize_named_gate_unconstrained,
     synthesize_named_gate_unconstrained_report,
+    synthesize_unitary_label_grid_report,
+    synthesize_unitary_unconstrained_report,
     two_qubit_gate,
     unitary_fidelity,
     unitary_fidelity_batch,
@@ -273,3 +278,88 @@ def test_bell_synthesis_report_keeps_full_fidelity_distribution():
 
     assert len(report.candidates) == 5
     assert len(report.fidelities) == 16
+
+
+def test_unitary_label_grid_report_finds_hidden_template_target():
+    local_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+    h = quaternion_to_unitary(_h_quaternion())
+    target = compose_local_entangler_local(
+        torch.eye(2, dtype=torch.complex64),
+        h,
+        two_qubit_gate("cz"),
+        torch.eye(2, dtype=torch.complex64),
+        h,
+    )
+
+    report = synthesize_unitary_label_grid_report(
+        local_gates,
+        labels,
+        target_unitary=target,
+        target_name="hidden",
+        entangler="cz",
+        top_k=1,
+    )
+
+    assert report.candidates[0].fidelity > 1.0 - 1e-6
+    assert report.candidates[0].slot_labels == ("I", "H", "I", "H")
+
+
+def test_unitary_random_report_returns_finite_candidates():
+    local_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+    target = two_qubit_gate("cz")
+
+    report = synthesize_unitary_unconstrained_report(
+        local_gates,
+        target_unitary=target,
+        target_name="hidden",
+        entangler="cz",
+        n_candidates=32,
+        top_k=3,
+        local_labels=labels,
+    )
+
+    assert len(report.candidates) == 3
+    assert len(report.fidelities) == 32
+    assert all(0.0 <= candidate.fidelity <= 1.0 for candidate in report.candidates)
+
+
+def test_hidden_shallow_circuit_benchmark_recovers_exact_targets(capsys):
+    exact_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    targets = make_hidden_shallow_circuit_targets(exact_gates, labels, n_targets=2, seed=4)
+    benchmarks = run_hidden_shallow_circuit_benchmark(
+        exact_gates=exact_gates,
+        exact_labels=labels,
+        generated_gates=exact_gates,
+        generated_labels=labels,
+        n_targets=2,
+        n_random_candidates=32,
+        top_k=2,
+        seed=4,
+    )
+    print_hidden_shallow_circuit_benchmark(benchmarks)
+
+    captured = capsys.readouterr().out
+    assert "hidden labels" in captured
+    assert len(targets) == 2
+    assert len(benchmarks) == 2
+    assert all(benchmark.exact_report.candidates[0].fidelity > 1.0 - 1e-6 for benchmark in benchmarks)
+    assert all(benchmark.generated_label_grid_report.candidates[0].fidelity > 1.0 - 1e-6 for benchmark in benchmarks)

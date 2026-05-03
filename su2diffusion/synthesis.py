@@ -24,6 +24,23 @@ class SynthesisReport:
     fidelities: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class HiddenShallowCircuitTarget:
+    name: str
+    entangler: str
+    unitary: torch.Tensor
+    slot_indices: tuple[int, int, int, int]
+    slot_labels: tuple[str, str, str, str]
+
+
+@dataclass(frozen=True)
+class HiddenShallowCircuitBenchmark:
+    target: HiddenShallowCircuitTarget
+    exact_report: SynthesisReport
+    generated_label_grid_report: SynthesisReport
+    random_report: SynthesisReport
+
+
 def quaternion_to_unitary(q: torch.Tensor) -> torch.Tensor:
     q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     q = q.to(torch.complex64)
@@ -147,8 +164,46 @@ def synthesize_named_gate_report(
     target = target.lower()
     entangler = entangler.lower()
     device = local_gates.device
-    units = quaternion_to_unitary(local_gates)
     target_unitary = two_qubit_gate(target, device=device)
+
+    return synthesize_unitary_guided_report(
+        local_gates,
+        target_unitary=target_unitary,
+        target_name=target,
+        entangler=entangler,
+        n_candidates=n_candidates,
+        top_k=top_k,
+        local_labels=local_labels,
+        slot_label_names=slot_label_names,
+        seed=seed,
+        name=name or f"{target.upper()} guided search",
+    )
+
+
+def synthesize_unitary_guided_report(
+    local_gates: torch.Tensor,
+    target_unitary: torch.Tensor,
+    target_name: str = "target",
+    entangler: str = "cz",
+    n_candidates: int = 1024,
+    top_k: int = 5,
+    local_labels: list[str | None] | None = None,
+    slot_label_names: tuple[str, str, str, str] | None = None,
+    seed: int = 0,
+    name: str | None = None,
+) -> SynthesisReport:
+    if local_gates.shape[0] == 0:
+        raise ValueError("synthesize_unitary_guided_report needs at least one local gate")
+    if n_candidates <= 0:
+        raise ValueError("n_candidates must be positive")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    target_name = target_name.lower()
+    entangler = entangler.lower()
+    device = local_gates.device
+    units = quaternion_to_unitary(local_gates)
+    target_unitary = target_unitary.to(device=device, dtype=torch.complex64)
     entangler_unitary = two_qubit_gate(entangler, device=device)
 
     generator = torch.Generator()
@@ -168,7 +223,7 @@ def synthesize_named_gate_report(
         labels = _labels_for_slots(slots, local_labels)
         candidates.append(
             SynthesisCandidate(
-                target=target,
+                target=target_name,
                 template="local-entangler-local",
                 entangler=entangler,
                 fidelity=unitary_fidelity(unitary, target_unitary),
@@ -180,7 +235,7 @@ def synthesize_named_gate_report(
     candidates.sort(key=lambda candidate: candidate.fidelity, reverse=True)
     return make_synthesis_report(
         candidates[:top_k],
-        name=name or f"{target.upper()} guided search",
+        name=name or f"{target_name} guided search",
         mode="guided",
         fidelities=[candidate.fidelity for candidate in candidates],
     )
@@ -242,8 +297,68 @@ def synthesize_named_gate_unconstrained_report(
     target = target.lower()
     entangler = entangler.lower()
     device = local_gates.device
-    units = quaternion_to_unitary(local_gates)
     target_unitary = two_qubit_gate(target, device=device)
+
+    return synthesize_unitary_unconstrained_report(
+        local_gates,
+        target_unitary=target_unitary,
+        target_name=target,
+        entangler=entangler,
+        n_candidates=n_candidates,
+        top_k=top_k,
+        local_labels=local_labels,
+        seed=seed,
+        name=name or f"{target.upper()} random generated search",
+    )
+
+
+def synthesize_named_gate_label_grid_report(
+    local_gates: torch.Tensor,
+    local_labels: list[str],
+    target: str = "cz",
+    entangler: str = "cz",
+    top_k: int = 5,
+    name: str | None = None,
+) -> SynthesisReport:
+    target = target.lower()
+    entangler = entangler.lower()
+    device = local_gates.device
+    target_unitary = two_qubit_gate(target, device=device)
+
+    return synthesize_unitary_label_grid_report(
+        local_gates,
+        local_labels,
+        target_unitary=target_unitary,
+        target_name=target,
+        entangler=entangler,
+        top_k=top_k,
+        name=name or f"{target.upper()} label-grid search",
+    )
+
+
+def synthesize_unitary_unconstrained_report(
+    local_gates: torch.Tensor,
+    target_unitary: torch.Tensor,
+    target_name: str = "target",
+    entangler: str = "cz",
+    n_candidates: int = 100_000,
+    top_k: int = 5,
+    local_labels: list[str | None] | None = None,
+    seed: int = 0,
+    name: str | None = None,
+) -> SynthesisReport:
+    if local_gates.shape[0] == 0:
+        raise ValueError("synthesize_unitary_unconstrained_report needs at least one local gate")
+    if n_candidates <= 0:
+        raise ValueError("n_candidates must be positive")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    target_name = target_name.lower()
+    entangler = entangler.lower()
+    device = local_gates.device
+    units = quaternion_to_unitary(local_gates)
+    target_unitary = target_unitary.to(device=device, dtype=torch.complex64)
     entangler_unitary = two_qubit_gate(entangler, device=device)
 
     generator = torch.Generator(device=device)
@@ -264,7 +379,7 @@ def synthesize_named_gate_unconstrained_report(
     candidates = _top_candidates_from_slots(
         fidelities=fidelities,
         slot_indices=indices,
-        target=target,
+        target=target_name,
         entangler=entangler,
         template="unconstrained-local-entangler-local",
         top_k=top_k,
@@ -272,34 +387,34 @@ def synthesize_named_gate_unconstrained_report(
     )
     return make_synthesis_report(
         candidates,
-        name=name or f"{target.upper()} random generated search",
+        name=name or f"{target_name} random generated search",
         mode="random",
         fidelities=fidelities.tolist(),
     )
 
 
-def synthesize_named_gate_label_grid_report(
+def synthesize_unitary_label_grid_report(
     local_gates: torch.Tensor,
     local_labels: list[str],
-    target: str = "cz",
+    target_unitary: torch.Tensor,
+    target_name: str = "target",
     entangler: str = "cz",
     top_k: int = 5,
     name: str | None = None,
 ) -> SynthesisReport:
     if local_gates.shape[0] == 0:
-        raise ValueError("synthesize_named_gate_label_grid_report needs at least one local gate")
+        raise ValueError("synthesize_unitary_label_grid_report needs at least one local gate")
     if top_k <= 0:
         raise ValueError("top_k must be positive")
 
+    target_name = target_name.lower()
+    entangler = entangler.lower()
+    device = local_gates.device
     unique_labels = list(dict.fromkeys(local_labels))
     representative_indices = [_first_index_for_label(local_labels, label) for label in unique_labels]
     representatives = local_gates[representative_indices]
     units = quaternion_to_unitary(representatives)
-
-    target = target.lower()
-    entangler = entangler.lower()
-    device = local_gates.device
-    target_unitary = two_qubit_gate(target, device=device)
+    target_unitary = target_unitary.to(device=device, dtype=torch.complex64)
     entangler_unitary = two_qubit_gate(entangler, device=device)
 
     n_labels = len(unique_labels)
@@ -322,7 +437,7 @@ def synthesize_named_gate_label_grid_report(
         sample_slots = tuple(representative_indices[label_idx] for label_idx in label_slots)
         candidates.append(
             SynthesisCandidate(
-                target=target,
+                target=target_name,
                 template="label-grid-local-entangler-local",
                 entangler=entangler,
                 fidelity=value,
@@ -332,7 +447,7 @@ def synthesize_named_gate_label_grid_report(
         )
     return make_synthesis_report(
         candidates,
-        name=name or f"{target.upper()} label-grid search",
+        name=name or f"{target_name} label-grid search",
         mode="label-grid",
         fidelities=fidelities.tolist(),
     )
@@ -475,6 +590,132 @@ def plot_synthesis_fidelity_histograms(
     plt.title("Synthesis search fidelity distributions")
     plt.legend()
     plt.tight_layout()
+
+
+def make_hidden_shallow_circuit_targets(
+    local_gates: torch.Tensor,
+    local_labels: list[str],
+    n_targets: int = 8,
+    entangler: str = "cz",
+    seed: int = 0,
+) -> list[HiddenShallowCircuitTarget]:
+    if local_gates.shape[0] == 0:
+        raise ValueError("make_hidden_shallow_circuit_targets needs at least one local gate")
+    if n_targets <= 0:
+        raise ValueError("n_targets must be positive")
+
+    entangler = entangler.lower()
+    device = local_gates.device
+    units = quaternion_to_unitary(local_gates)
+    entangler_unitary = two_qubit_gate(entangler, device=device)
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    slot_indices = torch.randint(
+        low=0,
+        high=local_gates.shape[0],
+        size=(n_targets, 4),
+        device=device,
+        generator=generator,
+    )
+
+    targets = []
+    for i, slots_tensor in enumerate(slot_indices):
+        slots = tuple(int(index) for index in slots_tensor.tolist())
+        left_a, left_b, right_a, right_b = (units[index] for index in slots)
+        unitary = compose_local_entangler_local(left_a, left_b, entangler_unitary, right_a, right_b)
+        targets.append(
+            HiddenShallowCircuitTarget(
+                name=f"hidden-{i:02d}",
+                entangler=entangler,
+                unitary=unitary,
+                slot_indices=slots,
+                slot_labels=tuple(local_labels[index] for index in slots),
+            )
+        )
+    return targets
+
+
+def run_hidden_shallow_circuit_benchmark(
+    exact_gates: torch.Tensor,
+    exact_labels: list[str],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    n_targets: int = 8,
+    entangler: str = "cz",
+    n_random_candidates: int = 100_000,
+    top_k: int = 5,
+    seed: int = 0,
+) -> list[HiddenShallowCircuitBenchmark]:
+    targets = make_hidden_shallow_circuit_targets(
+        exact_gates,
+        exact_labels,
+        n_targets=n_targets,
+        entangler=entangler,
+        seed=seed,
+    )
+
+    benchmarks = []
+    for i, target in enumerate(targets):
+        exact_report = synthesize_unitary_label_grid_report(
+            exact_gates,
+            exact_labels,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            top_k=top_k,
+            name=f"{target.name} exact grid",
+        )
+        generated_label_grid_report = synthesize_unitary_label_grid_report(
+            generated_gates,
+            generated_labels,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            top_k=top_k,
+            name=f"{target.name} generated label grid",
+        )
+        random_report = synthesize_unitary_unconstrained_report(
+            generated_gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            n_candidates=n_random_candidates,
+            top_k=top_k,
+            local_labels=generated_labels,
+            seed=seed + i + 1,
+            name=f"{target.name} generated random",
+        )
+        benchmarks.append(
+            HiddenShallowCircuitBenchmark(
+                target=target,
+                exact_report=exact_report,
+                generated_label_grid_report=generated_label_grid_report,
+                random_report=random_report,
+            )
+        )
+    return benchmarks
+
+
+def print_hidden_shallow_circuit_benchmark(
+    benchmarks: list[HiddenShallowCircuitBenchmark],
+) -> None:
+    header = "target     hidden labels                    exact    gen-grid   random   best generated labels"
+    print(header)
+    print("-" * len(header))
+    for benchmark in benchmarks:
+        hidden_labels = ", ".join(benchmark.target.slot_labels)
+        best_labels = ", ".join(
+            label if label is not None else "?"
+            for label in benchmark.generated_label_grid_report.candidates[0].slot_labels
+        )
+        print(
+            f"{benchmark.target.name:<10} {hidden_labels:<32} "
+            f"{benchmark.exact_report.candidates[0].fidelity:>6.4f}   "
+            f"{benchmark.generated_label_grid_report.candidates[0].fidelity:>8.4f}   "
+            f"{benchmark.random_report.candidates[0].fidelity:>6.4f}   "
+            f"{best_labels}"
+        )
 
 
 def slot_labels_for_named_target(target: str, entangler: str) -> tuple[str, str, str, str]:
