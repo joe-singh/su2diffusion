@@ -41,6 +41,19 @@ class HiddenShallowCircuitBenchmark:
     random_report: SynthesisReport
 
 
+@dataclass(frozen=True)
+class HiddenShallowCircuitAggregate:
+    mode: str
+    n_targets: int
+    mean_best: float
+    median_best: float
+    min_best: float
+    max_best: float
+    success_95: float
+    success_98: float
+    success_99: float
+
+
 def quaternion_to_unitary(q: torch.Tensor) -> torch.Tensor:
     q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     q = q.to(torch.complex64)
@@ -346,6 +359,7 @@ def synthesize_unitary_unconstrained_report(
     local_labels: list[str | None] | None = None,
     seed: int = 0,
     name: str | None = None,
+    keep_fidelities: bool = True,
 ) -> SynthesisReport:
     if local_gates.shape[0] == 0:
         raise ValueError("synthesize_unitary_unconstrained_report needs at least one local gate")
@@ -389,7 +403,7 @@ def synthesize_unitary_unconstrained_report(
         candidates,
         name=name or f"{target_name} random generated search",
         mode="random",
-        fidelities=fidelities.tolist(),
+        fidelities=fidelities.tolist() if keep_fidelities else None,
     )
 
 
@@ -401,6 +415,7 @@ def synthesize_unitary_label_grid_report(
     entangler: str = "cz",
     top_k: int = 5,
     name: str | None = None,
+    keep_fidelities: bool = True,
 ) -> SynthesisReport:
     if local_gates.shape[0] == 0:
         raise ValueError("synthesize_unitary_label_grid_report needs at least one local gate")
@@ -449,7 +464,7 @@ def synthesize_unitary_label_grid_report(
         candidates,
         name=name or f"{target_name} label-grid search",
         mode="label-grid",
-        fidelities=fidelities.tolist(),
+        fidelities=fidelities.tolist() if keep_fidelities else None,
     )
 
 
@@ -646,6 +661,7 @@ def run_hidden_shallow_circuit_benchmark(
     n_random_candidates: int = 100_000,
     top_k: int = 5,
     seed: int = 0,
+    keep_fidelities: bool = True,
 ) -> list[HiddenShallowCircuitBenchmark]:
     targets = make_hidden_shallow_circuit_targets(
         exact_gates,
@@ -665,6 +681,7 @@ def run_hidden_shallow_circuit_benchmark(
             entangler=entangler,
             top_k=top_k,
             name=f"{target.name} exact grid",
+            keep_fidelities=keep_fidelities,
         )
         generated_label_grid_report = synthesize_unitary_label_grid_report(
             generated_gates,
@@ -674,6 +691,7 @@ def run_hidden_shallow_circuit_benchmark(
             entangler=entangler,
             top_k=top_k,
             name=f"{target.name} generated label grid",
+            keep_fidelities=keep_fidelities,
         )
         random_report = synthesize_unitary_unconstrained_report(
             generated_gates,
@@ -685,6 +703,7 @@ def run_hidden_shallow_circuit_benchmark(
             local_labels=generated_labels,
             seed=seed + i + 1,
             name=f"{target.name} generated random",
+            keep_fidelities=keep_fidelities,
         )
         benchmarks.append(
             HiddenShallowCircuitBenchmark(
@@ -716,6 +735,63 @@ def print_hidden_shallow_circuit_benchmark(
             f"{benchmark.random_report.candidates[0].fidelity:>6.4f}   "
             f"{best_labels}"
         )
+
+
+def summarize_hidden_shallow_circuit_benchmark(
+    benchmarks: list[HiddenShallowCircuitBenchmark],
+) -> list[HiddenShallowCircuitAggregate]:
+    if not benchmarks:
+        raise ValueError("summarize_hidden_shallow_circuit_benchmark needs at least one benchmark")
+
+    return [
+        _hidden_benchmark_aggregate("exact-grid", [item.exact_report for item in benchmarks]),
+        _hidden_benchmark_aggregate(
+            "generated-label-grid",
+            [item.generated_label_grid_report for item in benchmarks],
+        ),
+        _hidden_benchmark_aggregate("generated-random", [item.random_report for item in benchmarks]),
+    ]
+
+
+def print_hidden_shallow_circuit_summary(
+    benchmarks: list[HiddenShallowCircuitBenchmark] | list[HiddenShallowCircuitAggregate],
+) -> None:
+    aggregates = (
+        benchmarks
+        if benchmarks and isinstance(benchmarks[0], HiddenShallowCircuitAggregate)
+        else summarize_hidden_shallow_circuit_benchmark(benchmarks)
+    )
+    header = "mode                   n   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for item in aggregates:
+        print(
+            f"{item.mode:<22} {item.n_targets:<3} "
+            f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
+            f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
+            f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
+def plot_hidden_shallow_circuit_best_fidelities(
+    benchmarks: list[HiddenShallowCircuitBenchmark],
+) -> None:
+    if not benchmarks:
+        raise ValueError("plot_hidden_shallow_circuit_best_fidelities needs at least one benchmark")
+
+    values = [
+        _hidden_benchmark_best_values([item.exact_report for item in benchmarks]),
+        _hidden_benchmark_best_values([item.generated_label_grid_report for item in benchmarks]),
+        _hidden_benchmark_best_values([item.random_report for item in benchmarks]),
+    ]
+    labels = ["exact grid", "generated label grid", "generated random"]
+
+    plt.figure(figsize=(8, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Hidden shallow-circuit synthesis benchmark")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
 
 
 def slot_labels_for_named_target(target: str, entangler: str) -> tuple[str, str, str, str]:
@@ -798,3 +874,22 @@ def _top_candidates_from_slots(
             )
         )
     return candidates
+
+
+def _hidden_benchmark_best_values(reports: list[SynthesisReport]) -> torch.Tensor:
+    return torch.tensor([report.candidates[0].fidelity for report in reports], dtype=torch.float32)
+
+
+def _hidden_benchmark_aggregate(mode: str, reports: list[SynthesisReport]) -> HiddenShallowCircuitAggregate:
+    values = _hidden_benchmark_best_values(reports)
+    return HiddenShallowCircuitAggregate(
+        mode=mode,
+        n_targets=values.numel(),
+        mean_best=values.mean().item(),
+        median_best=values.median().item(),
+        min_best=values.min().item(),
+        max_best=values.max().item(),
+        success_95=(values >= 0.95).float().mean().item(),
+        success_98=(values >= 0.98).float().mean().item(),
+        success_99=(values >= 0.99).float().mean().item(),
+    )
