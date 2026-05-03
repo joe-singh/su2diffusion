@@ -8,8 +8,11 @@ from su2diffusion.synthesis import (
     slot_labels_for_named_target,
     synthesize_bell_state,
     synthesize_named_gate,
+    synthesize_named_gate_label_grid,
+    synthesize_named_gate_unconstrained,
     two_qubit_gate,
     unitary_fidelity,
+    unitary_fidelity_batch,
 )
 
 
@@ -58,6 +61,15 @@ def test_unitary_fidelity_is_global_phase_invariant():
     assert unitary_fidelity(phased, target) > 1.0 - 1e-6
 
 
+def test_unitary_fidelity_batch_matches_scalar_fidelity():
+    target = two_qubit_gate("cz")
+    candidates = torch.stack([target, 1j * target])
+
+    actual = unitary_fidelity_batch(candidates, target)
+
+    assert torch.allclose(actual, torch.ones(2), atol=1e-6)
+
+
 def test_named_gate_synthesis_can_use_label_constrained_slots():
     local_gates = torch.stack(
         [
@@ -94,6 +106,48 @@ def test_synthesis_ranking_returns_sorted_finite_candidates():
         [candidate.fidelity for candidate in candidates],
         reverse=True,
     )
+
+
+def test_unconstrained_named_gate_synthesis_finds_known_decomposition():
+    local_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    candidates = synthesize_named_gate_unconstrained(
+        local_gates,
+        target="cnot",
+        entangler="cz",
+        n_candidates=128,
+        top_k=3,
+        local_labels=labels,
+        seed=2,
+    )
+
+    assert len(candidates) == 3
+    assert candidates[0].fidelity > 1.0 - 1e-6
+    assert candidates[0].slot_labels == ("I", "H", "I", "H")
+
+
+def test_label_grid_synthesis_finds_known_decompositions():
+    local_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    cz = synthesize_named_gate_label_grid(local_gates, labels, target="cz", entangler="cz", top_k=1)
+    cnot = synthesize_named_gate_label_grid(local_gates, labels, target="cnot", entangler="cz", top_k=1)
+
+    assert cz[0].fidelity > 1.0 - 1e-6
+    assert cz[0].slot_labels == ("I", "I", "I", "I")
+    assert cnot[0].fidelity > 1.0 - 1e-6
+    assert cnot[0].slot_labels == ("I", "H", "I", "H")
 
 
 def test_bell_synthesis_returns_sorted_candidates():

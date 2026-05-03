@@ -38,8 +38,11 @@ from .synthesis import (
     slot_labels_for_named_target,
     synthesize_bell_state,
     synthesize_named_gate,
+    synthesize_named_gate_label_grid,
+    synthesize_named_gate_unconstrained,
     two_qubit_gate,
     unitary_fidelity,
+    unitary_fidelity_batch,
 )
 from .train import TrainConfig, train_heat_kernel_model
 from .viz import plot_experiment_report
@@ -95,8 +98,11 @@ __all__ = [
     "slot_labels_for_named_target",
     "synthesize_bell_state",
     "synthesize_named_gate",
+    "synthesize_named_gate_label_grid",
+    "synthesize_named_gate_unconstrained",
     "two_qubit_gate",
     "su2_distance",
     "train_heat_kernel_model",
     "unitary_fidelity",
+    "unitary_fidelity_batch",
 ]

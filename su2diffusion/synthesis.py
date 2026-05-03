@@ -80,6 +80,12 @@ def unitary_fidelity(candidate: torch.Tensor, target: torch.Tensor) -> float:
     return overlap.real.item()
 
 
+def unitary_fidelity_batch(candidates: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    dim = candidates.shape[-1]
+    overlaps = torch.einsum("ij,nij->n", target.conj(), candidates).abs() / dim
+    return overlaps.real
+
+
 def bell_state_fidelity(candidate: torch.Tensor) -> float:
     initial = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.complex64, device=candidate.device)
     target = bell_state(device=candidate.device)
@@ -139,6 +145,116 @@ def synthesize_named_gate(
 
     candidates.sort(key=lambda candidate: candidate.fidelity, reverse=True)
     return candidates[:top_k]
+
+
+def synthesize_named_gate_unconstrained(
+    local_gates: torch.Tensor,
+    target: str = "cz",
+    entangler: str = "cz",
+    n_candidates: int = 100_000,
+    top_k: int = 5,
+    local_labels: list[str | None] | None = None,
+    seed: int = 0,
+) -> list[SynthesisCandidate]:
+    if local_gates.shape[0] == 0:
+        raise ValueError("synthesize_named_gate_unconstrained needs at least one local gate")
+    if n_candidates <= 0:
+        raise ValueError("n_candidates must be positive")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    target = target.lower()
+    entangler = entangler.lower()
+    device = local_gates.device
+    units = quaternion_to_unitary(local_gates)
+    target_unitary = two_qubit_gate(target, device=device)
+    entangler_unitary = two_qubit_gate(entangler, device=device)
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    indices = torch.randint(
+        low=0,
+        high=local_gates.shape[0],
+        size=(n_candidates, 4),
+        device=device,
+        generator=generator,
+    )
+
+    left = _batched_local_layer(units[indices[:, 0]], units[indices[:, 1]])
+    right = _batched_local_layer(units[indices[:, 2]], units[indices[:, 3]])
+    entanglers = entangler_unitary.expand(n_candidates, 4, 4)
+    unitaries = left @ entanglers @ right
+    fidelities = unitary_fidelity_batch(unitaries, target_unitary)
+    values, rows = torch.topk(fidelities, k=min(top_k, n_candidates))
+
+    candidates = []
+    for value, row in zip(values.tolist(), rows.tolist()):
+        slots = indices[row].tolist()
+        candidates.append(
+            SynthesisCandidate(
+                target=target,
+                template="unconstrained-local-entangler-local",
+                entangler=entangler,
+                fidelity=value,
+                slot_indices=tuple(slots),
+                slot_labels=_labels_for_slots(slots, local_labels),
+            )
+        )
+    return candidates
+
+
+def synthesize_named_gate_label_grid(
+    local_gates: torch.Tensor,
+    local_labels: list[str],
+    target: str = "cz",
+    entangler: str = "cz",
+    top_k: int = 5,
+) -> list[SynthesisCandidate]:
+    if local_gates.shape[0] == 0:
+        raise ValueError("synthesize_named_gate_label_grid needs at least one local gate")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    unique_labels = list(dict.fromkeys(local_labels))
+    representative_indices = [_first_index_for_label(local_labels, label) for label in unique_labels]
+    representatives = local_gates[representative_indices]
+    units = quaternion_to_unitary(representatives)
+
+    target = target.lower()
+    entangler = entangler.lower()
+    device = local_gates.device
+    target_unitary = two_qubit_gate(target, device=device)
+    entangler_unitary = two_qubit_gate(entangler, device=device)
+
+    n_labels = len(unique_labels)
+    grid = torch.cartesian_prod(
+        torch.arange(n_labels, device=device),
+        torch.arange(n_labels, device=device),
+        torch.arange(n_labels, device=device),
+        torch.arange(n_labels, device=device),
+    )
+    left = _batched_local_layer(units[grid[:, 0]], units[grid[:, 1]])
+    right = _batched_local_layer(units[grid[:, 2]], units[grid[:, 3]])
+    entanglers = entangler_unitary.expand(grid.shape[0], 4, 4)
+    unitaries = left @ entanglers @ right
+    fidelities = unitary_fidelity_batch(unitaries, target_unitary)
+    values, rows = torch.topk(fidelities, k=min(top_k, grid.shape[0]))
+
+    candidates = []
+    for value, row in zip(values.tolist(), rows.tolist()):
+        label_slots = grid[row].tolist()
+        sample_slots = tuple(representative_indices[label_idx] for label_idx in label_slots)
+        candidates.append(
+            SynthesisCandidate(
+                target=target,
+                template="label-grid-local-entangler-local",
+                entangler=entangler,
+                fidelity=value,
+                slot_indices=sample_slots,
+                slot_labels=tuple(unique_labels[label_idx] for label_idx in label_slots),
+            )
+        )
+    return candidates
 
 
 def synthesize_bell_state(
@@ -237,6 +353,17 @@ def _sample_slot_indices(
             slots.append(pool[choice])
         indices.append(slots)
     return indices
+
+
+def _batched_local_layer(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.einsum("nab,ncd->nacbd", a, b).reshape(a.shape[0], 4, 4)
+
+
+def _first_index_for_label(local_labels: list[str], label: str) -> int:
+    for i, local_label in enumerate(local_labels):
+        if local_label == label:
+            return i
+    raise ValueError(f"No local gates found for label {label!r}")
 
 
 def _labels_for_slots(slots: list[int], local_labels: list[str | None] | None) -> tuple[str | None, str | None, str | None, str | None]:
