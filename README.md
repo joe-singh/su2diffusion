@@ -80,3 +80,9 @@ The first circuit-level diffusion path models full depth-2 local-gate stacks on
 `(A tensor B) CZ (C tensor D) CZ (E tensor F)`, so the denoiser can learn
 correlations across circuit slots instead of sampling six local gates
 independently.
+
+The solution-stack workflow turns this into a synthesis-driven dataset: hidden
+near-Clifford targets are solved by search plus local `SU(2)` refinement, and
+the refined six-gate stacks train a second joint circuit diffusion model. This
+tests whether learning from successful circuits improves proposal quality over
+random near-Clifford circuit stacks.
