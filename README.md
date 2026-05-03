@@ -45,3 +45,13 @@ The synthesis demo has two parts:
 
 In the first 50-target Colab benchmark, generated label-grid search recovered
 all hidden shallow circuits above `0.98` best unitary fidelity.
+
+The notebook also includes a depth-2 hidden benchmark for circuits of the form
+
+```text
+(A tensor B) CZ (C tensor D) CZ (E tensor F)
+```
+
+At this depth exhaustive Clifford search is too large for the default workflow,
+so the benchmark uses random search over generated six-slot local-gate
+candidates and reports aggregate best-fidelity success rates.

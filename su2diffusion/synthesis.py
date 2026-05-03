@@ -10,8 +10,8 @@ class SynthesisCandidate:
     template: str
     entangler: str
     fidelity: float
-    slot_indices: tuple[int, int, int, int]
-    slot_labels: tuple[str | None, str | None, str | None, str | None]
+    slot_indices: tuple[int, ...]
+    slot_labels: tuple[str | None, ...]
 
 
 @dataclass(frozen=True)
@@ -29,8 +29,8 @@ class HiddenShallowCircuitTarget:
     name: str
     entangler: str
     unitary: torch.Tensor
-    slot_indices: tuple[int, int, int, int]
-    slot_labels: tuple[str, str, str, str]
+    slot_indices: tuple[int, ...]
+    slot_labels: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,14 @@ class HiddenShallowCircuitBenchmark:
     exact_report: SynthesisReport
     generated_label_grid_report: SynthesisReport
     random_report: SynthesisReport
+
+
+@dataclass(frozen=True)
+class HiddenTwoEntanglerCircuitBenchmark:
+    target: HiddenShallowCircuitTarget
+    oracle_fidelity: float
+    exact_random_report: SynthesisReport
+    generated_random_report: SynthesisReport
 
 
 @dataclass(frozen=True)
@@ -115,16 +123,34 @@ def compose_local_entangler_local(
     return local_layer(left_a, left_b) @ entangler @ local_layer(right_a, right_b)
 
 
+def compose_two_entangler_local(
+    first_a: torch.Tensor,
+    first_b: torch.Tensor,
+    entangler: torch.Tensor,
+    middle_a: torch.Tensor,
+    middle_b: torch.Tensor,
+    second_a: torch.Tensor,
+    second_b: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        local_layer(first_a, first_b)
+        @ entangler
+        @ local_layer(middle_a, middle_b)
+        @ entangler
+        @ local_layer(second_a, second_b)
+    )
+
+
 def unitary_fidelity(candidate: torch.Tensor, target: torch.Tensor) -> float:
     dim = candidate.shape[-1]
     overlap = torch.trace(target.conj().T @ candidate).abs() / dim
-    return overlap.real.item()
+    return overlap.real.clamp(0.0, 1.0).item()
 
 
 def unitary_fidelity_batch(candidates: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     dim = candidates.shape[-1]
     overlaps = torch.einsum("ij,nij->n", target.conj(), candidates).abs() / dim
-    return overlaps.real
+    return overlaps.real.clamp(0.0, 1.0)
 
 
 def bell_state_fidelity(candidate: torch.Tensor) -> float:
@@ -407,6 +433,65 @@ def synthesize_unitary_unconstrained_report(
     )
 
 
+def synthesize_unitary_two_entangler_random_report(
+    local_gates: torch.Tensor,
+    target_unitary: torch.Tensor,
+    target_name: str = "target",
+    entangler: str = "cz",
+    n_candidates: int = 100_000,
+    top_k: int = 5,
+    local_labels: list[str | None] | None = None,
+    seed: int = 0,
+    name: str | None = None,
+    keep_fidelities: bool = True,
+) -> SynthesisReport:
+    if local_gates.shape[0] == 0:
+        raise ValueError("synthesize_unitary_two_entangler_random_report needs at least one local gate")
+    if n_candidates <= 0:
+        raise ValueError("n_candidates must be positive")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    target_name = target_name.lower()
+    entangler = entangler.lower()
+    device = local_gates.device
+    units = quaternion_to_unitary(local_gates)
+    target_unitary = target_unitary.to(device=device, dtype=torch.complex64)
+    entangler_unitary = two_qubit_gate(entangler, device=device)
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    indices = torch.randint(
+        low=0,
+        high=local_gates.shape[0],
+        size=(n_candidates, 6),
+        device=device,
+        generator=generator,
+    )
+
+    first = _batched_local_layer(units[indices[:, 0]], units[indices[:, 1]])
+    middle = _batched_local_layer(units[indices[:, 2]], units[indices[:, 3]])
+    second = _batched_local_layer(units[indices[:, 4]], units[indices[:, 5]])
+    entanglers = entangler_unitary.expand(n_candidates, 4, 4)
+    unitaries = first @ entanglers @ middle @ entanglers @ second
+    fidelities = unitary_fidelity_batch(unitaries, target_unitary)
+    candidates = _top_candidates_from_slots(
+        fidelities=fidelities,
+        slot_indices=indices,
+        target=target_name,
+        entangler=entangler,
+        template="two-entangler-local",
+        top_k=top_k,
+        local_labels=local_labels,
+    )
+    return make_synthesis_report(
+        candidates,
+        name=name or f"{target_name} two-entangler random search",
+        mode="two-entangler-random",
+        fidelities=fidelities.tolist() if keep_fidelities else None,
+    )
+
+
 def synthesize_unitary_label_grid_report(
     local_gates: torch.Tensor,
     local_labels: list[str],
@@ -651,6 +736,58 @@ def make_hidden_shallow_circuit_targets(
     return targets
 
 
+def make_hidden_two_entangler_circuit_targets(
+    local_gates: torch.Tensor,
+    local_labels: list[str],
+    n_targets: int = 8,
+    entangler: str = "cz",
+    seed: int = 0,
+) -> list[HiddenShallowCircuitTarget]:
+    if local_gates.shape[0] == 0:
+        raise ValueError("make_hidden_two_entangler_circuit_targets needs at least one local gate")
+    if n_targets <= 0:
+        raise ValueError("n_targets must be positive")
+
+    entangler = entangler.lower()
+    device = local_gates.device
+    units = quaternion_to_unitary(local_gates)
+    entangler_unitary = two_qubit_gate(entangler, device=device)
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    slot_indices = torch.randint(
+        low=0,
+        high=local_gates.shape[0],
+        size=(n_targets, 6),
+        device=device,
+        generator=generator,
+    )
+
+    targets = []
+    for i, slots_tensor in enumerate(slot_indices):
+        slots = tuple(int(index) for index in slots_tensor.tolist())
+        first_a, first_b, middle_a, middle_b, second_a, second_b = (units[index] for index in slots)
+        unitary = compose_two_entangler_local(
+            first_a,
+            first_b,
+            entangler_unitary,
+            middle_a,
+            middle_b,
+            second_a,
+            second_b,
+        )
+        targets.append(
+            HiddenShallowCircuitTarget(
+                name=f"depth2-{i:02d}",
+                entangler=entangler,
+                unitary=unitary,
+                slot_indices=slots,
+                slot_labels=tuple(local_labels[index] for index in slots),
+            )
+        )
+    return targets
+
+
 def run_hidden_shallow_circuit_benchmark(
     exact_gates: torch.Tensor,
     exact_labels: list[str],
@@ -716,6 +853,63 @@ def run_hidden_shallow_circuit_benchmark(
     return benchmarks
 
 
+def run_hidden_two_entangler_circuit_benchmark(
+    exact_gates: torch.Tensor,
+    exact_labels: list[str],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    n_targets: int = 8,
+    entangler: str = "cz",
+    n_random_candidates: int = 200_000,
+    top_k: int = 5,
+    seed: int = 0,
+    keep_fidelities: bool = True,
+) -> list[HiddenTwoEntanglerCircuitBenchmark]:
+    targets = make_hidden_two_entangler_circuit_targets(
+        exact_gates,
+        exact_labels,
+        n_targets=n_targets,
+        entangler=entangler,
+        seed=seed,
+    )
+
+    benchmarks = []
+    for i, target in enumerate(targets):
+        exact_random_report = synthesize_unitary_two_entangler_random_report(
+            exact_gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            n_candidates=n_random_candidates,
+            top_k=top_k,
+            local_labels=exact_labels,
+            seed=seed + 10_000 + i,
+            name=f"{target.name} exact random",
+            keep_fidelities=keep_fidelities,
+        )
+        generated_random_report = synthesize_unitary_two_entangler_random_report(
+            generated_gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            n_candidates=n_random_candidates,
+            top_k=top_k,
+            local_labels=generated_labels,
+            seed=seed + 20_000 + i,
+            name=f"{target.name} generated random",
+            keep_fidelities=keep_fidelities,
+        )
+        benchmarks.append(
+            HiddenTwoEntanglerCircuitBenchmark(
+                target=target,
+                oracle_fidelity=1.0,
+                exact_random_report=exact_random_report,
+                generated_random_report=generated_random_report,
+            )
+        )
+    return benchmarks
+
+
 def print_hidden_shallow_circuit_benchmark(
     benchmarks: list[HiddenShallowCircuitBenchmark],
 ) -> None:
@@ -737,6 +931,27 @@ def print_hidden_shallow_circuit_benchmark(
         )
 
 
+def print_hidden_two_entangler_circuit_benchmark(
+    benchmarks: list[HiddenTwoEntanglerCircuitBenchmark],
+) -> None:
+    header = "target     hidden labels                                      oracle   exact-rand   gen-rand   best generated labels"
+    print(header)
+    print("-" * len(header))
+    for benchmark in benchmarks:
+        hidden_labels = ", ".join(benchmark.target.slot_labels)
+        best_labels = ", ".join(
+            label if label is not None else "?"
+            for label in benchmark.generated_random_report.candidates[0].slot_labels
+        )
+        print(
+            f"{benchmark.target.name:<10} {hidden_labels:<50} "
+            f"{benchmark.oracle_fidelity:>6.4f}   "
+            f"{benchmark.exact_random_report.candidates[0].fidelity:>10.4f}   "
+            f"{benchmark.generated_random_report.candidates[0].fidelity:>8.4f}   "
+            f"{best_labels}"
+        )
+
+
 def summarize_hidden_shallow_circuit_benchmark(
     benchmarks: list[HiddenShallowCircuitBenchmark],
 ) -> list[HiddenShallowCircuitAggregate]:
@@ -750,6 +965,29 @@ def summarize_hidden_shallow_circuit_benchmark(
             [item.generated_label_grid_report for item in benchmarks],
         ),
         _hidden_benchmark_aggregate("generated-random", [item.random_report for item in benchmarks]),
+    ]
+
+
+def summarize_hidden_two_entangler_circuit_benchmark(
+    benchmarks: list[HiddenTwoEntanglerCircuitBenchmark],
+) -> list[HiddenShallowCircuitAggregate]:
+    if not benchmarks:
+        raise ValueError("summarize_hidden_two_entangler_circuit_benchmark needs at least one benchmark")
+
+    return [
+        HiddenShallowCircuitAggregate(
+            mode="oracle",
+            n_targets=len(benchmarks),
+            mean_best=1.0,
+            median_best=1.0,
+            min_best=1.0,
+            max_best=1.0,
+            success_95=1.0,
+            success_98=1.0,
+            success_99=1.0,
+        ),
+        _hidden_benchmark_aggregate("exact-random", [item.exact_random_report for item in benchmarks]),
+        _hidden_benchmark_aggregate("generated-random", [item.generated_random_report for item in benchmarks]),
     ]
 
 
@@ -773,6 +1011,17 @@ def print_hidden_shallow_circuit_summary(
         )
 
 
+def print_hidden_two_entangler_circuit_summary(
+    benchmarks: list[HiddenTwoEntanglerCircuitBenchmark] | list[HiddenShallowCircuitAggregate],
+) -> None:
+    aggregates = (
+        benchmarks
+        if benchmarks and isinstance(benchmarks[0], HiddenShallowCircuitAggregate)
+        else summarize_hidden_two_entangler_circuit_benchmark(benchmarks)
+    )
+    print_hidden_shallow_circuit_summary(aggregates)
+
+
 def plot_hidden_shallow_circuit_best_fidelities(
     benchmarks: list[HiddenShallowCircuitBenchmark],
 ) -> None:
@@ -790,6 +1039,27 @@ def plot_hidden_shallow_circuit_best_fidelities(
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Hidden shallow-circuit synthesis benchmark")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hidden_two_entangler_best_fidelities(
+    benchmarks: list[HiddenTwoEntanglerCircuitBenchmark],
+) -> None:
+    if not benchmarks:
+        raise ValueError("plot_hidden_two_entangler_best_fidelities needs at least one benchmark")
+
+    values = [
+        torch.ones(len(benchmarks), dtype=torch.float32),
+        _hidden_benchmark_best_values([item.exact_random_report for item in benchmarks]),
+        _hidden_benchmark_best_values([item.generated_random_report for item in benchmarks]),
+    ]
+    labels = ["oracle", "exact random", "generated random"]
+
+    plt.figure(figsize=(8, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Hidden two-entangler synthesis benchmark")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 
