@@ -4,19 +4,30 @@ from su2diffusion.circuit import (
     CircuitDenoiser,
     CircuitExperimentConfig,
     CircuitTrainConfig,
+    TargetConditionedCircuitDenoiser,
     circuit_forward_heat_target,
     generate_solution_stack_dataset,
     get_circuit_experiment_config,
     print_joint_circuit_comparison_summary,
     print_solution_stack_circuit_comparison_summary,
     print_solution_stack_dataset_summary,
+    print_target_conditioned_circuit_comparison_summary,
+    print_target_conditioned_overfit_summary,
     run_circuit_experiment,
     run_joint_circuit_proposal_benchmark,
     run_solution_stack_circuit_experiment,
+    run_target_conditioned_circuit_proposal_benchmark,
+    run_target_conditioned_overfit_diagnostic,
+    run_target_conditioned_solution_stack_circuit_experiment,
+    run_target_conditioned_synthetic_circuit_experiment,
     sample_circuit_reverse,
     sample_near_clifford_circuit_stacks,
+    sample_target_conditioned_circuit_reverse,
     synthesize_unitary_from_circuit_stack_report,
+    target_unitary_features,
     train_circuit_heat_kernel_model_on_stacks,
+    train_target_conditioned_circuit_heat_kernel_model,
+    train_target_conditioned_circuit_heat_kernel_model_synthetic,
 )
 from su2diffusion.data import DataConfig, center_names_for_config, centers_for_config
 from su2diffusion.diffusion import DiffusionSchedule
@@ -71,6 +82,17 @@ def test_circuit_denoiser_output_shape():
     assert eps.shape == (3, 6, 3)
 
 
+def test_target_conditioned_circuit_denoiser_output_shape():
+    model = TargetConditionedCircuitDenoiser(T=8, hidden=16)
+    q_stack = torch.randn(3, 6, 4)
+    t_idx = torch.tensor([1, 2, 3], dtype=torch.long)
+    features = torch.randn(3, 32)
+
+    eps = model(q_stack, t_idx, features)
+
+    assert eps.shape == (3, 6, 3)
+
+
 def test_circuit_reverse_sampler_returns_normalized_stacks():
     schedule = DiffusionSchedule(T=4)
     model = CircuitDenoiser(T=schedule.T, hidden=16)
@@ -80,6 +102,25 @@ def test_circuit_reverse_sampler_returns_normalized_stacks():
     assert q_stack.shape == (6, 6, 4)
     assert torch.isfinite(q_stack).all()
     assert torch.allclose(q_stack.norm(dim=-1), torch.ones(6, 6), atol=1e-5)
+
+
+def test_target_conditioned_reverse_sampler_returns_normalized_stacks():
+    schedule = DiffusionSchedule(T=4)
+    model = TargetConditionedCircuitDenoiser(T=schedule.T, hidden=16)
+    targets = torch.stack([torch.eye(4, dtype=torch.complex64), two_qubit_gate("cz", device="cpu")])
+
+    q_stack = sample_target_conditioned_circuit_reverse(
+        model,
+        schedule,
+        target_unitaries=targets,
+        n_samples_per_target=3,
+        eta=0.0,
+        device="cpu",
+    )
+
+    assert q_stack.shape == (2, 3, 6, 4)
+    assert torch.isfinite(q_stack).all()
+    assert torch.allclose(q_stack.norm(dim=-1), torch.ones(2, 3, 6), atol=1e-5)
 
 
 def test_circuit_experiment_smoke_runs_on_cpu():
@@ -234,6 +275,203 @@ def test_solution_stack_circuit_experiment_and_summary(capsys):
     captured = capsys.readouterr().out
     assert "solution-stack diffusion" in captured
     assert result.generated_stochastic.shape == (8, 6, 4)
+
+
+def test_target_unitary_features_shape_and_dtype():
+    targets = torch.stack([torch.eye(4, dtype=torch.complex64), two_qubit_gate("cz", device="cpu")])
+
+    features = target_unitary_features(targets)
+
+    assert features.shape == (2, 32)
+    assert features.dtype == torch.float32
+
+
+def test_train_target_conditioned_circuit_model_smoke():
+    q_stacks = q_normalized_random_stacks(8)
+    targets = torch.stack([torch.eye(4, dtype=torch.complex64)] * 8)
+    schedule = DiffusionSchedule(T=4)
+    config = CircuitTrainConfig(batch_size=4, num_steps=1, hidden=16, n_terms=4)
+
+    model, losses = train_target_conditioned_circuit_heat_kernel_model(
+        q_stacks,
+        targets,
+        train_config=config,
+        schedule=schedule,
+        device="cpu",
+        show_progress=False,
+    )
+
+    assert isinstance(model, TargetConditionedCircuitDenoiser)
+    assert len(losses) == 1
+
+
+def test_train_synthetic_target_conditioned_circuit_model_smoke():
+    schedule = DiffusionSchedule(T=4)
+    config = CircuitTrainConfig(batch_size=4, num_steps=1, hidden=16, n_terms=4)
+
+    model, losses = train_target_conditioned_circuit_heat_kernel_model_synthetic(
+        train_config=config,
+        schedule=schedule,
+        device="cpu",
+        show_progress=False,
+    )
+
+    assert isinstance(model, TargetConditionedCircuitDenoiser)
+    assert len(losses) == 1
+
+
+def test_target_conditioned_experiment_and_summary(capsys):
+    data_config = DataConfig(kind="clifford", sigma_data=0.08, label_strategy="balanced")
+    centers = centers_for_config(data_config, device="cpu")
+    names = center_names_for_config(data_config)
+    dataset = generate_solution_stack_dataset(
+        centers,
+        names,
+        n_targets=2,
+        perturb_scale=0.02,
+        candidate_count=16,
+        refinement_steps=5,
+        fidelity_threshold=0.0,
+        seed=5,
+    )
+    near_benchmarks = run_near_clifford_two_entangler_benchmark(
+        clifford_gates=centers,
+        clifford_labels=names,
+        generated_gates=centers,
+        generated_labels=names,
+        n_targets=1,
+        perturb_scale=0.05,
+        n_random_candidates=32,
+        n_analytic_gates=16,
+        n_haar_gates=16,
+        top_k=1,
+        seed=6,
+        keep_fidelities=False,
+    )
+    config = CircuitExperimentConfig(
+        name="tiny-target-conditioned-circuit",
+        schedule=DiffusionSchedule(T=4),
+        train=CircuitTrainConfig(batch_size=4, num_steps=1, hidden=16, n_terms=4),
+        sample_count=4,
+    )
+    eval_targets = torch.stack([item.target.unitary for item in near_benchmarks])
+
+    result = run_target_conditioned_solution_stack_circuit_experiment(
+        dataset,
+        eval_targets,
+        config,
+        device="cpu",
+        show_progress=False,
+    )
+    random_reports = run_joint_circuit_proposal_benchmark(
+        near_benchmarks,
+        q_normalized_random_stacks(8),
+        top_k=1,
+        keep_fidelities=False,
+    )
+    solution_reports = run_joint_circuit_proposal_benchmark(
+        near_benchmarks,
+        dataset.stacks,
+        top_k=1,
+        keep_fidelities=False,
+    )
+    conditioned_reports = run_target_conditioned_circuit_proposal_benchmark(
+        near_benchmarks,
+        result.generated_stochastic_by_target,
+        top_k=1,
+        keep_fidelities=False,
+    )
+    print_target_conditioned_circuit_comparison_summary(
+        near_benchmarks,
+        random_reports,
+        conditioned_reports,
+        solution_joint_reports=solution_reports,
+    )
+
+    captured = capsys.readouterr().out
+    assert "target-conditioned diffusion" in captured
+    assert result.generated_stochastic_by_target.shape == (1, 4, 6, 4)
+    assert len(conditioned_reports) == 1
+
+
+def test_synthetic_target_conditioned_experiment_and_summary(capsys):
+    data_config = DataConfig(kind="clifford", sigma_data=0.08, label_strategy="balanced")
+    centers = centers_for_config(data_config, device="cpu")
+    names = center_names_for_config(data_config)
+    near_benchmarks = run_near_clifford_two_entangler_benchmark(
+        clifford_gates=centers,
+        clifford_labels=names,
+        generated_gates=centers,
+        generated_labels=names,
+        n_targets=1,
+        perturb_scale=0.05,
+        n_random_candidates=32,
+        n_analytic_gates=16,
+        n_haar_gates=16,
+        top_k=1,
+        seed=7,
+        keep_fidelities=False,
+    )
+    config = CircuitExperimentConfig(
+        name="tiny-target-conditioned-synthetic-circuit",
+        schedule=DiffusionSchedule(T=4),
+        train=CircuitTrainConfig(batch_size=4, num_steps=1, hidden=16, n_terms=4),
+        sample_count=4,
+    )
+    eval_targets = torch.stack([item.target.unitary for item in near_benchmarks])
+
+    result = run_target_conditioned_synthetic_circuit_experiment(
+        eval_targets,
+        config,
+        device="cpu",
+        show_progress=False,
+    )
+    random_reports = run_joint_circuit_proposal_benchmark(
+        near_benchmarks,
+        q_normalized_random_stacks(8),
+        top_k=1,
+        keep_fidelities=False,
+    )
+    conditioned_reports = run_target_conditioned_circuit_proposal_benchmark(
+        near_benchmarks,
+        result.generated_stochastic_by_target,
+        top_k=1,
+        keep_fidelities=False,
+    )
+    print_target_conditioned_circuit_comparison_summary(
+        near_benchmarks,
+        random_reports,
+        conditioned_reports,
+    )
+
+    captured = capsys.readouterr().out
+    assert "target-conditioned diffusion" in captured
+    assert result.generated_stochastic_by_target.shape == (1, 4, 6, 4)
+
+
+def test_target_conditioned_overfit_diagnostic_smoke(capsys):
+    config = CircuitExperimentConfig(
+        name="tiny-target-conditioned-overfit",
+        schedule=DiffusionSchedule(T=4),
+        train=CircuitTrainConfig(batch_size=4, num_steps=1, hidden=16, n_terms=4),
+        sample_count=4,
+    )
+
+    result = run_target_conditioned_overfit_diagnostic(
+        config,
+        n_targets=2,
+        perturb_scale=0.02,
+        device="cpu",
+        show_progress=False,
+        top_k=1,
+    )
+    print_target_conditioned_overfit_summary(result)
+
+    captured = capsys.readouterr().out
+    assert "target-conditioned overfit" in captured
+    assert result.solution_stacks.shape == (2, 6, 4)
+    assert result.generated_stochastic_by_target.shape == (2, 4, 6, 4)
+    assert len(result.reports) == 2
 
 
 def q_normalized_random_stacks(n: int) -> torch.Tensor:
