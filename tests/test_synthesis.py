@@ -7,6 +7,7 @@ from su2diffusion.synthesis import (
     make_synthesis_report,
     make_hidden_shallow_circuit_targets,
     print_hidden_shallow_circuit_benchmark,
+    print_hidden_shallow_circuit_summary,
     print_synthesis_summary,
     quaternion_to_unitary,
     run_hidden_shallow_circuit_benchmark,
@@ -21,6 +22,7 @@ from su2diffusion.synthesis import (
     synthesize_named_gate_unconstrained_report,
     synthesize_unitary_label_grid_report,
     synthesize_unitary_unconstrained_report,
+    summarize_hidden_shallow_circuit_benchmark,
     two_qubit_gate,
     unitary_fidelity,
     unitary_fidelity_batch,
@@ -363,3 +365,34 @@ def test_hidden_shallow_circuit_benchmark_recovers_exact_targets(capsys):
     assert len(benchmarks) == 2
     assert all(benchmark.exact_report.candidates[0].fidelity > 1.0 - 1e-6 for benchmark in benchmarks)
     assert all(benchmark.generated_label_grid_report.candidates[0].fidelity > 1.0 - 1e-6 for benchmark in benchmarks)
+
+
+def test_hidden_shallow_circuit_benchmark_summary(capsys):
+    exact_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    benchmarks = run_hidden_shallow_circuit_benchmark(
+        exact_gates=exact_gates,
+        exact_labels=labels,
+        generated_gates=exact_gates,
+        generated_labels=labels,
+        n_targets=3,
+        n_random_candidates=32,
+        top_k=2,
+        seed=8,
+        keep_fidelities=False,
+    )
+    aggregates = summarize_hidden_shallow_circuit_benchmark(benchmarks)
+    print_hidden_shallow_circuit_summary(aggregates)
+
+    captured = capsys.readouterr().out
+    assert "generated-label-grid" in captured
+    assert len(aggregates) == 3
+    assert aggregates[0].n_targets == 3
+    assert aggregates[0].success_99 == 1.0
+    assert all(len(item.generated_label_grid_report.fidelities) == 2 for item in benchmarks)
