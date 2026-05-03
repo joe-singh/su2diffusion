@@ -4,12 +4,18 @@ from su2diffusion.synthesis import (
     bell_state_fidelity,
     compose_local_entangler_local,
     local_layer,
+    make_synthesis_report,
+    print_synthesis_summary,
     quaternion_to_unitary,
     slot_labels_for_named_target,
     synthesize_bell_state,
+    synthesize_bell_state_report,
     synthesize_named_gate,
     synthesize_named_gate_label_grid,
+    synthesize_named_gate_label_grid_report,
+    synthesize_named_gate_report,
     synthesize_named_gate_unconstrained,
+    synthesize_named_gate_unconstrained_report,
     two_qubit_gate,
     unitary_fidelity,
     unitary_fidelity_batch,
@@ -95,6 +101,33 @@ def test_named_gate_synthesis_can_use_label_constrained_slots():
     assert candidates[0].fidelity >= candidates[1].fidelity
 
 
+def test_guided_named_gate_report_keeps_full_fidelity_distribution():
+    local_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    report = synthesize_named_gate_report(
+        local_gates,
+        target="cnot",
+        entangler="cz",
+        n_candidates=7,
+        top_k=3,
+        local_labels=labels,
+        slot_label_names=slot_labels_for_named_target("cnot", "cz"),
+        name="CNOT guided",
+    )
+
+    assert report.name == "CNOT guided"
+    assert report.mode == "guided"
+    assert len(report.candidates) == 3
+    assert len(report.fidelities) == 7
+    assert report.candidates[0].slot_labels == ("I", "H", "I", "H")
+
+
 def test_synthesis_ranking_returns_sorted_finite_candidates():
     local_gates = torch.randn(16, 4)
 
@@ -150,6 +183,80 @@ def test_label_grid_synthesis_finds_known_decompositions():
     assert cnot[0].slot_labels == ("I", "H", "I", "H")
 
 
+def test_label_grid_report_keeps_full_fidelity_distribution():
+    local_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    report = synthesize_named_gate_label_grid_report(
+        local_gates,
+        labels,
+        target="cnot",
+        entangler="cz",
+        top_k=2,
+        name="CNOT label grid",
+    )
+
+    assert report.name == "CNOT label grid"
+    assert report.mode == "label-grid"
+    assert len(report.candidates) == 2
+    assert len(report.fidelities) == 16
+    assert report.candidates[0].fidelity >= report.candidates[1].fidelity
+
+
+def test_random_search_report_keeps_full_fidelity_distribution():
+    local_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    report = synthesize_named_gate_unconstrained_report(
+        local_gates,
+        target="cnot",
+        entangler="cz",
+        n_candidates=32,
+        top_k=3,
+        local_labels=labels,
+        seed=2,
+    )
+
+    assert report.mode == "random"
+    assert len(report.candidates) == 3
+    assert len(report.fidelities) == 32
+    assert report.candidates[0].fidelity >= report.candidates[1].fidelity
+
+
+def test_synthesis_summary_prints_report_statistics(capsys):
+    local_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    candidates = synthesize_named_gate(
+        local_gates,
+        target="cnot",
+        entangler="cz",
+        n_candidates=4,
+        top_k=2,
+        slot_label_names=None,
+    )
+    report = make_synthesis_report(candidates, name="guided", mode="guided")
+
+    print_synthesis_summary([report])
+
+    captured = capsys.readouterr().out
+    assert "guided" in captured
+    assert "top-k mean" in captured
+
+
 def test_bell_synthesis_returns_sorted_candidates():
     local_gates = torch.randn(16, 4)
 
@@ -157,3 +264,12 @@ def test_bell_synthesis_returns_sorted_candidates():
 
     assert len(candidates) == 5
     assert all(0.0 <= candidate.fidelity <= 1.0 for candidate in candidates)
+
+
+def test_bell_synthesis_report_keeps_full_fidelity_distribution():
+    local_gates = torch.randn(16, 4)
+
+    report = synthesize_bell_state_report(local_gates, entangler="cnot", n_candidates=16, top_k=5)
+
+    assert len(report.candidates) == 5
+    assert len(report.fidelities) == 16

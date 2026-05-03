@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import matplotlib.pyplot as plt
 import torch
 
 
@@ -11,6 +12,16 @@ class SynthesisCandidate:
     fidelity: float
     slot_indices: tuple[int, int, int, int]
     slot_labels: tuple[str | None, str | None, str | None, str | None]
+
+
+@dataclass(frozen=True)
+class SynthesisReport:
+    name: str
+    mode: str
+    target: str
+    entangler: str
+    candidates: list[SynthesisCandidate]
+    fidelities: tuple[float, ...]
 
 
 def quaternion_to_unitary(q: torch.Tensor) -> torch.Tensor:
@@ -103,8 +114,31 @@ def synthesize_named_gate(
     slot_label_names: tuple[str, str, str, str] | None = None,
     seed: int = 0,
 ) -> list[SynthesisCandidate]:
+    return synthesize_named_gate_report(
+        local_gates,
+        target=target,
+        entangler=entangler,
+        n_candidates=n_candidates,
+        top_k=top_k,
+        local_labels=local_labels,
+        slot_label_names=slot_label_names,
+        seed=seed,
+    ).candidates
+
+
+def synthesize_named_gate_report(
+    local_gates: torch.Tensor,
+    target: str = "cz",
+    entangler: str = "cz",
+    n_candidates: int = 1024,
+    top_k: int = 5,
+    local_labels: list[str | None] | None = None,
+    slot_label_names: tuple[str, str, str, str] | None = None,
+    seed: int = 0,
+    name: str | None = None,
+) -> SynthesisReport:
     if local_gates.shape[0] == 0:
-        raise ValueError("synthesize_named_gate needs at least one local gate")
+        raise ValueError("synthesize_named_gate_report needs at least one local gate")
     if n_candidates <= 0:
         raise ValueError("n_candidates must be positive")
     if top_k <= 0:
@@ -144,7 +178,12 @@ def synthesize_named_gate(
         )
 
     candidates.sort(key=lambda candidate: candidate.fidelity, reverse=True)
-    return candidates[:top_k]
+    return make_synthesis_report(
+        candidates[:top_k],
+        name=name or f"{target.upper()} guided search",
+        mode="guided",
+        fidelities=[candidate.fidelity for candidate in candidates],
+    )
 
 
 def synthesize_named_gate_unconstrained(
@@ -156,8 +195,45 @@ def synthesize_named_gate_unconstrained(
     local_labels: list[str | None] | None = None,
     seed: int = 0,
 ) -> list[SynthesisCandidate]:
+    return synthesize_named_gate_unconstrained_report(
+        local_gates,
+        target=target,
+        entangler=entangler,
+        n_candidates=n_candidates,
+        top_k=top_k,
+        local_labels=local_labels,
+        seed=seed,
+    ).candidates
+
+
+def synthesize_named_gate_label_grid(
+    local_gates: torch.Tensor,
+    local_labels: list[str],
+    target: str = "cz",
+    entangler: str = "cz",
+    top_k: int = 5,
+) -> list[SynthesisCandidate]:
+    return synthesize_named_gate_label_grid_report(
+        local_gates,
+        local_labels,
+        target=target,
+        entangler=entangler,
+        top_k=top_k,
+    ).candidates
+
+
+def synthesize_named_gate_unconstrained_report(
+    local_gates: torch.Tensor,
+    target: str = "cz",
+    entangler: str = "cz",
+    n_candidates: int = 100_000,
+    top_k: int = 5,
+    local_labels: list[str | None] | None = None,
+    seed: int = 0,
+    name: str | None = None,
+) -> SynthesisReport:
     if local_gates.shape[0] == 0:
-        raise ValueError("synthesize_named_gate_unconstrained needs at least one local gate")
+        raise ValueError("synthesize_named_gate_unconstrained_report needs at least one local gate")
     if n_candidates <= 0:
         raise ValueError("n_candidates must be positive")
     if top_k <= 0:
@@ -185,33 +261,33 @@ def synthesize_named_gate_unconstrained(
     entanglers = entangler_unitary.expand(n_candidates, 4, 4)
     unitaries = left @ entanglers @ right
     fidelities = unitary_fidelity_batch(unitaries, target_unitary)
-    values, rows = torch.topk(fidelities, k=min(top_k, n_candidates))
+    candidates = _top_candidates_from_slots(
+        fidelities=fidelities,
+        slot_indices=indices,
+        target=target,
+        entangler=entangler,
+        template="unconstrained-local-entangler-local",
+        top_k=top_k,
+        local_labels=local_labels,
+    )
+    return make_synthesis_report(
+        candidates,
+        name=name or f"{target.upper()} random generated search",
+        mode="random",
+        fidelities=fidelities.tolist(),
+    )
 
-    candidates = []
-    for value, row in zip(values.tolist(), rows.tolist()):
-        slots = indices[row].tolist()
-        candidates.append(
-            SynthesisCandidate(
-                target=target,
-                template="unconstrained-local-entangler-local",
-                entangler=entangler,
-                fidelity=value,
-                slot_indices=tuple(slots),
-                slot_labels=_labels_for_slots(slots, local_labels),
-            )
-        )
-    return candidates
 
-
-def synthesize_named_gate_label_grid(
+def synthesize_named_gate_label_grid_report(
     local_gates: torch.Tensor,
     local_labels: list[str],
     target: str = "cz",
     entangler: str = "cz",
     top_k: int = 5,
-) -> list[SynthesisCandidate]:
+    name: str | None = None,
+) -> SynthesisReport:
     if local_gates.shape[0] == 0:
-        raise ValueError("synthesize_named_gate_label_grid needs at least one local gate")
+        raise ValueError("synthesize_named_gate_label_grid_report needs at least one local gate")
     if top_k <= 0:
         raise ValueError("top_k must be positive")
 
@@ -254,7 +330,12 @@ def synthesize_named_gate_label_grid(
                 slot_labels=tuple(unique_labels[label_idx] for label_idx in label_slots),
             )
         )
-    return candidates
+    return make_synthesis_report(
+        candidates,
+        name=name or f"{target.upper()} label-grid search",
+        mode="label-grid",
+        fidelities=fidelities.tolist(),
+    )
 
 
 def synthesize_bell_state(
@@ -266,8 +347,29 @@ def synthesize_bell_state(
     slot_label_names: tuple[str, str, str, str] | None = None,
     seed: int = 0,
 ) -> list[SynthesisCandidate]:
+    return synthesize_bell_state_report(
+        local_gates,
+        entangler=entangler,
+        n_candidates=n_candidates,
+        top_k=top_k,
+        local_labels=local_labels,
+        slot_label_names=slot_label_names,
+        seed=seed,
+    ).candidates
+
+
+def synthesize_bell_state_report(
+    local_gates: torch.Tensor,
+    entangler: str = "cnot",
+    n_candidates: int = 1024,
+    top_k: int = 5,
+    local_labels: list[str | None] | None = None,
+    slot_label_names: tuple[str, str, str, str] | None = None,
+    seed: int = 0,
+    name: str | None = None,
+) -> SynthesisReport:
     if local_gates.shape[0] == 0:
-        raise ValueError("synthesize_bell_state needs at least one local gate")
+        raise ValueError("synthesize_bell_state_report needs at least one local gate")
 
     entangler = entangler.lower()
     device = local_gates.device
@@ -301,7 +403,12 @@ def synthesize_bell_state(
         )
 
     candidates.sort(key=lambda candidate: candidate.fidelity, reverse=True)
-    return candidates[:top_k]
+    return make_synthesis_report(
+        candidates[:top_k],
+        name=name or "Bell guided search",
+        mode="guided",
+        fidelities=[candidate.fidelity for candidate in candidates],
+    )
 
 
 def print_synthesis_candidates(candidates: list[SynthesisCandidate]) -> None:
@@ -314,6 +421,60 @@ def print_synthesis_candidates(candidates: list[SynthesisCandidate]) -> None:
             f"{rank:<4} {candidate.target:<8} {candidate.entangler:<9} "
             f"{candidate.fidelity:>8.4f}   {labels}"
         )
+
+
+def make_synthesis_report(
+    candidates: list[SynthesisCandidate],
+    name: str,
+    mode: str,
+    fidelities: list[float] | tuple[float, ...] | None = None,
+) -> SynthesisReport:
+    if not candidates:
+        raise ValueError("make_synthesis_report needs at least one candidate")
+    first = candidates[0]
+    values = tuple(float(candidate.fidelity) for candidate in candidates) if fidelities is None else tuple(fidelities)
+    return SynthesisReport(
+        name=name,
+        mode=mode,
+        target=first.target,
+        entangler=first.entangler,
+        candidates=candidates,
+        fidelities=values,
+    )
+
+
+def print_synthesis_summary(reports: list[SynthesisReport] | dict[str, SynthesisReport], top_n: int = 10) -> None:
+    rows = list(reports.values()) if isinstance(reports, dict) else reports
+    header = "name                         target   mode        best     median   top-k mean   best labels"
+    print(header)
+    print("-" * len(header))
+    for report in rows:
+        values = torch.tensor(report.fidelities, dtype=torch.float32)
+        top_values = torch.topk(values, k=min(top_n, values.numel())).values
+        labels = ", ".join(label if label is not None else "?" for label in report.candidates[0].slot_labels)
+        print(
+            f"{report.name:<28} {report.target:<8} {report.mode:<10} "
+            f"{values.max().item():>7.4f}   {values.median().item():>7.4f}   "
+            f"{top_values.mean().item():>10.4f}   {labels}"
+        )
+
+
+def plot_synthesis_fidelity_histograms(
+    reports: list[SynthesisReport] | dict[str, SynthesisReport],
+    bins: int = 50,
+) -> None:
+    rows = list(reports.values()) if isinstance(reports, dict) else reports
+    if not rows:
+        raise ValueError("plot_synthesis_fidelity_histograms needs at least one report")
+
+    plt.figure(figsize=(8, 4))
+    for report in rows:
+        plt.hist(report.fidelities, bins=bins, alpha=0.45, density=True, label=report.name)
+    plt.xlabel("unitary fidelity")
+    plt.ylabel("density")
+    plt.title("Synthesis search fidelity distributions")
+    plt.legend()
+    plt.tight_layout()
 
 
 def slot_labels_for_named_target(target: str, entangler: str) -> tuple[str, str, str, str]:
@@ -370,3 +531,29 @@ def _labels_for_slots(slots: list[int], local_labels: list[str | None] | None) -
     if local_labels is None:
         return (None, None, None, None)
     return tuple(local_labels[i] for i in slots)
+
+
+def _top_candidates_from_slots(
+    fidelities: torch.Tensor,
+    slot_indices: torch.Tensor,
+    target: str,
+    entangler: str,
+    template: str,
+    top_k: int,
+    local_labels: list[str | None] | None,
+) -> list[SynthesisCandidate]:
+    values, rows = torch.topk(fidelities, k=min(top_k, fidelities.numel()))
+    candidates = []
+    for value, row in zip(values.tolist(), rows.tolist()):
+        slots = slot_indices[row].tolist()
+        candidates.append(
+            SynthesisCandidate(
+                target=target,
+                template=template,
+                entangler=entangler,
+                fidelity=value,
+                slot_indices=tuple(slots),
+                slot_labels=_labels_for_slots(slots, local_labels),
+            )
+        )
+    return candidates
