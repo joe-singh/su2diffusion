@@ -24,3 +24,24 @@ To run a pull-request branch in Colab:
 ```
 
 Then import from `su2diffusion` in the notebook.
+
+## Current Demo
+
+The main notebook trains a conditional diffusion model on synthetic
+single-qubit Clifford neighborhoods in `SU(2)`. Generated single-qubit gates
+are converted to `2x2` unitaries and used as local layers in shallow 2-qubit
+templates such as
+
+```text
+(A tensor B) CZ (C tensor D)
+```
+
+The synthesis demo has two parts:
+
+- named-gate sanity checks for `CZ`, `CNOT`, and Bell-state preparation;
+- hidden shallow-circuit benchmarks where target circuits are generated from
+  exact Clifford local layers, the local labels are hidden, and generated gates
+  are searched/ranked by unitary fidelity.
+
+In the first 50-target Colab benchmark, generated label-grid search recovered
+all hidden shallow circuits above `0.98` best unitary fidelity.
