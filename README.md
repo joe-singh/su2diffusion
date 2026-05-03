@@ -70,3 +70,7 @@ near-Clifford circuits by perturbing each ideal Clifford local gate with a small
 `SU(2)` exponential update before composing the depth-2 circuit. This makes the
 hardcoded Clifford library an imperfect baseline and gives diffusion-generated
 continuous gates a more meaningful role.
+
+The near-Clifford benchmark also includes an analytic noisy-Clifford sampler,
+which draws `exp(epsilon) * Clifford` directly without training. This baseline
+checks whether diffusion adds value beyond a hand-coded local perturbation model.

@@ -28,6 +28,7 @@ from su2diffusion.synthesis import (
     run_hidden_shallow_circuit_benchmark,
     run_hidden_two_entangler_circuit_benchmark,
     run_near_clifford_two_entangler_benchmark,
+    sample_near_clifford_gates,
     slot_labels_for_named_target,
     synthesize_bell_state,
     synthesize_bell_state_report,
@@ -663,6 +664,36 @@ def test_near_clifford_targets_are_continuous_perturbations():
     assert unitary_fidelity(exact_targets[0].unitary, perturbed_targets[0].unitary) < 1.0 - 1e-4
 
 
+def test_sample_near_clifford_gates_is_reproducible_and_on_su2():
+    clifford_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    gates_a, names_a = sample_near_clifford_gates(
+        clifford_gates,
+        labels,
+        n_samples=8,
+        perturb_scale=0.05,
+        seed=11,
+    )
+    gates_b, names_b = sample_near_clifford_gates(
+        clifford_gates,
+        labels,
+        n_samples=8,
+        perturb_scale=0.05,
+        seed=11,
+    )
+
+    assert gates_a.shape == (8, 4)
+    assert names_a == names_b
+    assert torch.allclose(gates_a, gates_b)
+    assert torch.allclose(gates_a.norm(dim=-1), torch.ones(8), atol=1e-6)
+
+
 def test_near_clifford_two_entangler_benchmark_reports_baselines(capsys):
     clifford_gates = torch.stack(
         [
@@ -680,6 +711,7 @@ def test_near_clifford_two_entangler_benchmark_reports_baselines(capsys):
         n_targets=2,
         perturb_scale=0.05,
         n_random_candidates=64,
+        n_analytic_gates=16,
         n_haar_gates=16,
         top_k=2,
         seed=7,
@@ -692,6 +724,7 @@ def test_near_clifford_two_entangler_benchmark_reports_baselines(capsys):
     captured = capsys.readouterr().out
     assert "Clifford" in captured
     assert len(benchmarks) == 2
-    assert len(aggregates) == 3
+    assert len(aggregates) == 4
     assert all(len(item.target.slot_labels) == 6 for item in benchmarks)
+    assert all(0.0 <= item.analytic_report.candidates[0].fidelity <= 1.0 for item in benchmarks)
     assert all(0.0 <= item.generated_report.candidates[0].fidelity <= 1.0 for item in benchmarks)

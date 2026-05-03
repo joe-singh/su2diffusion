@@ -56,6 +56,7 @@ class NearCliffordCircuitBenchmark:
     target: HiddenShallowCircuitTarget
     perturb_scale: float
     clifford_report: SynthesisReport
+    analytic_report: SynthesisReport
     generated_report: SynthesisReport
     haar_report: SynthesisReport
 
@@ -880,6 +881,43 @@ def make_near_clifford_two_entangler_circuit_targets(
     return targets
 
 
+def sample_near_clifford_gates(
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    n_samples: int,
+    perturb_scale: float = 0.12,
+    seed: int = 0,
+) -> tuple[torch.Tensor, list[str]]:
+    if clifford_gates.shape[0] == 0:
+        raise ValueError("sample_near_clifford_gates needs at least one Clifford gate")
+    if n_samples <= 0:
+        raise ValueError("n_samples must be positive")
+    if perturb_scale < 0:
+        raise ValueError("perturb_scale must be nonnegative")
+    if len(clifford_labels) != clifford_gates.shape[0]:
+        raise ValueError("clifford_labels must match clifford_gates")
+
+    device = clifford_gates.device
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    labels = torch.randint(
+        low=0,
+        high=clifford_gates.shape[0],
+        size=(n_samples,),
+        device=device,
+        generator=generator,
+    )
+    perturbations = perturb_scale * torch.randn(
+        n_samples,
+        3,
+        device=device,
+        generator=generator,
+    )
+    gates = q_normalize(q_mul(q_exp(perturbations), clifford_gates[labels]))
+    names = [clifford_labels[int(label)] for label in labels.tolist()]
+    return gates, names
+
+
 def run_hidden_shallow_circuit_benchmark(
     exact_gates: torch.Tensor,
     exact_labels: list[str],
@@ -954,11 +992,14 @@ def run_near_clifford_two_entangler_benchmark(
     perturb_scale: float = 0.12,
     entangler: str = "cz",
     n_random_candidates: int = 200_000,
+    n_analytic_gates: int = 1024,
     n_haar_gates: int = 1024,
     top_k: int = 5,
     seed: int = 0,
     keep_fidelities: bool = True,
 ) -> list[NearCliffordCircuitBenchmark]:
+    if n_analytic_gates <= 0:
+        raise ValueError("n_analytic_gates must be positive")
     if n_haar_gates <= 0:
         raise ValueError("n_haar_gates must be positive")
 
@@ -969,6 +1010,13 @@ def run_near_clifford_two_entangler_benchmark(
         perturb_scale=perturb_scale,
         entangler=entangler,
         seed=seed,
+    )
+    analytic_gates, analytic_labels = sample_near_clifford_gates(
+        clifford_gates,
+        clifford_labels,
+        n_samples=n_analytic_gates,
+        perturb_scale=perturb_scale,
+        seed=seed + 25_000,
     )
     haar_generator = torch.Generator(device=clifford_gates.device)
     haar_generator.manual_seed(seed + 30_000)
@@ -987,6 +1035,18 @@ def run_near_clifford_two_entangler_benchmark(
             local_labels=clifford_labels,
             seed=seed + 10_000 + i,
             name=f"{target.name} Clifford random",
+            keep_fidelities=keep_fidelities,
+        )
+        analytic_report = synthesize_unitary_two_entangler_random_report(
+            analytic_gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            n_candidates=n_random_candidates,
+            top_k=top_k,
+            local_labels=analytic_labels,
+            seed=seed + 15_000 + i,
+            name=f"{target.name} analytic near-Clifford random",
             keep_fidelities=keep_fidelities,
         )
         generated_report = synthesize_unitary_two_entangler_random_report(
@@ -1018,6 +1078,7 @@ def run_near_clifford_two_entangler_benchmark(
                 target=target,
                 perturb_scale=perturb_scale,
                 clifford_report=clifford_report,
+                analytic_report=analytic_report,
                 generated_report=generated_report,
                 haar_report=haar_report,
             )
@@ -1127,7 +1188,7 @@ def print_hidden_two_entangler_circuit_benchmark(
 def print_near_clifford_two_entangler_benchmark(
     benchmarks: list[NearCliffordCircuitBenchmark],
 ) -> None:
-    header = "target          base labels                                        Clifford generated Haar     best generated labels"
+    header = "target          base labels                                        Clifford analytic generated Haar     best generated labels"
     print(header)
     print("-" * len(header))
     for benchmark in benchmarks:
@@ -1139,6 +1200,7 @@ def print_near_clifford_two_entangler_benchmark(
         print(
             f"{benchmark.target.name:<15} {base_labels:<50} "
             f"{benchmark.clifford_report.candidates[0].fidelity:>8.4f} "
+            f"{benchmark.analytic_report.candidates[0].fidelity:>8.4f} "
             f"{benchmark.generated_report.candidates[0].fidelity:>9.4f} "
             f"{benchmark.haar_report.candidates[0].fidelity:>6.4f}   "
             f"{best_labels}"
@@ -1169,6 +1231,7 @@ def summarize_near_clifford_two_entangler_benchmark(
 
     return [
         _hidden_benchmark_aggregate("Clifford random", [item.clifford_report for item in benchmarks]),
+        _hidden_benchmark_aggregate("analytic near-Clifford", [item.analytic_report for item in benchmarks]),
         _hidden_benchmark_aggregate("generated random", [item.generated_report for item in benchmarks]),
         _hidden_benchmark_aggregate("Haar random", [item.haar_report for item in benchmarks]),
     ]
@@ -1289,10 +1352,11 @@ def plot_near_clifford_two_entangler_best_fidelities(
 
     values = [
         _hidden_benchmark_best_values([item.clifford_report for item in benchmarks]),
+        _hidden_benchmark_best_values([item.analytic_report for item in benchmarks]),
         _hidden_benchmark_best_values([item.generated_report for item in benchmarks]),
         _hidden_benchmark_best_values([item.haar_report for item in benchmarks]),
     ]
-    labels = ["Clifford random", "generated random", "Haar random"]
+    labels = ["Clifford random", "analytic near-Clifford", "generated random", "Haar random"]
 
     plt.figure(figsize=(8, 4))
     plt.boxplot(values, labels=labels, showmeans=True)
