@@ -3,14 +3,19 @@ import torch
 from su2diffusion.synthesis import (
     bell_state_fidelity,
     compose_local_entangler_local,
+    compose_two_entangler_local,
     local_layer,
     make_synthesis_report,
     make_hidden_shallow_circuit_targets,
+    make_hidden_two_entangler_circuit_targets,
     print_hidden_shallow_circuit_benchmark,
     print_hidden_shallow_circuit_summary,
+    print_hidden_two_entangler_circuit_benchmark,
+    print_hidden_two_entangler_circuit_summary,
     print_synthesis_summary,
     quaternion_to_unitary,
     run_hidden_shallow_circuit_benchmark,
+    run_hidden_two_entangler_circuit_benchmark,
     slot_labels_for_named_target,
     synthesize_bell_state,
     synthesize_bell_state_report,
@@ -21,8 +26,10 @@ from su2diffusion.synthesis import (
     synthesize_named_gate_unconstrained,
     synthesize_named_gate_unconstrained_report,
     synthesize_unitary_label_grid_report,
+    synthesize_unitary_two_entangler_random_report,
     synthesize_unitary_unconstrained_report,
     summarize_hidden_shallow_circuit_benchmark,
+    summarize_hidden_two_entangler_circuit_benchmark,
     two_qubit_gate,
     unitary_fidelity,
     unitary_fidelity_batch,
@@ -65,6 +72,17 @@ def test_two_qubit_targets_and_bell_state_are_correct():
 
     assert unitary_fidelity(two_qubit_gate("cz"), two_qubit_gate("cz")) > 1.0 - 1e-6
     assert bell_state_fidelity(candidate) > 1.0 - 1e-6
+
+
+def test_two_entangler_composition_matches_manual_product():
+    h = quaternion_to_unitary(_h_quaternion())
+    identity = torch.eye(2, dtype=torch.complex64)
+    cz = two_qubit_gate("cz")
+
+    actual = compose_two_entangler_local(identity, h, cz, h, identity, identity, h)
+    expected = local_layer(identity, h) @ cz @ local_layer(h, identity) @ cz @ local_layer(identity, h)
+
+    assert torch.allclose(actual, expected, atol=1e-6)
 
 
 def test_unitary_fidelity_is_global_phase_invariant():
@@ -396,3 +414,72 @@ def test_hidden_shallow_circuit_benchmark_summary(capsys):
     assert aggregates[0].n_targets == 3
     assert aggregates[0].success_99 == 1.0
     assert all(len(item.generated_label_grid_report.fidelities) == 2 for item in benchmarks)
+
+
+def test_two_entangler_random_report_finds_hidden_candidate():
+    local_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+    units = quaternion_to_unitary(local_gates)
+    target = compose_two_entangler_local(
+        units[0],
+        units[1],
+        two_qubit_gate("cz"),
+        units[0],
+        units[1],
+        units[0],
+        units[1],
+    )
+
+    report = synthesize_unitary_two_entangler_random_report(
+        local_gates,
+        target,
+        target_name="depth2",
+        entangler="cz",
+        n_candidates=256,
+        top_k=3,
+        local_labels=labels,
+        seed=1,
+    )
+
+    assert len(report.candidates) == 3
+    assert len(report.candidates[0].slot_indices) == 6
+    assert all(0.0 <= candidate.fidelity <= 1.0 for candidate in report.candidates)
+
+
+def test_hidden_two_entangler_benchmark_summary(capsys):
+    exact_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    targets = make_hidden_two_entangler_circuit_targets(exact_gates, labels, n_targets=2, seed=3)
+    benchmarks = run_hidden_two_entangler_circuit_benchmark(
+        exact_gates=exact_gates,
+        exact_labels=labels,
+        generated_gates=exact_gates,
+        generated_labels=labels,
+        n_targets=2,
+        n_random_candidates=128,
+        top_k=2,
+        seed=3,
+        keep_fidelities=False,
+    )
+    print_hidden_two_entangler_circuit_benchmark(benchmarks)
+    aggregates = summarize_hidden_two_entangler_circuit_benchmark(benchmarks)
+    print_hidden_two_entangler_circuit_summary(aggregates)
+
+    captured = capsys.readouterr().out
+    assert "exact-random" in captured
+    assert len(targets) == 2
+    assert len(benchmarks) == 2
+    assert len(benchmarks[0].target.slot_labels) == 6
+    assert aggregates[0].mode == "oracle"
+    assert aggregates[0].success_99 == 1.0
