@@ -3,6 +3,8 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import torch
 
+from .quaternion import q_exp, q_mul, q_normalize
+
 
 @dataclass(frozen=True)
 class SynthesisCandidate:
@@ -60,6 +62,18 @@ class HiddenShallowCircuitAggregate:
     success_95: float
     success_98: float
     success_99: float
+
+
+@dataclass(frozen=True)
+class RefinementResult:
+    target: str
+    entangler: str
+    initial_fidelity: float
+    refined_fidelity: float
+    fidelity_trace: tuple[float, ...]
+    slot_indices: tuple[int, ...]
+    slot_labels: tuple[str | None, ...]
+    refined_gates: torch.Tensor
 
 
 def quaternion_to_unitary(q: torch.Tensor) -> torch.Tensor:
@@ -1064,6 +1078,140 @@ def plot_hidden_two_entangler_best_fidelities(
     plt.tight_layout()
 
 
+def refine_two_entangler_candidate(
+    local_gates: torch.Tensor,
+    candidate: SynthesisCandidate,
+    target_unitary: torch.Tensor,
+    entangler: str = "cz",
+    num_steps: int = 200,
+    lr: float = 0.05,
+) -> RefinementResult:
+    if len(candidate.slot_indices) != 6:
+        raise ValueError("refine_two_entangler_candidate expects a six-slot two-entangler candidate")
+    if num_steps <= 0:
+        raise ValueError("num_steps must be positive")
+    if lr <= 0:
+        raise ValueError("lr must be positive")
+
+    device = local_gates.device
+    base_gates = q_normalize(local_gates[list(candidate.slot_indices)]).detach()
+    target_unitary = target_unitary.to(device=device, dtype=torch.complex64)
+    entangler_unitary = two_qubit_gate(entangler, device=device)
+
+    delta = torch.zeros(6, 3, device=device, dtype=base_gates.dtype, requires_grad=True)
+    optimizer = torch.optim.Adam([delta], lr=lr)
+    trace = []
+    best_delta = delta.detach().clone()
+    best_fidelity = float(candidate.fidelity)
+
+    for _ in range(num_steps):
+        optimizer.zero_grad()
+        refined_gates = q_normalize(q_mul(q_exp(delta), base_gates))
+        unitary = _compose_two_entangler_from_quaternions(refined_gates, entangler_unitary)
+        fidelity = _differentiable_unitary_fidelity(unitary, target_unitary)
+        fidelity_value = float(fidelity.detach().clamp(0.0, 1.0).cpu())
+        trace.append(fidelity_value)
+        if fidelity_value > best_fidelity:
+            best_fidelity = fidelity_value
+            best_delta = delta.detach().clone()
+        loss = 1.0 - fidelity
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        final_gates = q_normalize(q_mul(q_exp(delta), base_gates))
+        final_unitary = _compose_two_entangler_from_quaternions(final_gates, entangler_unitary)
+        final_fidelity = unitary_fidelity(final_unitary, target_unitary)
+        if final_fidelity > best_fidelity:
+            best_fidelity = final_fidelity
+            best_delta = delta.detach().clone()
+        refined_gates = q_normalize(q_mul(q_exp(best_delta), base_gates))
+        refined_unitary = _compose_two_entangler_from_quaternions(refined_gates, entangler_unitary)
+        refined_fidelity = unitary_fidelity(refined_unitary, target_unitary)
+
+    return RefinementResult(
+        target=candidate.target,
+        entangler=entangler,
+        initial_fidelity=float(candidate.fidelity),
+        refined_fidelity=refined_fidelity,
+        fidelity_trace=tuple(trace),
+        slot_indices=candidate.slot_indices,
+        slot_labels=candidate.slot_labels,
+        refined_gates=refined_gates.detach(),
+    )
+
+
+def refine_hidden_two_entangler_benchmark(
+    benchmarks: list[HiddenTwoEntanglerCircuitBenchmark],
+    generated_gates: torch.Tensor,
+    num_steps: int = 200,
+    lr: float = 0.05,
+) -> list[RefinementResult]:
+    if not benchmarks:
+        raise ValueError("refine_hidden_two_entangler_benchmark needs at least one benchmark")
+
+    results = []
+    for benchmark in benchmarks:
+        candidate = benchmark.generated_random_report.candidates[0]
+        results.append(
+            refine_two_entangler_candidate(
+                generated_gates,
+                candidate,
+                target_unitary=benchmark.target.unitary,
+                entangler=benchmark.target.entangler,
+                num_steps=num_steps,
+                lr=lr,
+            )
+        )
+    return results
+
+
+def print_refinement_results(results: list[RefinementResult]) -> None:
+    header = "target     before   after    gain     slot labels"
+    print(header)
+    print("-" * len(header))
+    for result in results:
+        labels = ", ".join(label if label is not None else "?" for label in result.slot_labels)
+        gain = result.refined_fidelity - result.initial_fidelity
+        print(
+            f"{result.target:<10} {result.initial_fidelity:>6.4f}   "
+            f"{result.refined_fidelity:>6.4f}   {gain:>+6.4f}   {labels}"
+        )
+
+
+def print_refinement_summary(results: list[RefinementResult]) -> None:
+    if not results:
+        raise ValueError("print_refinement_summary needs at least one result")
+
+    before = torch.tensor([result.initial_fidelity for result in results], dtype=torch.float32)
+    after = torch.tensor([result.refined_fidelity for result in results], dtype=torch.float32)
+    gain = after - before
+    header = "n   mean before   mean after   median gain   min after   >=0.99 before   >=0.99 after"
+    print(header)
+    print("-" * len(header))
+    print(
+        f"{len(results):<3} {before.mean().item():>11.4f}   {after.mean().item():>10.4f}   "
+        f"{gain.median().item():>11.4f}   {after.min().item():>9.4f}   "
+        f"{(before >= 0.99).float().mean().item():>12.1%}   "
+        f"{(after >= 0.99).float().mean().item():>11.1%}"
+    )
+
+
+def plot_refinement_improvements(results: list[RefinementResult]) -> None:
+    if not results:
+        raise ValueError("plot_refinement_improvements needs at least one result")
+
+    before = [result.initial_fidelity for result in results]
+    after = [result.refined_fidelity for result in results]
+
+    plt.figure(figsize=(8, 4))
+    plt.boxplot([before, after], labels=["before refinement", "after refinement"], showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Local SU(2) refinement of generated two-entangler circuits")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
 def slot_labels_for_named_target(target: str, entangler: str) -> tuple[str, str, str, str]:
     target = target.lower()
     entangler = entangler.lower()
@@ -1114,9 +1262,9 @@ def _first_index_for_label(local_labels: list[str], label: str) -> int:
     raise ValueError(f"No local gates found for label {label!r}")
 
 
-def _labels_for_slots(slots: list[int], local_labels: list[str | None] | None) -> tuple[str | None, str | None, str | None, str | None]:
+def _labels_for_slots(slots: list[int], local_labels: list[str | None] | None) -> tuple[str | None, ...]:
     if local_labels is None:
-        return (None, None, None, None)
+        return tuple(None for _ in slots)
     return tuple(local_labels[i] for i in slots)
 
 
@@ -1163,3 +1311,25 @@ def _hidden_benchmark_aggregate(mode: str, reports: list[SynthesisReport]) -> Hi
         success_98=(values >= 0.98).float().mean().item(),
         success_99=(values >= 0.99).float().mean().item(),
     )
+
+
+def _compose_two_entangler_from_quaternions(
+    gates: torch.Tensor,
+    entangler_unitary: torch.Tensor,
+) -> torch.Tensor:
+    units = quaternion_to_unitary(gates)
+    return compose_two_entangler_local(
+        units[0],
+        units[1],
+        entangler_unitary,
+        units[2],
+        units[3],
+        units[4],
+        units[5],
+    )
+
+
+def _differentiable_unitary_fidelity(candidate: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    dim = candidate.shape[-1]
+    overlap = torch.trace(target.conj().T @ candidate).abs() / dim
+    return overlap.real

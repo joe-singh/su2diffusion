@@ -1,6 +1,7 @@
 import torch
 
 from su2diffusion.synthesis import (
+    SynthesisCandidate,
     bell_state_fidelity,
     compose_local_entangler_local,
     compose_two_entangler_local,
@@ -12,8 +13,12 @@ from su2diffusion.synthesis import (
     print_hidden_shallow_circuit_summary,
     print_hidden_two_entangler_circuit_benchmark,
     print_hidden_two_entangler_circuit_summary,
+    print_refinement_results,
+    print_refinement_summary,
     print_synthesis_summary,
     quaternion_to_unitary,
+    refine_hidden_two_entangler_benchmark,
+    refine_two_entangler_candidate,
     run_hidden_shallow_circuit_benchmark,
     run_hidden_two_entangler_circuit_benchmark,
     slot_labels_for_named_target,
@@ -34,6 +39,7 @@ from su2diffusion.synthesis import (
     unitary_fidelity,
     unitary_fidelity_batch,
 )
+from su2diffusion.quaternion import q_exp, q_mul, q_normalize
 
 
 def _h_quaternion() -> torch.Tensor:
@@ -483,3 +489,94 @@ def test_hidden_two_entangler_benchmark_summary(capsys):
     assert len(benchmarks[0].target.slot_labels) == 6
     assert aggregates[0].mode == "oracle"
     assert aggregates[0].success_99 == 1.0
+
+
+def test_two_entangler_refinement_improves_perturbed_candidate(capsys):
+    exact_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    units = quaternion_to_unitary(exact_gates)
+    target = compose_two_entangler_local(
+        units[0],
+        units[1],
+        two_qubit_gate("cz"),
+        units[0],
+        units[1],
+        units[0],
+        units[1],
+    )
+    perturb = torch.tensor(
+        [
+            [0.08, 0.01, -0.02],
+            [-0.03, 0.05, 0.01],
+        ]
+    )
+    generated_gates = q_normalize(q_mul(q_exp(perturb), exact_gates))
+    generated_units = quaternion_to_unitary(generated_gates)
+    candidate_unitary = compose_two_entangler_local(
+        generated_units[0],
+        generated_units[1],
+        two_qubit_gate("cz"),
+        generated_units[0],
+        generated_units[1],
+        generated_units[0],
+        generated_units[1],
+    )
+    candidate = SynthesisCandidate(
+        target="depth2",
+        template="two-entangler-local",
+        entangler="cz",
+        fidelity=unitary_fidelity(candidate_unitary, target),
+        slot_indices=(0, 1, 0, 1, 0, 1),
+        slot_labels=("I", "H", "I", "H", "I", "H"),
+    )
+
+    result = refine_two_entangler_candidate(
+        generated_gates,
+        candidate,
+        target,
+        num_steps=40,
+        lr=0.05,
+    )
+    print_refinement_results([result])
+    print_refinement_summary([result])
+
+    captured = capsys.readouterr().out
+    assert "before" in captured
+    assert result.refined_gates.shape == (6, 4)
+    assert result.refined_fidelity > result.initial_fidelity + 1e-3
+    assert result.refined_fidelity > 0.99
+
+
+def test_refine_hidden_two_entangler_benchmark_uses_generated_report_candidate():
+    exact_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+    benchmarks = run_hidden_two_entangler_circuit_benchmark(
+        exact_gates=exact_gates,
+        exact_labels=labels,
+        generated_gates=exact_gates,
+        generated_labels=labels,
+        n_targets=1,
+        n_random_candidates=128,
+        top_k=1,
+        seed=3,
+        keep_fidelities=False,
+    )
+
+    results = refine_hidden_two_entangler_benchmark(
+        benchmarks,
+        generated_gates=exact_gates,
+        num_steps=5,
+        lr=0.02,
+    )
+
+    assert len(results) == 1
+    assert results[0].refined_fidelity >= results[0].initial_fidelity - 1e-5

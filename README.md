@@ -55,3 +55,8 @@ The notebook also includes a depth-2 hidden benchmark for circuits of the form
 At this depth exhaustive Clifford search is too large for the default workflow,
 so the benchmark uses random search over generated six-slot local-gate
 candidates and reports aggregate best-fidelity success rates.
+
+The depth-2 demo can also run a local refinement pass: after random search picks
+the best generated circuit, the six local `SU(2)` gates are optimized with the
+template and entanglers fixed. This tests whether the remaining error is mostly
+from coarse generated samples or from the circuit ansatz/search itself.
