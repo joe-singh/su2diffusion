@@ -64,3 +64,9 @@ from coarse generated samples or from the circuit ansatz/search itself.
 The notebook includes an ablation that reruns the same local optimizer from
 random Haar local-gate starts. That comparison is meant to separate the value of
 diffusion/search initialization from the value of continuous local refinement.
+
+For a more continuous synthesis benchmark, the notebook can build hidden
+near-Clifford circuits by perturbing each ideal Clifford local gate with a small
+`SU(2)` exponential update before composing the depth-2 circuit. This makes the
+hardcoded Clifford library an imperfect baseline and gives diffusion-generated
+continuous gates a more meaningful role.
