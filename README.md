@@ -60,3 +60,7 @@ The depth-2 demo can also run a local refinement pass: after random search picks
 the best generated circuit, the six local `SU(2)` gates are optimized with the
 template and entanglers fixed. This tests whether the remaining error is mostly
 from coarse generated samples or from the circuit ansatz/search itself.
+
+The notebook includes an ablation that reruns the same local optimizer from
+random Haar local-gate starts. That comparison is meant to separate the value of
+diffusion/search initialization from the value of continuous local refinement.

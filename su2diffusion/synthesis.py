@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import torch
 
-from .quaternion import q_exp, q_mul, q_normalize
+from .quaternion import q_exp, q_mul, q_normalize, sample_haar
 
 
 @dataclass(frozen=True)
@@ -74,6 +74,13 @@ class RefinementResult:
     slot_indices: tuple[int, ...]
     slot_labels: tuple[str | None, ...]
     refined_gates: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RefinementAblationResult:
+    target: str
+    generated: RefinementResult
+    random: RefinementResult
 
 
 def quaternion_to_unitary(q: torch.Tensor) -> torch.Tensor:
@@ -1166,6 +1173,53 @@ def refine_hidden_two_entangler_benchmark(
     return results
 
 
+def run_refinement_ablation_benchmark(
+    benchmarks: list[HiddenTwoEntanglerCircuitBenchmark],
+    generated_gates: torch.Tensor,
+    generated_results: list[RefinementResult] | None = None,
+    n_random_starts: int = 4,
+    num_steps: int = 200,
+    lr: float = 0.05,
+    seed: int = 0,
+) -> list[RefinementAblationResult]:
+    if not benchmarks:
+        raise ValueError("run_refinement_ablation_benchmark needs at least one benchmark")
+    if n_random_starts <= 0:
+        raise ValueError("n_random_starts must be positive")
+    if generated_results is not None and len(generated_results) != len(benchmarks):
+        raise ValueError("generated_results must match the number of benchmarks")
+
+    generated_results = generated_results or refine_hidden_two_entangler_benchmark(
+        benchmarks,
+        generated_gates=generated_gates,
+        num_steps=num_steps,
+        lr=lr,
+    )
+
+    generator = torch.Generator(device=generated_gates.device)
+    generator.manual_seed(seed)
+    results = []
+    for benchmark, generated in zip(benchmarks, generated_results):
+        random_results = [
+            _refine_random_two_entangler_start(
+                benchmark,
+                generator=generator,
+                num_steps=num_steps,
+                lr=lr,
+            )
+            for _ in range(n_random_starts)
+        ]
+        best_random = max(random_results, key=lambda item: item.refined_fidelity)
+        results.append(
+            RefinementAblationResult(
+                target=benchmark.target.name,
+                generated=generated,
+                random=best_random,
+            )
+        )
+    return results
+
+
 def print_refinement_results(results: list[RefinementResult]) -> None:
     header = "target     before   after    gain     slot labels"
     print(header)
@@ -1176,6 +1230,20 @@ def print_refinement_results(results: list[RefinementResult]) -> None:
         print(
             f"{result.target:<10} {result.initial_fidelity:>6.4f}   "
             f"{result.refined_fidelity:>6.4f}   {gain:>+6.4f}   {labels}"
+        )
+
+
+def print_refinement_ablation_results(results: list[RefinementAblationResult]) -> None:
+    header = "target     gen before  gen after   rand before rand after  gen-rand"
+    print(header)
+    print("-" * len(header))
+    for result in results:
+        advantage = result.generated.refined_fidelity - result.random.refined_fidelity
+        print(
+            f"{result.target:<10} {result.generated.initial_fidelity:>10.4f}  "
+            f"{result.generated.refined_fidelity:>9.4f}   "
+            f"{result.random.initial_fidelity:>10.4f}  {result.random.refined_fidelity:>9.4f}  "
+            f"{advantage:>+8.4f}"
         )
 
 
@@ -1197,6 +1265,24 @@ def print_refinement_summary(results: list[RefinementResult]) -> None:
     )
 
 
+def print_refinement_ablation_summary(results: list[RefinementAblationResult]) -> None:
+    if not results:
+        raise ValueError("print_refinement_ablation_summary needs at least one result")
+
+    generated = torch.tensor([result.generated.refined_fidelity for result in results], dtype=torch.float32)
+    random = torch.tensor([result.random.refined_fidelity for result in results], dtype=torch.float32)
+    advantage = generated - random
+    header = "n   gen mean   rand mean   mean advantage   gen >=0.99   rand >=0.99"
+    print(header)
+    print("-" * len(header))
+    print(
+        f"{len(results):<3} {generated.mean().item():>8.4f}   {random.mean().item():>9.4f}   "
+        f"{advantage.mean().item():>14.4f}   "
+        f"{(generated >= 0.99).float().mean().item():>9.1%}   "
+        f"{(random >= 0.99).float().mean().item():>10.1%}"
+    )
+
+
 def plot_refinement_improvements(results: list[RefinementResult]) -> None:
     if not results:
         raise ValueError("plot_refinement_improvements needs at least one result")
@@ -1208,6 +1294,26 @@ def plot_refinement_improvements(results: list[RefinementResult]) -> None:
     plt.boxplot([before, after], labels=["before refinement", "after refinement"], showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Local SU(2) refinement of generated two-entangler circuits")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_refinement_ablation(results: list[RefinementAblationResult]) -> None:
+    if not results:
+        raise ValueError("plot_refinement_ablation needs at least one result")
+
+    values = [
+        [result.generated.initial_fidelity for result in results],
+        [result.generated.refined_fidelity for result in results],
+        [result.random.initial_fidelity for result in results],
+        [result.random.refined_fidelity for result in results],
+    ]
+    labels = ["generated before", "generated after", "random before", "random after"]
+
+    plt.figure(figsize=(9, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Diffusion-seeded vs random-seeded local refinement")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 
@@ -1333,3 +1439,31 @@ def _differentiable_unitary_fidelity(candidate: torch.Tensor, target: torch.Tens
     dim = candidate.shape[-1]
     overlap = torch.trace(target.conj().T @ candidate).abs() / dim
     return overlap.real
+
+
+def _refine_random_two_entangler_start(
+    benchmark: HiddenTwoEntanglerCircuitBenchmark,
+    generator: torch.Generator,
+    num_steps: int,
+    lr: float,
+) -> RefinementResult:
+    device = benchmark.target.unitary.device
+    local_gates = sample_haar(6, device=device, generator=generator)
+    entangler_unitary = two_qubit_gate(benchmark.target.entangler, device=device)
+    unitary = _compose_two_entangler_from_quaternions(local_gates, entangler_unitary)
+    candidate = SynthesisCandidate(
+        target=benchmark.target.name,
+        template="two-entangler-random-haar-start",
+        entangler=benchmark.target.entangler,
+        fidelity=unitary_fidelity(unitary, benchmark.target.unitary),
+        slot_indices=(0, 1, 2, 3, 4, 5),
+        slot_labels=("haar", "haar", "haar", "haar", "haar", "haar"),
+    )
+    return refine_two_entangler_candidate(
+        local_gates,
+        candidate,
+        target_unitary=benchmark.target.unitary,
+        entangler=benchmark.target.entangler,
+        num_steps=num_steps,
+        lr=lr,
+    )

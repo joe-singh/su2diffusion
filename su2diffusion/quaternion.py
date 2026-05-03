@@ -56,9 +56,13 @@ def q_log(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return torch.where(small, xyz, v)
 
 
-def sample_haar(n: int, device: torch.device | str | None = None) -> torch.Tensor:
+def sample_haar(
+    n: int,
+    device: torch.device | str | None = None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     """Haar-random SU(2) by normalizing a Gaussian in R^4."""
-    q = torch.randn(n, 4, device=device)
+    q = torch.randn(n, 4, device=device, generator=generator)
     return q_normalize(q)
 
 

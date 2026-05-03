@@ -13,12 +13,15 @@ from su2diffusion.synthesis import (
     print_hidden_shallow_circuit_summary,
     print_hidden_two_entangler_circuit_benchmark,
     print_hidden_two_entangler_circuit_summary,
+    print_refinement_ablation_results,
+    print_refinement_ablation_summary,
     print_refinement_results,
     print_refinement_summary,
     print_synthesis_summary,
     quaternion_to_unitary,
     refine_hidden_two_entangler_benchmark,
     refine_two_entangler_candidate,
+    run_refinement_ablation_benchmark,
     run_hidden_shallow_circuit_benchmark,
     run_hidden_two_entangler_circuit_benchmark,
     slot_labels_for_named_target,
@@ -580,3 +583,48 @@ def test_refine_hidden_two_entangler_benchmark_uses_generated_report_candidate()
 
     assert len(results) == 1
     assert results[0].refined_fidelity >= results[0].initial_fidelity - 1e-5
+
+
+def test_refinement_ablation_compares_generated_and_random_starts(capsys):
+    exact_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+    benchmarks = run_hidden_two_entangler_circuit_benchmark(
+        exact_gates=exact_gates,
+        exact_labels=labels,
+        generated_gates=exact_gates,
+        generated_labels=labels,
+        n_targets=1,
+        n_random_candidates=128,
+        top_k=1,
+        seed=3,
+        keep_fidelities=False,
+    )
+    generated_results = refine_hidden_two_entangler_benchmark(
+        benchmarks,
+        generated_gates=exact_gates,
+        num_steps=5,
+        lr=0.02,
+    )
+
+    ablations = run_refinement_ablation_benchmark(
+        benchmarks,
+        generated_gates=exact_gates,
+        generated_results=generated_results,
+        n_random_starts=2,
+        num_steps=5,
+        lr=0.02,
+        seed=1,
+    )
+    print_refinement_ablation_results(ablations)
+    print_refinement_ablation_summary(ablations)
+
+    captured = capsys.readouterr().out
+    assert "gen before" in captured
+    assert len(ablations) == 1
+    assert 0.0 <= ablations[0].random.initial_fidelity <= 1.0
+    assert 0.0 <= ablations[0].random.refined_fidelity <= 1.0
