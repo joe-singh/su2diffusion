@@ -52,6 +52,15 @@ class HiddenTwoEntanglerCircuitBenchmark:
 
 
 @dataclass(frozen=True)
+class NearCliffordCircuitBenchmark:
+    target: HiddenShallowCircuitTarget
+    perturb_scale: float
+    clifford_report: SynthesisReport
+    generated_report: SynthesisReport
+    haar_report: SynthesisReport
+
+
+@dataclass(frozen=True)
 class HiddenShallowCircuitAggregate:
     mode: str
     n_targets: int
@@ -809,6 +818,68 @@ def make_hidden_two_entangler_circuit_targets(
     return targets
 
 
+def make_near_clifford_two_entangler_circuit_targets(
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    n_targets: int = 8,
+    perturb_scale: float = 0.12,
+    entangler: str = "cz",
+    seed: int = 0,
+) -> list[HiddenShallowCircuitTarget]:
+    if clifford_gates.shape[0] == 0:
+        raise ValueError("make_near_clifford_two_entangler_circuit_targets needs at least one Clifford gate")
+    if n_targets <= 0:
+        raise ValueError("n_targets must be positive")
+    if perturb_scale < 0:
+        raise ValueError("perturb_scale must be nonnegative")
+
+    entangler = entangler.lower()
+    device = clifford_gates.device
+    entangler_unitary = two_qubit_gate(entangler, device=device)
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    slot_indices = torch.randint(
+        low=0,
+        high=clifford_gates.shape[0],
+        size=(n_targets, 6),
+        device=device,
+        generator=generator,
+    )
+    perturbations = perturb_scale * torch.randn(
+        n_targets,
+        6,
+        3,
+        device=device,
+        generator=generator,
+    )
+
+    targets = []
+    for i, slots_tensor in enumerate(slot_indices):
+        slots = tuple(int(index) for index in slots_tensor.tolist())
+        local_gates = q_normalize(q_mul(q_exp(perturbations[i]), clifford_gates[list(slots)]))
+        first_a, first_b, middle_a, middle_b, second_a, second_b = quaternion_to_unitary(local_gates)
+        unitary = compose_two_entangler_local(
+            first_a,
+            first_b,
+            entangler_unitary,
+            middle_a,
+            middle_b,
+            second_a,
+            second_b,
+        )
+        targets.append(
+            HiddenShallowCircuitTarget(
+                name=f"near-depth2-{i:02d}",
+                entangler=entangler,
+                unitary=unitary,
+                slot_indices=slots,
+                slot_labels=tuple(clifford_labels[index] for index in slots),
+            )
+        )
+    return targets
+
+
 def run_hidden_shallow_circuit_benchmark(
     exact_gates: torch.Tensor,
     exact_labels: list[str],
@@ -869,6 +940,86 @@ def run_hidden_shallow_circuit_benchmark(
                 exact_report=exact_report,
                 generated_label_grid_report=generated_label_grid_report,
                 random_report=random_report,
+            )
+        )
+    return benchmarks
+
+
+def run_near_clifford_two_entangler_benchmark(
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    n_targets: int = 12,
+    perturb_scale: float = 0.12,
+    entangler: str = "cz",
+    n_random_candidates: int = 200_000,
+    n_haar_gates: int = 1024,
+    top_k: int = 5,
+    seed: int = 0,
+    keep_fidelities: bool = True,
+) -> list[NearCliffordCircuitBenchmark]:
+    if n_haar_gates <= 0:
+        raise ValueError("n_haar_gates must be positive")
+
+    targets = make_near_clifford_two_entangler_circuit_targets(
+        clifford_gates,
+        clifford_labels,
+        n_targets=n_targets,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        seed=seed,
+    )
+    haar_generator = torch.Generator(device=clifford_gates.device)
+    haar_generator.manual_seed(seed + 30_000)
+    haar_gates = sample_haar(n_haar_gates, device=clifford_gates.device, generator=haar_generator)
+    haar_labels = ["Haar"] * n_haar_gates
+
+    benchmarks = []
+    for i, target in enumerate(targets):
+        clifford_report = synthesize_unitary_two_entangler_random_report(
+            clifford_gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            n_candidates=n_random_candidates,
+            top_k=top_k,
+            local_labels=clifford_labels,
+            seed=seed + 10_000 + i,
+            name=f"{target.name} Clifford random",
+            keep_fidelities=keep_fidelities,
+        )
+        generated_report = synthesize_unitary_two_entangler_random_report(
+            generated_gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            n_candidates=n_random_candidates,
+            top_k=top_k,
+            local_labels=generated_labels,
+            seed=seed + 20_000 + i,
+            name=f"{target.name} generated random",
+            keep_fidelities=keep_fidelities,
+        )
+        haar_report = synthesize_unitary_two_entangler_random_report(
+            haar_gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            n_candidates=n_random_candidates,
+            top_k=top_k,
+            local_labels=haar_labels,
+            seed=seed + 40_000 + i,
+            name=f"{target.name} Haar random",
+            keep_fidelities=keep_fidelities,
+        )
+        benchmarks.append(
+            NearCliffordCircuitBenchmark(
+                target=target,
+                perturb_scale=perturb_scale,
+                clifford_report=clifford_report,
+                generated_report=generated_report,
+                haar_report=haar_report,
             )
         )
     return benchmarks
@@ -973,6 +1124,27 @@ def print_hidden_two_entangler_circuit_benchmark(
         )
 
 
+def print_near_clifford_two_entangler_benchmark(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+) -> None:
+    header = "target          base labels                                        Clifford generated Haar     best generated labels"
+    print(header)
+    print("-" * len(header))
+    for benchmark in benchmarks:
+        base_labels = ", ".join(benchmark.target.slot_labels)
+        best_labels = ", ".join(
+            label if label is not None else "?"
+            for label in benchmark.generated_report.candidates[0].slot_labels
+        )
+        print(
+            f"{benchmark.target.name:<15} {base_labels:<50} "
+            f"{benchmark.clifford_report.candidates[0].fidelity:>8.4f} "
+            f"{benchmark.generated_report.candidates[0].fidelity:>9.4f} "
+            f"{benchmark.haar_report.candidates[0].fidelity:>6.4f}   "
+            f"{best_labels}"
+        )
+
+
 def summarize_hidden_shallow_circuit_benchmark(
     benchmarks: list[HiddenShallowCircuitBenchmark],
 ) -> list[HiddenShallowCircuitAggregate]:
@@ -986,6 +1158,19 @@ def summarize_hidden_shallow_circuit_benchmark(
             [item.generated_label_grid_report for item in benchmarks],
         ),
         _hidden_benchmark_aggregate("generated-random", [item.random_report for item in benchmarks]),
+    ]
+
+
+def summarize_near_clifford_two_entangler_benchmark(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+) -> list[HiddenShallowCircuitAggregate]:
+    if not benchmarks:
+        raise ValueError("summarize_near_clifford_two_entangler_benchmark needs at least one benchmark")
+
+    return [
+        _hidden_benchmark_aggregate("Clifford random", [item.clifford_report for item in benchmarks]),
+        _hidden_benchmark_aggregate("generated random", [item.generated_report for item in benchmarks]),
+        _hidden_benchmark_aggregate("Haar random", [item.haar_report for item in benchmarks]),
     ]
 
 
@@ -1043,6 +1228,17 @@ def print_hidden_two_entangler_circuit_summary(
     print_hidden_shallow_circuit_summary(aggregates)
 
 
+def print_near_clifford_two_entangler_summary(
+    benchmarks: list[NearCliffordCircuitBenchmark] | list[HiddenShallowCircuitAggregate],
+) -> None:
+    aggregates = (
+        benchmarks
+        if benchmarks and isinstance(benchmarks[0], HiddenShallowCircuitAggregate)
+        else summarize_near_clifford_two_entangler_benchmark(benchmarks)
+    )
+    print_hidden_shallow_circuit_summary(aggregates)
+
+
 def plot_hidden_shallow_circuit_best_fidelities(
     benchmarks: list[HiddenShallowCircuitBenchmark],
 ) -> None:
@@ -1081,6 +1277,27 @@ def plot_hidden_two_entangler_best_fidelities(
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Hidden two-entangler synthesis benchmark")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_near_clifford_two_entangler_best_fidelities(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+) -> None:
+    if not benchmarks:
+        raise ValueError("plot_near_clifford_two_entangler_best_fidelities needs at least one benchmark")
+
+    values = [
+        _hidden_benchmark_best_values([item.clifford_report for item in benchmarks]),
+        _hidden_benchmark_best_values([item.generated_report for item in benchmarks]),
+        _hidden_benchmark_best_values([item.haar_report for item in benchmarks]),
+    ]
+    labels = ["Clifford random", "generated random", "Haar random"]
+
+    plt.figure(figsize=(8, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Near-Clifford hidden two-entangler benchmark")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 

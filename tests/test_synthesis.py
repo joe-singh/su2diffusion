@@ -9,6 +9,9 @@ from su2diffusion.synthesis import (
     make_synthesis_report,
     make_hidden_shallow_circuit_targets,
     make_hidden_two_entangler_circuit_targets,
+    make_near_clifford_two_entangler_circuit_targets,
+    print_near_clifford_two_entangler_benchmark,
+    print_near_clifford_two_entangler_summary,
     print_hidden_shallow_circuit_benchmark,
     print_hidden_shallow_circuit_summary,
     print_hidden_two_entangler_circuit_benchmark,
@@ -24,6 +27,7 @@ from su2diffusion.synthesis import (
     run_refinement_ablation_benchmark,
     run_hidden_shallow_circuit_benchmark,
     run_hidden_two_entangler_circuit_benchmark,
+    run_near_clifford_two_entangler_benchmark,
     slot_labels_for_named_target,
     synthesize_bell_state,
     synthesize_bell_state_report,
@@ -38,6 +42,7 @@ from su2diffusion.synthesis import (
     synthesize_unitary_unconstrained_report,
     summarize_hidden_shallow_circuit_benchmark,
     summarize_hidden_two_entangler_circuit_benchmark,
+    summarize_near_clifford_two_entangler_benchmark,
     two_qubit_gate,
     unitary_fidelity,
     unitary_fidelity_batch,
@@ -628,3 +633,65 @@ def test_refinement_ablation_compares_generated_and_random_starts(capsys):
     assert len(ablations) == 1
     assert 0.0 <= ablations[0].random.initial_fidelity <= 1.0
     assert 0.0 <= ablations[0].random.refined_fidelity <= 1.0
+
+
+def test_near_clifford_targets_are_continuous_perturbations():
+    clifford_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    exact_targets = make_near_clifford_two_entangler_circuit_targets(
+        clifford_gates,
+        labels,
+        n_targets=1,
+        perturb_scale=0.0,
+        seed=5,
+    )
+    perturbed_targets = make_near_clifford_two_entangler_circuit_targets(
+        clifford_gates,
+        labels,
+        n_targets=1,
+        perturb_scale=0.15,
+        seed=5,
+    )
+
+    assert exact_targets[0].slot_labels == perturbed_targets[0].slot_labels
+    assert unitary_fidelity(exact_targets[0].unitary, perturbed_targets[0].unitary) < 1.0 - 1e-4
+
+
+def test_near_clifford_two_entangler_benchmark_reports_baselines(capsys):
+    clifford_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    labels = ["I", "H"]
+
+    benchmarks = run_near_clifford_two_entangler_benchmark(
+        clifford_gates=clifford_gates,
+        clifford_labels=labels,
+        generated_gates=clifford_gates,
+        generated_labels=labels,
+        n_targets=2,
+        perturb_scale=0.05,
+        n_random_candidates=64,
+        n_haar_gates=16,
+        top_k=2,
+        seed=7,
+        keep_fidelities=False,
+    )
+    print_near_clifford_two_entangler_benchmark(benchmarks)
+    aggregates = summarize_near_clifford_two_entangler_benchmark(benchmarks)
+    print_near_clifford_two_entangler_summary(aggregates)
+
+    captured = capsys.readouterr().out
+    assert "Clifford" in captured
+    assert len(benchmarks) == 2
+    assert len(aggregates) == 3
+    assert all(len(item.target.slot_labels) == 6 for item in benchmarks)
+    assert all(0.0 <= item.generated_report.candidates[0].fidelity <= 1.0 for item in benchmarks)
