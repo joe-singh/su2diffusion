@@ -10,6 +10,22 @@ from .data import (
     sample_clean,
     sample_clean_blobs,
 )
+from .circuit import (
+    CircuitExperimentConfig,
+    CircuitExperimentResult,
+    CircuitTrainConfig,
+    circuit_forward_heat_target,
+    get_circuit_experiment_config,
+    plot_joint_circuit_comparison,
+    print_joint_circuit_comparison_summary,
+    run_circuit_experiment,
+    run_joint_circuit_proposal_benchmark,
+    sample_circuit_reverse,
+    sample_near_clifford_circuit_stacks,
+    summarize_joint_circuit_comparison,
+    synthesize_unitary_from_circuit_stack_report,
+    train_circuit_heat_kernel_model,
+)
 from .diagnostics import (
     ConditionalLabelDiagnostics,
     SampleDiagnostics,
@@ -23,7 +39,7 @@ from .diagnostics import (
 from .diffusion import DiffusionSchedule, brownian_forward_heat_target, heat_epsilon_target
 from .experiment import ExperimentConfig, ExperimentResult, ResampleResult, get_experiment_config, resample_experiment, run_experiment
 from .forward_checks import ForwardProcessDiagnostics, diagnose_forward_process, print_forward_diagnostics
-from .model import SU2Denoiser
+from .model import CircuitDenoiser, SU2Denoiser
 from .quaternion import q_exp, q_inv, q_log, q_mul, q_normalize, sample_haar, su2_distance
 from .sampling import sample_reverse, sample_reverse_trajectory
 from .synthesis import (
@@ -97,6 +113,10 @@ from .viz import plot_experiment_report
 
 __all__ = [
     "BlobConfig",
+    "CircuitDenoiser",
+    "CircuitExperimentConfig",
+    "CircuitExperimentResult",
+    "CircuitTrainConfig",
     "DataConfig",
     "DiffusionSchedule",
     "ExperimentConfig",
@@ -120,6 +140,7 @@ __all__ = [
     "bell_state_fidelity",
     "brownian_forward_heat_target",
     "center_names_for_config",
+    "circuit_forward_heat_target",
     "clifford_centers",
     "compose_local_entangler_local",
     "compose_two_entangler_local",
@@ -128,6 +149,7 @@ __all__ = [
     "diagnose_forward_process",
     "gate_centers",
     "get_experiment_config",
+    "get_circuit_experiment_config",
     "heat_epsilon_target",
     "kron2",
     "local_layer",
@@ -136,6 +158,7 @@ __all__ = [
     "make_near_clifford_two_entangler_circuit_targets",
     "make_synthesis_report",
     "plot_near_clifford_two_entangler_best_fidelities",
+    "plot_joint_circuit_comparison",
     "plot_synthesis_fidelity_histograms",
     "plot_refinement_ablation",
     "plot_refinement_improvements",
@@ -150,6 +173,7 @@ __all__ = [
     "print_hidden_shallow_circuit_summary",
     "print_hidden_two_entangler_circuit_benchmark",
     "print_hidden_two_entangler_circuit_summary",
+    "print_joint_circuit_comparison_summary",
     "print_near_clifford_two_entangler_benchmark",
     "print_near_clifford_two_entangler_summary",
     "print_refinement_ablation_results",
@@ -171,12 +195,16 @@ __all__ = [
     "resample_experiment",
     "run_hidden_shallow_circuit_benchmark",
     "run_hidden_two_entangler_circuit_benchmark",
+    "run_circuit_experiment",
+    "run_joint_circuit_proposal_benchmark",
     "run_near_clifford_two_entangler_benchmark",
     "run_experiment",
     "sample_clean",
     "sample_balanced_labels",
     "sample_clean_blobs",
+    "sample_circuit_reverse",
     "sample_haar",
+    "sample_near_clifford_circuit_stacks",
     "sample_near_clifford_gates",
     "sample_reverse",
     "sample_reverse_trajectory",
@@ -196,9 +224,12 @@ __all__ = [
     "summarize_hidden_shallow_circuit_benchmark",
     "summarize_hidden_two_entangler_circuit_benchmark",
     "summarize_near_clifford_two_entangler_benchmark",
+    "summarize_joint_circuit_comparison",
+    "synthesize_unitary_from_circuit_stack_report",
     "two_qubit_gate",
     "su2_distance",
     "train_heat_kernel_model",
+    "train_circuit_heat_kernel_model",
     "unitary_fidelity",
     "unitary_fidelity_batch",
 ]

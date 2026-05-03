@@ -74,3 +74,9 @@ continuous gates a more meaningful role.
 The near-Clifford benchmark also includes an analytic noisy-Clifford sampler,
 which draws `exp(epsilon) * Clifford` directly without training. This baseline
 checks whether diffusion adds value beyond a hand-coded local perturbation model.
+
+The first circuit-level diffusion path models full depth-2 local-gate stacks on
+`SU(2)^6`. A sample is the six-gate template
+`(A tensor B) CZ (C tensor D) CZ (E tensor F)`, so the denoiser can learn
+correlations across circuit slots instead of sampling six local gates
+independently.
