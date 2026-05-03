@@ -67,3 +67,36 @@ class SU2Denoiser(nn.Module):
 
         x = torch.cat(parts, dim=-1)
         return self.net(x)
+
+
+class CircuitDenoiser(nn.Module):
+    def __init__(
+        self,
+        T: int = 200,
+        n_slots: int = 6,
+        time_dim: int = 64,
+        hidden: int = 512,
+    ):
+        super().__init__()
+        self.T = T
+        self.n_slots = n_slots
+        self.time_dim = time_dim
+
+        self.net = nn.Sequential(
+            nn.Linear(n_slots * 4 + time_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, n_slots * 3),
+        )
+
+    def forward(self, q_stack: torch.Tensor, t_idx: torch.Tensor) -> torch.Tensor:
+        if q_stack.ndim != 3 or q_stack.shape[1:] != (self.n_slots, 4):
+            raise ValueError(f"Expected q_stack with shape (batch, {self.n_slots}, 4)")
+
+        t_scaled = t_idx.float() / self.T
+        temb = timestep_embedding(t_scaled, self.time_dim)
+        x = torch.cat([q_stack.reshape(q_stack.shape[0], self.n_slots * 4), temb], dim=-1)
+        return self.net(x).reshape(q_stack.shape[0], self.n_slots, 3)
