@@ -108,7 +108,7 @@ def center_names_for_config(config: DataConfig | BlobConfig | None = None) -> li
             "B---",
             "E0++",
             "E0-+",
-            "E+0+",
+            "H",
             "E-0+",
             "E++0",
             "E-+0",
