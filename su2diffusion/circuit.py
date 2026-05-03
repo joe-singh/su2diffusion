@@ -12,13 +12,19 @@ from .model import CircuitDenoiser
 from .quaternion import q_exp, q_mul, q_normalize, sample_haar
 from .synthesis import (
     HiddenShallowCircuitAggregate,
+    HiddenShallowCircuitTarget,
     NearCliffordCircuitBenchmark,
+    RefinementResult,
     SynthesisCandidate,
     SynthesisReport,
     compose_two_entangler_local,
+    make_near_clifford_two_entangler_circuit_targets,
     quaternion_to_unitary,
+    refine_two_entangler_candidate,
+    sample_near_clifford_gates,
     summarize_near_clifford_two_entangler_benchmark,
     two_qubit_gate,
+    unitary_fidelity,
     unitary_fidelity_batch,
 )
 
@@ -53,6 +59,14 @@ class CircuitExperimentResult:
     losses: list[float]
     generated_deterministic: torch.Tensor
     generated_stochastic: torch.Tensor
+
+
+@dataclass
+class SolutionStackDatasetResult:
+    stacks: torch.Tensor
+    fidelities: torch.Tensor
+    targets: list[HiddenShallowCircuitTarget]
+    refinements: list[RefinementResult]
 
 
 def get_circuit_experiment_config(name: str) -> CircuitExperimentConfig:
@@ -186,6 +200,106 @@ def train_circuit_heat_kernel_model(
     return model, losses
 
 
+def train_circuit_heat_kernel_model_on_stacks(
+    solution_stacks: torch.Tensor,
+    train_config: CircuitTrainConfig | None = None,
+    schedule: DiffusionSchedule | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> tuple[CircuitDenoiser, list[float]]:
+    if solution_stacks.ndim != 3 or solution_stacks.shape[1:] != (6, 4):
+        raise ValueError("solution_stacks must have shape (n, 6, 4)")
+    if solution_stacks.shape[0] == 0:
+        raise ValueError("solution_stacks must contain at least one stack")
+
+    train_config = train_config or CircuitTrainConfig()
+    schedule = schedule or DiffusionSchedule()
+    device = torch.device(device) if device is not None else get_default_device()
+    solution_stacks = q_normalize(solution_stacks.to(device=device))
+
+    torch.manual_seed(train_config.seed)
+    model = CircuitDenoiser(T=schedule.T, hidden=train_config.hidden).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+    losses: list[float] = []
+
+    iterator = range(1, train_config.num_steps + 1)
+    if show_progress:
+        iterator = tqdm(iterator, desc="Training solution-stack circuit target", dynamic_ncols=True)
+
+    for _ in iterator:
+        rows = torch.randint(
+            low=0,
+            high=solution_stacks.shape[0],
+            size=(train_config.batch_size,),
+            device=device,
+        )
+        q0_stack = solution_stacks[rows]
+        t_idx = torch.randint(1, schedule.T + 1, (train_config.batch_size,), device=device)
+
+        with torch.no_grad():
+            qt_stack, eps_target = circuit_forward_heat_target(
+                q0_stack,
+                t_idx,
+                schedule=schedule,
+                n_terms=train_config.n_terms,
+            )
+
+        eps_pred = model(qt_stack, t_idx)
+        loss = F.mse_loss(eps_pred, eps_target)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        loss_value = loss.item()
+        losses.append(loss_value)
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix({"loss": f"{loss_value:.5f}"})
+
+    return model, losses
+
+
+def run_solution_stack_circuit_experiment(
+    solution_stacks: torch.Tensor,
+    config: CircuitExperimentConfig | str,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> CircuitExperimentResult:
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    device = torch.device(device) if device is not None else get_default_device()
+
+    model, losses = train_circuit_heat_kernel_model_on_stacks(
+        solution_stacks,
+        train_config=config.train,
+        schedule=config.schedule,
+        device=device,
+        show_progress=show_progress,
+    )
+    with torch.no_grad():
+        generated_deterministic = sample_circuit_reverse(
+            model,
+            config.schedule,
+            n_samples=config.sample_count,
+            eta=config.deterministic_eta,
+            device=device,
+        )
+        generated_stochastic = sample_circuit_reverse(
+            model,
+            config.schedule,
+            n_samples=config.sample_count,
+            eta=config.eta,
+            device=device,
+        )
+    return CircuitExperimentResult(
+        config=config,
+        model=model,
+        losses=losses,
+        generated_deterministic=generated_deterministic,
+        generated_stochastic=generated_stochastic,
+    )
+
+
 @torch.no_grad()
 def sample_circuit_reverse(
     model: torch.nn.Module,
@@ -256,6 +370,90 @@ def run_circuit_experiment(
         losses=losses,
         generated_deterministic=generated_deterministic,
         generated_stochastic=generated_stochastic,
+    )
+
+
+def generate_solution_stack_dataset(
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    n_targets: int = 128,
+    perturb_scale: float = 0.12,
+    entangler: str = "cz",
+    candidate_count: int = 256,
+    refinement_steps: int = 100,
+    refinement_lr: float = 0.05,
+    fidelity_threshold: float = 0.995,
+    seed: int = 0,
+) -> SolutionStackDatasetResult:
+    if n_targets <= 0:
+        raise ValueError("n_targets must be positive")
+    if candidate_count <= 0:
+        raise ValueError("candidate_count must be positive")
+    if not (0.0 <= fidelity_threshold <= 1.0):
+        raise ValueError("fidelity_threshold must be between 0 and 1")
+
+    targets = make_near_clifford_two_entangler_circuit_targets(
+        clifford_gates,
+        clifford_labels,
+        n_targets=n_targets,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        seed=seed,
+    )
+    stacks = []
+    fidelities = []
+    kept_targets = []
+    refinements = []
+    for i, target in enumerate(targets):
+        candidate_stack = _best_analytic_stack_for_target(
+            target,
+            clifford_gates=clifford_gates,
+            clifford_labels=clifford_labels,
+            perturb_scale=perturb_scale,
+            candidate_count=candidate_count,
+            seed=seed + 10_000 + i,
+        )
+        units = quaternion_to_unitary(candidate_stack)
+        entangler_unitary = two_qubit_gate(target.entangler, device=clifford_gates.device)
+        unitary = compose_two_entangler_local(
+            units[0],
+            units[1],
+            entangler_unitary,
+            units[2],
+            units[3],
+            units[4],
+            units[5],
+        )
+        candidate = SynthesisCandidate(
+            target=target.name,
+            template="solution-stack-analytic-start",
+            entangler=target.entangler,
+            fidelity=unitary_fidelity(unitary, target.unitary),
+            slot_indices=(0, 1, 2, 3, 4, 5),
+            slot_labels=("analytic", "analytic", "analytic", "analytic", "analytic", "analytic"),
+        )
+        refined = refine_two_entangler_candidate(
+            candidate_stack,
+            candidate,
+            target_unitary=target.unitary,
+            entangler=target.entangler,
+            num_steps=refinement_steps,
+            lr=refinement_lr,
+        )
+        if refined.refined_fidelity >= fidelity_threshold:
+            stacks.append(refined.refined_gates)
+            fidelities.append(refined.refined_fidelity)
+            kept_targets.append(target)
+            refinements.append(refined)
+
+    if not stacks:
+        raise RuntimeError("No solution stacks met the fidelity threshold")
+
+    return SolutionStackDatasetResult(
+        stacks=torch.stack(stacks),
+        fidelities=torch.tensor(fidelities, dtype=torch.float32, device=clifford_gates.device),
+        targets=kept_targets,
+        refinements=refinements,
     )
 
 
@@ -337,6 +535,43 @@ def summarize_joint_circuit_comparison(
     return rows
 
 
+def summarize_solution_stack_circuit_comparison(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    random_joint_reports: list[SynthesisReport],
+    solution_joint_reports: list[SynthesisReport],
+) -> list[HiddenShallowCircuitAggregate]:
+    rows = summarize_joint_circuit_comparison(benchmarks, random_joint_reports)
+    rows.append(_aggregate_reports("solution-stack diffusion", solution_joint_reports))
+    return rows
+
+
+def print_solution_stack_dataset_summary(dataset: SolutionStackDatasetResult) -> None:
+    header = "n stacks   mean fidelity   min fidelity   max fidelity"
+    print(header)
+    print("-" * len(header))
+    print(
+        f"{dataset.stacks.shape[0]:<8}   {dataset.fidelities.mean().item():>11.4f}   "
+        f"{dataset.fidelities.min().item():>10.4f}   {dataset.fidelities.max().item():>10.4f}"
+    )
+
+
+def print_solution_stack_circuit_comparison_summary(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    random_joint_reports: list[SynthesisReport],
+    solution_joint_reports: list[SynthesisReport],
+) -> None:
+    header = "mode                      n   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for item in summarize_solution_stack_circuit_comparison(benchmarks, random_joint_reports, solution_joint_reports):
+        print(
+            f"{item.mode:<25} {item.n_targets:<3} "
+            f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
+            f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
+            f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
 def print_joint_circuit_comparison_summary(
     benchmarks: list[NearCliffordCircuitBenchmark],
     joint_reports: list[SynthesisReport],
@@ -377,6 +612,29 @@ def plot_joint_circuit_comparison(
     plt.tight_layout()
 
 
+def plot_solution_stack_circuit_comparison(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    random_joint_reports: list[SynthesisReport],
+    solution_joint_reports: list[SynthesisReport],
+) -> None:
+    values = [
+        _best_values([item.clifford_report for item in benchmarks]),
+        _best_values([item.analytic_report for item in benchmarks]),
+        _best_values([item.generated_report for item in benchmarks]),
+        _best_values([item.haar_report for item in benchmarks]),
+        _best_values(random_joint_reports),
+        _best_values(solution_joint_reports),
+    ]
+    labels = ["Clifford", "analytic", "independent", "Haar", "joint random", "joint solution"]
+
+    plt.figure(figsize=(11, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Near-Clifford proposals with solution-stack diffusion")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
 def _compose_two_entangler_stack_units(
     units: torch.Tensor,
     entangler_unitary: torch.Tensor,
@@ -386,6 +644,29 @@ def _compose_two_entangler_stack_units(
     second = _batched_local_layer(units[:, 4], units[:, 5])
     entanglers = entangler_unitary.expand(units.shape[0], 4, 4)
     return first @ entanglers @ middle @ entanglers @ second
+
+
+def _best_analytic_stack_for_target(
+    target: HiddenShallowCircuitTarget,
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    perturb_scale: float,
+    candidate_count: int,
+    seed: int,
+) -> torch.Tensor:
+    flat_gates, _ = sample_near_clifford_gates(
+        clifford_gates,
+        clifford_labels,
+        n_samples=candidate_count * 6,
+        perturb_scale=perturb_scale,
+        seed=seed,
+    )
+    stacks = flat_gates.reshape(candidate_count, 6, 4)
+    units = quaternion_to_unitary(stacks)
+    entangler_unitary = two_qubit_gate(target.entangler, device=clifford_gates.device)
+    unitaries = _compose_two_entangler_stack_units(units, entangler_unitary)
+    fidelities = unitary_fidelity_batch(unitaries, target.unitary)
+    return stacks[int(torch.argmax(fidelities).item())]
 
 
 def _batched_local_layer(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
