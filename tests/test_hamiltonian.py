@@ -2,12 +2,15 @@ import torch
 
 from su2diffusion.data import center_names_for_config, centers_for_config, DataConfig
 from su2diffusion.hamiltonian import (
+    generate_hamiltonian_solution_dataset,
     hamiltonian_from_terms,
     make_hamiltonian_target,
     make_random_pauli_hamiltonian_targets,
     parse_pauli_string,
     pauli_string_matrix,
     print_hamiltonian_target,
+    print_hamiltonian_solution_dataset,
+    print_hamiltonian_solution_dataset_summary,
     print_hamiltonian_suite,
     print_hamiltonian_suite_summary,
     print_hamiltonian_two_entangler_benchmark,
@@ -125,3 +128,39 @@ def test_random_hamiltonian_suite_smoke(capsys):
     assert len(result.benchmarks) == 3
     assert [row.n_targets for row in rows] == [3, 3, 3, 3]
     assert all(0.0 <= row.mean_best <= 1.0 for row in rows)
+
+
+def test_hamiltonian_solution_dataset_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=7,
+    )
+
+    dataset = generate_hamiltonian_solution_dataset(
+        targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=8,
+    )
+    print_hamiltonian_solution_dataset(dataset)
+    print_hamiltonian_solution_dataset_summary(dataset)
+
+    captured = capsys.readouterr().out
+    assert "before" in captured
+    assert dataset.stacks.shape == (2, 6, 4)
+    assert torch.allclose(dataset.stacks.norm(dim=-1), torch.ones(2, 6), atol=1e-5)
+    assert torch.all(dataset.refined_fidelities >= dataset.initial_fidelities - 1e-6)
