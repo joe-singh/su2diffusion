@@ -87,6 +87,28 @@ class TargetConditionedOverfitResult:
     generated_stochastic_by_target: torch.Tensor
 
 
+@dataclass(frozen=True)
+class TargetConditionedLearningCurveRow:
+    n_train_targets: int
+    split: str
+    n_eval_targets: int
+    mean_best: float
+    median_best: float
+    min_best: float
+    max_best: float
+    success_95: float
+    success_98: float
+    success_99: float
+
+
+@dataclass
+class TargetConditionedLearningCurveResult:
+    rows: list[TargetConditionedLearningCurveRow]
+    train_reports_by_count: dict[int, list[SynthesisReport]]
+    heldout_reports_by_count: dict[int, list[SynthesisReport]]
+    losses_by_count: dict[int, list[float]]
+
+
 def get_circuit_experiment_config(name: str) -> CircuitExperimentConfig:
     configs = {
         "smoke-circuit-near-clifford": CircuitExperimentConfig(
@@ -577,19 +599,13 @@ def run_target_conditioned_overfit_diagnostic(
     data_config = data_config or config.data
     centers = centers_for_config(data_config, device=device)
     center_names = center_names_for_config(data_config)
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
-    solution_stacks, _ = sample_near_clifford_circuit_stacks(
-        n_targets,
+    solution_stacks, target_unitaries = _sample_target_conditioned_pairs(
+        n_targets=n_targets,
         centers=centers,
         center_names=center_names,
-        sigma=perturb_scale,
-        generator=generator,
-    )
-    entangler_unitary = two_qubit_gate(entangler, device=device)
-    target_unitaries = _compose_two_entangler_stack_units(
-        quaternion_to_unitary(solution_stacks),
-        entangler_unitary,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        seed=seed,
     )
 
     model, losses = train_target_conditioned_circuit_heat_kernel_model(
@@ -627,6 +643,110 @@ def run_target_conditioned_overfit_diagnostic(
         reports=reports,
         losses=losses,
         generated_stochastic_by_target=generated_stochastic_by_target,
+    )
+
+
+def run_target_conditioned_learning_curve(
+    config: CircuitExperimentConfig | str,
+    target_counts: tuple[int, ...] = (1, 4, 16, 64),
+    n_heldout_targets: int = 12,
+    perturb_scale: float = 0.12,
+    data_config: DataConfig | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    entangler: str = "cz",
+    seed: int = 0,
+    top_k: int = 5,
+) -> TargetConditionedLearningCurveResult:
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    if not target_counts:
+        raise ValueError("target_counts must contain at least one target count")
+    if any(count <= 0 for count in target_counts):
+        raise ValueError("target_counts must be positive")
+    if n_heldout_targets <= 0:
+        raise ValueError("n_heldout_targets must be positive")
+
+    device = torch.device(device) if device is not None else get_default_device()
+    data_config = data_config or config.data
+    centers = centers_for_config(data_config, device=device)
+    center_names = center_names_for_config(data_config)
+    rows: list[TargetConditionedLearningCurveRow] = []
+    train_reports_by_count: dict[int, list[SynthesisReport]] = {}
+    heldout_reports_by_count: dict[int, list[SynthesisReport]] = {}
+    losses_by_count: dict[int, list[float]] = {}
+
+    for i, n_train_targets in enumerate(target_counts):
+        train_stacks, train_targets = _sample_target_conditioned_pairs(
+            n_targets=n_train_targets,
+            centers=centers,
+            center_names=center_names,
+            perturb_scale=perturb_scale,
+            entangler=entangler,
+            seed=seed + i * 10_000,
+        )
+        heldout_stacks, heldout_targets = _sample_target_conditioned_pairs(
+            n_targets=n_heldout_targets,
+            centers=centers,
+            center_names=center_names,
+            perturb_scale=perturb_scale,
+            entangler=entangler,
+            seed=seed + i * 10_000 + 5_000,
+        )
+        del heldout_stacks
+
+        model, losses = train_target_conditioned_circuit_heat_kernel_model(
+            train_stacks,
+            train_targets,
+            train_config=config.train,
+            schedule=config.schedule,
+            device=device,
+            show_progress=show_progress,
+        )
+        losses_by_count[n_train_targets] = losses
+
+        with torch.no_grad():
+            train_generated = sample_target_conditioned_circuit_reverse(
+                model,
+                config.schedule,
+                target_unitaries=train_targets,
+                n_samples_per_target=config.sample_count,
+                eta=config.eta,
+                device=device,
+            )
+            heldout_generated = sample_target_conditioned_circuit_reverse(
+                model,
+                config.schedule,
+                target_unitaries=heldout_targets,
+                n_samples_per_target=config.sample_count,
+                eta=config.eta,
+                device=device,
+            )
+
+        train_reports = _target_conditioned_reports_from_batches(
+            train_generated,
+            train_targets,
+            prefix=f"train-{n_train_targets}",
+            entangler=entangler,
+            top_k=top_k,
+        )
+        heldout_reports = _target_conditioned_reports_from_batches(
+            heldout_generated,
+            heldout_targets,
+            prefix=f"heldout-{n_train_targets}",
+            entangler=entangler,
+            top_k=top_k,
+        )
+        train_reports_by_count[n_train_targets] = train_reports
+        heldout_reports_by_count[n_train_targets] = heldout_reports
+        rows.append(_learning_curve_row(n_train_targets, "train", train_reports))
+        rows.append(_learning_curve_row(n_train_targets, "heldout", heldout_reports))
+
+    return TargetConditionedLearningCurveResult(
+        rows=rows,
+        train_reports_by_count=train_reports_by_count,
+        heldout_reports_by_count=heldout_reports_by_count,
+        losses_by_count=losses_by_count,
     )
 
 
@@ -1031,6 +1151,19 @@ def print_target_conditioned_overfit_summary(result: TargetConditionedOverfitRes
     )
 
 
+def print_target_conditioned_learning_curve(result: TargetConditionedLearningCurveResult) -> None:
+    header = "n train   split     n eval   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for row in result.rows:
+        print(
+            f"{row.n_train_targets:<9} {row.split:<8} {row.n_eval_targets:<6} "
+            f"{row.mean_best:>9.4f}   {row.median_best:>6.4f}   "
+            f"{row.min_best:>6.4f}   {row.max_best:>6.4f}   "
+            f"{row.success_95:>6.1%}   {row.success_98:>6.1%}   {row.success_99:>6.1%}"
+        )
+
+
 def print_joint_circuit_comparison_summary(
     benchmarks: list[NearCliffordCircuitBenchmark],
     joint_reports: list[SynthesisReport],
@@ -1131,6 +1264,29 @@ def plot_target_conditioned_overfit(result: TargetConditionedOverfitResult) -> N
     plt.tight_layout()
 
 
+def plot_target_conditioned_learning_curve(result: TargetConditionedLearningCurveResult) -> None:
+    counts = sorted(result.train_reports_by_count)
+    train_means = [
+        _best_values(result.train_reports_by_count[count]).mean().item()
+        for count in counts
+    ]
+    heldout_means = [
+        _best_values(result.heldout_reports_by_count[count]).mean().item()
+        for count in counts
+    ]
+
+    plt.figure(figsize=(7, 4))
+    plt.plot(counts, train_means, marker="o", label="train targets")
+    plt.plot(counts, heldout_means, marker="o", label="held-out targets")
+    plt.xscale("log", base=2)
+    plt.xlabel("number of training targets")
+    plt.ylabel("mean best unitary fidelity")
+    plt.title("Target-conditioned circuit learning curve")
+    plt.ylim(0.0, 1.02)
+    plt.legend()
+    plt.tight_layout()
+
+
 def _compose_two_entangler_stack_units(
     units: torch.Tensor,
     entangler_unitary: torch.Tensor,
@@ -1163,6 +1319,72 @@ def _best_analytic_stack_for_target(
     unitaries = _compose_two_entangler_stack_units(units, entangler_unitary)
     fidelities = unitary_fidelity_batch(unitaries, target.unitary)
     return stacks[int(torch.argmax(fidelities).item())]
+
+
+def _sample_target_conditioned_pairs(
+    n_targets: int,
+    centers: torch.Tensor,
+    center_names: list[str],
+    perturb_scale: float,
+    entangler: str,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device=centers.device)
+    generator.manual_seed(seed)
+    stacks, _ = sample_near_clifford_circuit_stacks(
+        n_targets,
+        centers=centers,
+        center_names=center_names,
+        sigma=perturb_scale,
+        generator=generator,
+    )
+    entangler_unitary = two_qubit_gate(entangler, device=centers.device)
+    target_unitaries = _compose_two_entangler_stack_units(
+        quaternion_to_unitary(stacks),
+        entangler_unitary,
+    )
+    return stacks, target_unitaries
+
+
+def _target_conditioned_reports_from_batches(
+    generated_by_target: torch.Tensor,
+    target_unitaries: torch.Tensor,
+    prefix: str,
+    entangler: str,
+    top_k: int,
+) -> list[SynthesisReport]:
+    return [
+        synthesize_unitary_from_circuit_stack_report(
+            stacks,
+            target_unitary=target_unitary,
+            target_name=f"{prefix}-{i:02d}",
+            entangler=entangler,
+            top_k=top_k,
+            name=f"{prefix}-{i:02d} target-conditioned diffusion",
+            keep_fidelities=False,
+        )
+        for i, (stacks, target_unitary) in enumerate(zip(generated_by_target, target_unitaries))
+    ]
+
+
+def _learning_curve_row(
+    n_train_targets: int,
+    split: str,
+    reports: list[SynthesisReport],
+) -> TargetConditionedLearningCurveRow:
+    values = _best_values(reports)
+    return TargetConditionedLearningCurveRow(
+        n_train_targets=n_train_targets,
+        split=split,
+        n_eval_targets=values.numel(),
+        mean_best=values.mean().item(),
+        median_best=values.median().item(),
+        min_best=values.min().item(),
+        max_best=values.max().item(),
+        success_95=(values >= 0.95).float().mean().item(),
+        success_98=(values >= 0.98).float().mean().item(),
+        success_99=(values >= 0.99).float().mean().item(),
+    )
 
 
 def _batched_local_layer(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
