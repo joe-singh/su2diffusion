@@ -8,7 +8,7 @@ from tqdm.auto import tqdm
 from .data import DataConfig, center_names_for_config, centers_for_config
 from .device import get_default_device
 from .diffusion import DiffusionSchedule, brownian_forward_heat_target
-from .model import CircuitDenoiser, TargetConditionedCircuitDenoiser
+from .model import CircuitDenoiser, TargetConditionedCircuitDenoiser, TargetLabelConditionedCircuitDenoiser
 from .quaternion import q_exp, q_mul, q_normalize, sample_haar
 from .synthesis import (
     HiddenShallowCircuitAggregate,
@@ -68,6 +68,15 @@ class TargetConditionedCircuitExperimentResult:
     losses: list[float]
     generated_deterministic_by_target: torch.Tensor
     generated_stochastic_by_target: torch.Tensor
+
+
+@dataclass
+class TargetLabelConditionedCircuitExperimentResult:
+    config: CircuitExperimentConfig
+    model: torch.nn.Module
+    losses: list[float]
+    generated_stochastic_by_target: torch.Tensor
+    reports: list[SynthesisReport]
 
 
 @dataclass
@@ -148,6 +157,26 @@ def sample_near_clifford_circuit_stacks(
     n_slots: int = 6,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, list[tuple[str, ...]]]:
+    q_stack, labels = sample_near_clifford_circuit_stacks_with_labels(
+        batch_size,
+        centers=centers,
+        center_names=center_names,
+        sigma=sigma,
+        n_slots=n_slots,
+        generator=generator,
+    )
+    label_names = [tuple(center_names[int(label)] for label in row.tolist()) for row in labels]
+    return q_stack, label_names
+
+
+def sample_near_clifford_circuit_stacks_with_labels(
+    batch_size: int,
+    centers: torch.Tensor,
+    center_names: list[str],
+    sigma: float = 0.08,
+    n_slots: int = 6,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     if n_slots <= 0:
@@ -164,8 +193,7 @@ def sample_near_clifford_circuit_stacks(
     )
     perturbations = sigma * torch.randn(batch_size, n_slots, 3, device=centers.device, generator=generator)
     q_stack = q_normalize(q_mul(q_exp(perturbations), centers[labels]))
-    label_names = [tuple(center_names[int(label)] for label in row.tolist()) for row in labels]
-    return q_stack, label_names
+    return q_stack, labels
 
 
 def circuit_forward_heat_target(
@@ -429,6 +457,75 @@ def train_target_conditioned_circuit_heat_kernel_model_synthetic(
             )
 
         eps_pred = model(qt_stack, t_idx, features)
+        loss = F.mse_loss(eps_pred, eps_target)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        loss_value = loss.item()
+        losses.append(loss_value)
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix({"loss": f"{loss_value:.5f}"})
+
+    return model, losses
+
+
+def train_target_label_conditioned_circuit_heat_kernel_model_synthetic(
+    train_config: CircuitTrainConfig | None = None,
+    schedule: DiffusionSchedule | None = None,
+    data_config: DataConfig | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    entangler: str = "cz",
+) -> tuple[TargetLabelConditionedCircuitDenoiser, list[float]]:
+    train_config = train_config or CircuitTrainConfig()
+    schedule = schedule or DiffusionSchedule()
+    data_config = data_config or DataConfig(kind="clifford", sigma_data=0.08, label_strategy="balanced")
+    device = torch.device(device) if device is not None else get_default_device()
+
+    torch.manual_seed(train_config.seed)
+    centers = centers_for_config(data_config, device=device)
+    center_names = center_names_for_config(data_config)
+    entangler_unitary = two_qubit_gate(entangler, device=device)
+
+    model = TargetLabelConditionedCircuitDenoiser(
+        T=schedule.T,
+        hidden=train_config.hidden,
+        num_labels=centers.shape[0],
+    ).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+    losses: list[float] = []
+
+    iterator = range(1, train_config.num_steps + 1)
+    if show_progress:
+        iterator = tqdm(iterator, desc="Training label-conditioned circuit target", dynamic_ncols=True)
+
+    for _ in iterator:
+        q0_stack, slot_labels = sample_near_clifford_circuit_stacks_with_labels(
+            train_config.batch_size,
+            centers=centers,
+            center_names=center_names,
+            sigma=data_config.sigma_data,
+        )
+        with torch.no_grad():
+            target_unitaries = _compose_two_entangler_stack_units(
+                quaternion_to_unitary(q0_stack),
+                entangler_unitary,
+            )
+            features = target_unitary_features(target_unitaries)
+
+        t_idx = torch.randint(1, schedule.T + 1, (train_config.batch_size,), device=device)
+
+        with torch.no_grad():
+            qt_stack, eps_target = circuit_forward_heat_target(
+                q0_stack,
+                t_idx,
+                schedule=schedule,
+                n_terms=train_config.n_terms,
+            )
+
+        eps_pred = model(qt_stack, t_idx, features, slot_labels)
         loss = F.mse_loss(eps_pred, eps_target)
 
         opt.zero_grad(set_to_none=True)
@@ -827,6 +924,106 @@ def sample_target_conditioned_circuit_reverse(
     return q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
 
 
+@torch.no_grad()
+def sample_target_label_conditioned_circuit_reverse(
+    model: torch.nn.Module,
+    schedule: DiffusionSchedule,
+    target_unitaries: torch.Tensor,
+    slot_labels: torch.Tensor,
+    n_samples_per_target: int = 1000,
+    eta: float = 1.0,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    if target_unitaries.ndim != 3 or target_unitaries.shape[1:] != (4, 4):
+        raise ValueError("target_unitaries must have shape (n_targets, 4, 4)")
+    if slot_labels.ndim != 2 or slot_labels.shape != (target_unitaries.shape[0], 6):
+        raise ValueError("slot_labels must have shape (n_targets, 6)")
+    if n_samples_per_target <= 0:
+        raise ValueError("n_samples_per_target must be positive")
+
+    device = torch.device(device) if device is not None else next(model.parameters()).device
+    target_unitaries = target_unitaries.to(device=device)
+    slot_labels = slot_labels.to(device=device, dtype=torch.long)
+    n_targets = target_unitaries.shape[0]
+    n_slots = getattr(model, "n_slots", 6)
+    n_total = n_targets * n_samples_per_target
+    features = target_unitary_features(target_unitaries)
+    features = features[:, None, :].expand(n_targets, n_samples_per_target, features.shape[-1])
+    features = features.reshape(n_total, features.shape[-1])
+    labels = slot_labels[:, None, :].expand(n_targets, n_samples_per_target, n_slots).reshape(n_total, n_slots)
+
+    betas, _, sigmas = schedule.tensors(device)
+    q_stack = sample_haar(n_total * n_slots, device=device).reshape(n_total, n_slots, 4)
+
+    for s in reversed(range(schedule.T)):
+        t_idx = torch.full((n_total,), s + 1, device=device, dtype=torch.long)
+        eps_pred = model(q_stack, t_idx, features, labels)
+
+        beta = betas[s]
+        sigma = sigmas[s]
+        drift = -(beta / sigma.clamp_min(1e-8)) * eps_pred
+
+        if s > 0 and eta > 0:
+            noise = eta * torch.sqrt(beta) * torch.randn(n_total, n_slots, 3, device=device)
+        else:
+            noise = torch.zeros_like(drift)
+
+        q_stack = q_mul(q_stack, q_exp(drift + noise))
+        q_stack = q_normalize(q_stack)
+
+    return q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
+
+
+def run_target_label_conditioned_skeleton_benchmark(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    config: CircuitExperimentConfig | str,
+    data_config: DataConfig | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    entangler: str = "cz",
+    top_k: int = 5,
+) -> TargetLabelConditionedCircuitExperimentResult:
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    if not benchmarks:
+        raise ValueError("benchmarks must contain at least one target")
+    device = torch.device(device) if device is not None else get_default_device()
+
+    model, losses = train_target_label_conditioned_circuit_heat_kernel_model_synthetic(
+        train_config=config.train,
+        schedule=config.schedule,
+        data_config=data_config or config.data,
+        device=device,
+        show_progress=show_progress,
+        entangler=entangler,
+    )
+    target_unitaries = torch.stack([benchmark.target.unitary for benchmark in benchmarks]).to(device=device)
+    slot_labels = torch.tensor([benchmark.target.slot_indices for benchmark in benchmarks], device=device, dtype=torch.long)
+    with torch.no_grad():
+        generated_stochastic_by_target = sample_target_label_conditioned_circuit_reverse(
+            model,
+            config.schedule,
+            target_unitaries=target_unitaries,
+            slot_labels=slot_labels,
+            n_samples_per_target=config.sample_count,
+            eta=config.eta,
+            device=device,
+        )
+    reports = run_target_conditioned_circuit_proposal_benchmark(
+        benchmarks,
+        generated_stochastic_by_target,
+        top_k=top_k,
+        keep_fidelities=False,
+    )
+    return TargetLabelConditionedCircuitExperimentResult(
+        config=config,
+        model=model,
+        losses=losses,
+        generated_stochastic_by_target=generated_stochastic_by_target,
+        reports=reports,
+    )
+
+
 def run_circuit_experiment(
     config: CircuitExperimentConfig | str,
     device: torch.device | str | None = None,
@@ -1082,6 +1279,17 @@ def summarize_target_conditioned_circuit_comparison(
     return rows
 
 
+def summarize_target_label_conditioned_circuit_comparison(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    random_joint_reports: list[SynthesisReport],
+    conditioned_reports: list[SynthesisReport],
+    label_conditioned_reports: list[SynthesisReport],
+) -> list[HiddenShallowCircuitAggregate]:
+    rows = summarize_target_conditioned_circuit_comparison(benchmarks, random_joint_reports, conditioned_reports)
+    rows.append(_aggregate_reports("target+labels diffusion", label_conditioned_reports))
+    return rows
+
+
 def print_solution_stack_dataset_summary(dataset: SolutionStackDatasetResult) -> None:
     header = "n stacks   mean fidelity   min fidelity   max fidelity"
     print(header)
@@ -1123,6 +1331,29 @@ def print_target_conditioned_circuit_comparison_summary(
         random_joint_reports,
         conditioned_reports,
         solution_joint_reports=solution_joint_reports,
+    ):
+        print(
+            f"{item.mode:<30} {item.n_targets:<3} "
+            f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
+            f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
+            f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
+def print_target_label_conditioned_circuit_comparison_summary(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    random_joint_reports: list[SynthesisReport],
+    conditioned_reports: list[SynthesisReport],
+    label_conditioned_reports: list[SynthesisReport],
+) -> None:
+    header = "mode                           n   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for item in summarize_target_label_conditioned_circuit_comparison(
+        benchmarks,
+        random_joint_reports,
+        conditioned_reports,
+        label_conditioned_reports,
     ):
         print(
             f"{item.mode:<30} {item.n_targets:<3} "
@@ -1250,6 +1481,31 @@ def plot_target_conditioned_circuit_comparison(
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Target-conditioned circuit diffusion proposals")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_target_label_conditioned_circuit_comparison(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    random_joint_reports: list[SynthesisReport],
+    conditioned_reports: list[SynthesisReport],
+    label_conditioned_reports: list[SynthesisReport],
+) -> None:
+    values = [
+        _best_values([item.clifford_report for item in benchmarks]),
+        _best_values([item.analytic_report for item in benchmarks]),
+        _best_values([item.generated_report for item in benchmarks]),
+        _best_values([item.haar_report for item in benchmarks]),
+        _best_values(random_joint_reports),
+        _best_values(conditioned_reports),
+        _best_values(label_conditioned_reports),
+    ]
+    labels = ["Clifford", "analytic", "independent", "Haar", "joint random", "target", "target+labels"]
+
+    plt.figure(figsize=(12, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Skeleton-conditioned circuit diffusion proposals")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 

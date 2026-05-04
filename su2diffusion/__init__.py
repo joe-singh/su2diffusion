@@ -19,6 +19,7 @@ from .circuit import (
     TargetConditionedLearningCurveResult,
     TargetConditionedLearningCurveRow,
     TargetConditionedOverfitResult,
+    TargetLabelConditionedCircuitExperimentResult,
     circuit_forward_heat_target,
     generate_solution_stack_dataset,
     get_circuit_experiment_config,
@@ -27,12 +28,14 @@ from .circuit import (
     plot_target_conditioned_circuit_comparison,
     plot_target_conditioned_learning_curve,
     plot_target_conditioned_overfit,
+    plot_target_label_conditioned_circuit_comparison,
     print_joint_circuit_comparison_summary,
     print_solution_stack_circuit_comparison_summary,
     print_solution_stack_dataset_summary,
     print_target_conditioned_circuit_comparison_summary,
     print_target_conditioned_learning_curve,
     print_target_conditioned_overfit_summary,
+    print_target_label_conditioned_circuit_comparison_summary,
     run_circuit_experiment,
     run_joint_circuit_proposal_benchmark,
     run_solution_stack_circuit_experiment,
@@ -41,18 +44,22 @@ from .circuit import (
     run_target_conditioned_overfit_diagnostic,
     run_target_conditioned_solution_stack_circuit_experiment,
     run_target_conditioned_synthetic_circuit_experiment,
+    run_target_label_conditioned_skeleton_benchmark,
     sample_circuit_reverse,
     sample_near_clifford_circuit_stacks,
     sample_target_conditioned_circuit_reverse,
+    sample_target_label_conditioned_circuit_reverse,
     summarize_joint_circuit_comparison,
     summarize_solution_stack_circuit_comparison,
     summarize_target_conditioned_circuit_comparison,
+    summarize_target_label_conditioned_circuit_comparison,
     synthesize_unitary_from_circuit_stack_report,
     target_unitary_features,
     train_circuit_heat_kernel_model,
     train_circuit_heat_kernel_model_on_stacks,
     train_target_conditioned_circuit_heat_kernel_model,
     train_target_conditioned_circuit_heat_kernel_model_synthetic,
+    train_target_label_conditioned_circuit_heat_kernel_model_synthetic,
 )
 from .diagnostics import (
     ConditionalLabelDiagnostics,
@@ -67,7 +74,7 @@ from .diagnostics import (
 from .diffusion import DiffusionSchedule, brownian_forward_heat_target, heat_epsilon_target
 from .experiment import ExperimentConfig, ExperimentResult, ResampleResult, get_experiment_config, resample_experiment, run_experiment
 from .forward_checks import ForwardProcessDiagnostics, diagnose_forward_process, print_forward_diagnostics
-from .model import CircuitDenoiser, SU2Denoiser, TargetConditionedCircuitDenoiser
+from .model import CircuitDenoiser, SU2Denoiser, TargetConditionedCircuitDenoiser, TargetLabelConditionedCircuitDenoiser
 from .quaternion import q_exp, q_inv, q_log, q_mul, q_normalize, sample_haar, su2_distance
 from .sampling import sample_reverse, sample_reverse_trajectory
 from .synthesis import (
@@ -169,6 +176,8 @@ __all__ = [
     "TargetConditionedLearningCurveResult",
     "TargetConditionedLearningCurveRow",
     "TargetConditionedOverfitResult",
+    "TargetLabelConditionedCircuitDenoiser",
+    "TargetLabelConditionedCircuitExperimentResult",
     "TrainConfig",
     "bell_state",
     "bell_state_fidelity",
@@ -198,6 +207,7 @@ __all__ = [
     "plot_target_conditioned_circuit_comparison",
     "plot_target_conditioned_learning_curve",
     "plot_target_conditioned_overfit",
+    "plot_target_label_conditioned_circuit_comparison",
     "plot_synthesis_fidelity_histograms",
     "plot_refinement_ablation",
     "plot_refinement_improvements",
@@ -218,6 +228,7 @@ __all__ = [
     "print_target_conditioned_circuit_comparison_summary",
     "print_target_conditioned_learning_curve",
     "print_target_conditioned_overfit_summary",
+    "print_target_label_conditioned_circuit_comparison_summary",
     "print_near_clifford_two_entangler_benchmark",
     "print_near_clifford_two_entangler_summary",
     "print_refinement_ablation_results",
@@ -247,6 +258,7 @@ __all__ = [
     "run_target_conditioned_overfit_diagnostic",
     "run_target_conditioned_solution_stack_circuit_experiment",
     "run_target_conditioned_synthetic_circuit_experiment",
+    "run_target_label_conditioned_skeleton_benchmark",
     "run_near_clifford_two_entangler_benchmark",
     "run_experiment",
     "sample_clean",
@@ -256,6 +268,7 @@ __all__ = [
     "sample_haar",
     "sample_near_clifford_circuit_stacks",
     "sample_target_conditioned_circuit_reverse",
+    "sample_target_label_conditioned_circuit_reverse",
     "sample_near_clifford_gates",
     "sample_reverse",
     "sample_reverse_trajectory",
@@ -278,6 +291,7 @@ __all__ = [
     "summarize_joint_circuit_comparison",
     "summarize_solution_stack_circuit_comparison",
     "summarize_target_conditioned_circuit_comparison",
+    "summarize_target_label_conditioned_circuit_comparison",
     "synthesize_unitary_from_circuit_stack_report",
     "target_unitary_features",
     "two_qubit_gate",
@@ -287,6 +301,7 @@ __all__ = [
     "train_circuit_heat_kernel_model_on_stacks",
     "train_target_conditioned_circuit_heat_kernel_model",
     "train_target_conditioned_circuit_heat_kernel_model_synthetic",
+    "train_target_label_conditioned_circuit_heat_kernel_model_synthetic",
     "unitary_fidelity",
     "unitary_fidelity_batch",
 ]
