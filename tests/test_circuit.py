@@ -12,11 +12,13 @@ from su2diffusion.circuit import (
     print_solution_stack_circuit_comparison_summary,
     print_solution_stack_dataset_summary,
     print_target_conditioned_circuit_comparison_summary,
+    print_target_conditioned_learning_curve,
     print_target_conditioned_overfit_summary,
     run_circuit_experiment,
     run_joint_circuit_proposal_benchmark,
     run_solution_stack_circuit_experiment,
     run_target_conditioned_circuit_proposal_benchmark,
+    run_target_conditioned_learning_curve,
     run_target_conditioned_overfit_diagnostic,
     run_target_conditioned_solution_stack_circuit_experiment,
     run_target_conditioned_synthetic_circuit_experiment,
@@ -472,6 +474,31 @@ def test_target_conditioned_overfit_diagnostic_smoke(capsys):
     assert result.solution_stacks.shape == (2, 6, 4)
     assert result.generated_stochastic_by_target.shape == (2, 4, 6, 4)
     assert len(result.reports) == 2
+
+
+def test_target_conditioned_learning_curve_smoke(capsys):
+    config = CircuitExperimentConfig(
+        name="tiny-target-conditioned-learning-curve",
+        schedule=DiffusionSchedule(T=4),
+        train=CircuitTrainConfig(batch_size=4, num_steps=1, hidden=16, n_terms=4),
+        sample_count=4,
+    )
+
+    result = run_target_conditioned_learning_curve(
+        config,
+        target_counts=(1, 2),
+        n_heldout_targets=2,
+        perturb_scale=0.02,
+        device="cpu",
+        show_progress=False,
+        top_k=1,
+    )
+    print_target_conditioned_learning_curve(result)
+
+    captured = capsys.readouterr().out
+    assert "n train" in captured
+    assert [row.n_train_targets for row in result.rows] == [1, 1, 2, 2]
+    assert {row.split for row in result.rows} == {"train", "heldout"}
 
 
 def q_normalized_random_stacks(n: int) -> torch.Tensor:
