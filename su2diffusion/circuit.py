@@ -80,6 +80,17 @@ class TargetLabelConditionedCircuitExperimentResult:
 
 
 @dataclass
+class SkeletonLocalRefinementResult:
+    config: CircuitExperimentConfig
+    model: torch.nn.Module
+    losses: list[float]
+    generated_global_by_target: torch.Tensor
+    generated_local_by_target: torch.Tensor
+    global_reports: list[SynthesisReport]
+    local_reports: list[SynthesisReport]
+
+
+@dataclass
 class SolutionStackDatasetResult:
     stacks: torch.Tensor
     fidelities: torch.Tensor
@@ -974,6 +985,72 @@ def sample_target_label_conditioned_circuit_reverse(
     return q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
 
 
+@torch.no_grad()
+def sample_target_label_conditioned_circuit_reverse_from_skeleton(
+    model: torch.nn.Module,
+    schedule: DiffusionSchedule,
+    target_unitaries: torch.Tensor,
+    slot_labels: torch.Tensor,
+    centers: torch.Tensor,
+    n_samples_per_target: int = 1000,
+    eta: float = 1.0,
+    init_noise_scale: float = 0.05,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    if target_unitaries.ndim != 3 or target_unitaries.shape[1:] != (4, 4):
+        raise ValueError("target_unitaries must have shape (n_targets, 4, 4)")
+    if slot_labels.ndim != 2 or slot_labels.shape != (target_unitaries.shape[0], 6):
+        raise ValueError("slot_labels must have shape (n_targets, 6)")
+    if centers.ndim != 2 or centers.shape[1] != 4:
+        raise ValueError("centers must have shape (n_centers, 4)")
+    if n_samples_per_target <= 0:
+        raise ValueError("n_samples_per_target must be positive")
+    if init_noise_scale < 0:
+        raise ValueError("init_noise_scale must be nonnegative")
+
+    device = torch.device(device) if device is not None else next(model.parameters()).device
+    target_unitaries = target_unitaries.to(device=device)
+    slot_labels = slot_labels.to(device=device, dtype=torch.long)
+    centers = centers.to(device=device)
+    if int(slot_labels.max().item()) >= centers.shape[0] or int(slot_labels.min().item()) < 0:
+        raise ValueError("slot_labels must index into centers")
+
+    n_targets = target_unitaries.shape[0]
+    n_slots = getattr(model, "n_slots", 6)
+    n_total = n_targets * n_samples_per_target
+    features = target_unitary_features(target_unitaries)
+    features = features[:, None, :].expand(n_targets, n_samples_per_target, features.shape[-1])
+    features = features.reshape(n_total, features.shape[-1])
+    labels = slot_labels[:, None, :].expand(n_targets, n_samples_per_target, n_slots).reshape(n_total, n_slots)
+
+    q_stack = centers[slot_labels]
+    q_stack = q_stack[:, None, :, :].expand(n_targets, n_samples_per_target, n_slots, 4)
+    q_stack = q_stack.reshape(n_total, n_slots, 4).clone()
+    if init_noise_scale > 0:
+        init_noise = init_noise_scale * torch.randn(n_total, n_slots, 3, device=device)
+        q_stack = q_mul(q_exp(init_noise), q_stack)
+        q_stack = q_normalize(q_stack)
+
+    betas, _, sigmas = schedule.tensors(device)
+    for s in reversed(range(schedule.T)):
+        t_idx = torch.full((n_total,), s + 1, device=device, dtype=torch.long)
+        eps_pred = model(q_stack, t_idx, features, labels)
+
+        beta = betas[s]
+        sigma = sigmas[s]
+        drift = -(beta / sigma.clamp_min(1e-8)) * eps_pred
+
+        if s > 0 and eta > 0:
+            noise = eta * torch.sqrt(beta) * torch.randn(n_total, n_slots, 3, device=device)
+        else:
+            noise = torch.zeros_like(drift)
+
+        q_stack = q_mul(q_stack, q_exp(drift + noise))
+        q_stack = q_normalize(q_stack)
+
+    return q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
+
+
 def run_target_label_conditioned_skeleton_benchmark(
     benchmarks: list[NearCliffordCircuitBenchmark],
     config: CircuitExperimentConfig | str,
@@ -1021,6 +1098,79 @@ def run_target_label_conditioned_skeleton_benchmark(
         losses=losses,
         generated_stochastic_by_target=generated_stochastic_by_target,
         reports=reports,
+    )
+
+
+def run_skeleton_local_refinement_benchmark(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    config: CircuitExperimentConfig | str,
+    data_config: DataConfig | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    entangler: str = "cz",
+    top_k: int = 5,
+    init_noise_scale: float = 0.05,
+) -> SkeletonLocalRefinementResult:
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    if not benchmarks:
+        raise ValueError("benchmarks must contain at least one target")
+    device = torch.device(device) if device is not None else get_default_device()
+    data_config = data_config or config.data
+
+    model, losses = train_target_label_conditioned_circuit_heat_kernel_model_synthetic(
+        train_config=config.train,
+        schedule=config.schedule,
+        data_config=data_config,
+        device=device,
+        show_progress=show_progress,
+        entangler=entangler,
+    )
+    centers = centers_for_config(data_config, device=device)
+    target_unitaries = torch.stack([benchmark.target.unitary for benchmark in benchmarks]).to(device=device)
+    slot_labels = torch.tensor([benchmark.target.slot_indices for benchmark in benchmarks], device=device, dtype=torch.long)
+    with torch.no_grad():
+        generated_global_by_target = sample_target_label_conditioned_circuit_reverse(
+            model,
+            config.schedule,
+            target_unitaries=target_unitaries,
+            slot_labels=slot_labels,
+            n_samples_per_target=config.sample_count,
+            eta=config.eta,
+            device=device,
+        )
+        generated_local_by_target = sample_target_label_conditioned_circuit_reverse_from_skeleton(
+            model,
+            config.schedule,
+            target_unitaries=target_unitaries,
+            slot_labels=slot_labels,
+            centers=centers,
+            n_samples_per_target=config.sample_count,
+            eta=config.eta,
+            init_noise_scale=init_noise_scale,
+            device=device,
+        )
+
+    global_reports = run_target_conditioned_circuit_proposal_benchmark(
+        benchmarks,
+        generated_global_by_target,
+        top_k=top_k,
+        keep_fidelities=False,
+    )
+    local_reports = run_target_conditioned_circuit_proposal_benchmark(
+        benchmarks,
+        generated_local_by_target,
+        top_k=top_k,
+        keep_fidelities=False,
+    )
+    return SkeletonLocalRefinementResult(
+        config=config,
+        model=model,
+        losses=losses,
+        generated_global_by_target=generated_global_by_target,
+        generated_local_by_target=generated_local_by_target,
+        global_reports=global_reports,
+        local_reports=local_reports,
     )
 
 
@@ -1290,6 +1440,23 @@ def summarize_target_label_conditioned_circuit_comparison(
     return rows
 
 
+def summarize_skeleton_local_refinement_comparison(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    random_joint_reports: list[SynthesisReport],
+    conditioned_reports: list[SynthesisReport],
+    label_conditioned_reports: list[SynthesisReport],
+    skeleton_local_reports: list[SynthesisReport],
+) -> list[HiddenShallowCircuitAggregate]:
+    rows = summarize_target_label_conditioned_circuit_comparison(
+        benchmarks,
+        random_joint_reports,
+        conditioned_reports,
+        label_conditioned_reports,
+    )
+    rows.append(_aggregate_reports("skeleton-local diffusion", skeleton_local_reports))
+    return rows
+
+
 def print_solution_stack_dataset_summary(dataset: SolutionStackDatasetResult) -> None:
     header = "n stacks   mean fidelity   min fidelity   max fidelity"
     print(header)
@@ -1354,6 +1521,31 @@ def print_target_label_conditioned_circuit_comparison_summary(
         random_joint_reports,
         conditioned_reports,
         label_conditioned_reports,
+    ):
+        print(
+            f"{item.mode:<30} {item.n_targets:<3} "
+            f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
+            f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
+            f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
+def print_skeleton_local_refinement_summary(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    random_joint_reports: list[SynthesisReport],
+    conditioned_reports: list[SynthesisReport],
+    label_conditioned_reports: list[SynthesisReport],
+    skeleton_local_reports: list[SynthesisReport],
+) -> None:
+    header = "mode                           n   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for item in summarize_skeleton_local_refinement_comparison(
+        benchmarks,
+        random_joint_reports,
+        conditioned_reports,
+        label_conditioned_reports,
+        skeleton_local_reports,
     ):
         print(
             f"{item.mode:<30} {item.n_targets:<3} "
@@ -1506,6 +1698,42 @@ def plot_target_label_conditioned_circuit_comparison(
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Skeleton-conditioned circuit diffusion proposals")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_skeleton_local_refinement_comparison(
+    benchmarks: list[NearCliffordCircuitBenchmark],
+    random_joint_reports: list[SynthesisReport],
+    conditioned_reports: list[SynthesisReport],
+    label_conditioned_reports: list[SynthesisReport],
+    skeleton_local_reports: list[SynthesisReport],
+) -> None:
+    values = [
+        _best_values([item.clifford_report for item in benchmarks]),
+        _best_values([item.analytic_report for item in benchmarks]),
+        _best_values([item.generated_report for item in benchmarks]),
+        _best_values([item.haar_report for item in benchmarks]),
+        _best_values(random_joint_reports),
+        _best_values(conditioned_reports),
+        _best_values(label_conditioned_reports),
+        _best_values(skeleton_local_reports),
+    ]
+    labels = [
+        "Clifford",
+        "analytic",
+        "independent",
+        "Haar",
+        "joint random",
+        "target",
+        "target+labels",
+        "skeleton-local",
+    ]
+
+    plt.figure(figsize=(13, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Skeleton-local circuit diffusion proposals")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 
