@@ -37,6 +37,11 @@ class HamiltonianSynthesisBenchmark:
     haar_report: SynthesisReport
 
 
+@dataclass(frozen=True)
+class HamiltonianSuiteResult:
+    benchmarks: list[HamiltonianSynthesisBenchmark]
+
+
 def pauli_matrix(name: str, device: torch.device | str | None = None) -> torch.Tensor:
     name = name.upper()
     if name == "I":
@@ -147,6 +152,42 @@ def make_hamiltonian_target(
     )
 
 
+def make_random_pauli_hamiltonian_targets(
+    n_targets: int = 12,
+    terms: tuple[str, ...] = ("XI", "IZ", "XX", "ZZ"),
+    coefficient_scale: float = 0.35,
+    time: float = 0.8,
+    name_prefix: str = "pauli",
+    seed: int = 0,
+    device: torch.device | str | None = None,
+) -> list[HamiltonianTarget]:
+    if n_targets <= 0:
+        raise ValueError("n_targets must be positive")
+    if not terms:
+        raise ValueError("terms must contain at least one Pauli string")
+    if coefficient_scale <= 0:
+        raise ValueError("coefficient_scale must be positive")
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    coefficients = coefficient_scale * torch.randn(n_targets, len(terms), device=device, generator=generator)
+    targets = []
+    for i in range(n_targets):
+        target_terms = tuple(
+            HamiltonianTerm(pauli=pauli, coefficient=float(coefficient))
+            for pauli, coefficient in zip(terms, coefficients[i].tolist())
+        )
+        targets.append(
+            make_hamiltonian_target(
+                target_terms,
+                time=time,
+                name=f"{name_prefix}-{i:02d}",
+                device=device,
+            )
+        )
+    return targets
+
+
 def run_hamiltonian_two_entangler_benchmark(
     target: HamiltonianTarget,
     clifford_gates: torch.Tensor,
@@ -238,6 +279,44 @@ def run_hamiltonian_two_entangler_benchmark(
     )
 
 
+def run_hamiltonian_suite_benchmark(
+    targets: list[HamiltonianTarget],
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    perturb_scale: float = 0.12,
+    entangler: str = "cz",
+    n_random_candidates: int = 100_000,
+    n_analytic_gates: int = 1024,
+    n_haar_gates: int = 1024,
+    top_k: int = 5,
+    seed: int = 0,
+    keep_fidelities: bool = False,
+) -> HamiltonianSuiteResult:
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    benchmarks = [
+        run_hamiltonian_two_entangler_benchmark(
+            target,
+            clifford_gates=clifford_gates,
+            clifford_labels=clifford_labels,
+            generated_gates=generated_gates,
+            generated_labels=generated_labels,
+            perturb_scale=perturb_scale,
+            entangler=entangler,
+            n_random_candidates=n_random_candidates,
+            n_analytic_gates=n_analytic_gates,
+            n_haar_gates=n_haar_gates,
+            top_k=top_k,
+            seed=seed + i,
+            keep_fidelities=keep_fidelities,
+        )
+        for i, target in enumerate(targets)
+    ]
+    return HamiltonianSuiteResult(benchmarks=benchmarks)
+
+
 def _best(report: SynthesisReport) -> float:
     if not report.candidates:
         raise ValueError("report has no candidates")
@@ -270,6 +349,34 @@ def summarize_hamiltonian_two_entangler_benchmark(
             )
         )
     return rows
+
+
+def _aggregate_reports(mode: str, reports: list[SynthesisReport]) -> HiddenShallowCircuitAggregate:
+    if not reports:
+        raise ValueError("reports must contain at least one report")
+    values = torch.tensor([_best(report) for report in reports], dtype=torch.float32)
+    return HiddenShallowCircuitAggregate(
+        mode=mode,
+        n_targets=len(reports),
+        mean_best=float(values.mean().item()),
+        median_best=float(values.median().item()),
+        min_best=float(values.min().item()),
+        max_best=float(values.max().item()),
+        success_95=float((values >= 0.95).float().mean().item()),
+        success_98=float((values >= 0.98).float().mean().item()),
+        success_99=float((values >= 0.99).float().mean().item()),
+    )
+
+
+def summarize_hamiltonian_suite(result: HamiltonianSuiteResult) -> list[HiddenShallowCircuitAggregate]:
+    if not result.benchmarks:
+        raise ValueError("result must contain at least one benchmark")
+    return [
+        _aggregate_reports("Clifford random", [item.clifford_report for item in result.benchmarks]),
+        _aggregate_reports("analytic near-Clifford", [item.analytic_report for item in result.benchmarks]),
+        _aggregate_reports("generated random", [item.generated_report for item in result.benchmarks]),
+        _aggregate_reports("Haar random", [item.haar_report for item in result.benchmarks]),
+    ]
 
 
 def print_hamiltonian_target(target: HamiltonianTarget) -> None:
@@ -307,6 +414,36 @@ def print_hamiltonian_two_entangler_summary(benchmark: HamiltonianSynthesisBench
         )
 
 
+def print_hamiltonian_suite(result: HamiltonianSuiteResult, max_rows: int | None = 6) -> None:
+    header = "target      Clifford analytic generated Haar"
+    print(header)
+    print("-" * len(header))
+    rows = result.benchmarks if max_rows is None else result.benchmarks[:max_rows]
+    for item in rows:
+        print(
+            f"{item.target.name:<11} "
+            f"{_best(item.clifford_report):>8.4f} "
+            f"{_best(item.analytic_report):>8.4f} "
+            f"{_best(item.generated_report):>9.4f} "
+            f"{_best(item.haar_report):>6.4f}"
+        )
+    if max_rows is not None and len(result.benchmarks) > max_rows:
+        print(f"... {len(result.benchmarks) - max_rows} more")
+
+
+def print_hamiltonian_suite_summary(result: HamiltonianSuiteResult) -> None:
+    header = "mode                   n   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for item in summarize_hamiltonian_suite(result):
+        print(
+            f"{item.mode:<22} {item.n_targets:<3} "
+            f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
+            f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
+            f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
 def plot_hamiltonian_two_entangler_benchmark(benchmark: HamiltonianSynthesisBenchmark) -> None:
     values = [
         [_best(benchmark.clifford_report)],
@@ -319,5 +456,23 @@ def plot_hamiltonian_two_entangler_benchmark(benchmark: HamiltonianSynthesisBenc
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title(f"Hamiltonian target synthesis: {benchmark.target.name}")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_suite(result: HamiltonianSuiteResult) -> None:
+    if not result.benchmarks:
+        raise ValueError("result must contain at least one benchmark")
+    values = [
+        [_best(item.clifford_report) for item in result.benchmarks],
+        [_best(item.analytic_report) for item in result.benchmarks],
+        [_best(item.generated_report) for item in result.benchmarks],
+        [_best(item.haar_report) for item in result.benchmarks],
+    ]
+    labels = ["Clifford", "analytic", "generated", "Haar"]
+    plt.figure(figsize=(8, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Hamiltonian target synthesis suite")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()

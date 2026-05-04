@@ -4,12 +4,17 @@ from su2diffusion.data import center_names_for_config, centers_for_config, DataC
 from su2diffusion.hamiltonian import (
     hamiltonian_from_terms,
     make_hamiltonian_target,
+    make_random_pauli_hamiltonian_targets,
     parse_pauli_string,
     pauli_string_matrix,
     print_hamiltonian_target,
+    print_hamiltonian_suite,
+    print_hamiltonian_suite_summary,
     print_hamiltonian_two_entangler_benchmark,
     print_hamiltonian_two_entangler_summary,
+    run_hamiltonian_suite_benchmark,
     run_hamiltonian_two_entangler_benchmark,
+    summarize_hamiltonian_suite,
     unitary_from_hamiltonian,
 )
 
@@ -84,3 +89,39 @@ def test_hamiltonian_target_and_benchmark_smoke(capsys):
     assert "smoke-hamiltonian" in captured
     assert "generated random" in captured
     assert benchmark.generated_report.candidates[0].fidelity >= 0.0
+
+
+def test_random_hamiltonian_suite_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=3,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.2,
+        time=0.5,
+        seed=4,
+    )
+
+    result = run_hamiltonian_suite_benchmark(
+        targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        keep_fidelities=False,
+        seed=5,
+    )
+    rows = summarize_hamiltonian_suite(result)
+    print_hamiltonian_suite(result)
+    print_hamiltonian_suite_summary(result)
+
+    captured = capsys.readouterr().out
+    assert "target" in captured
+    assert len(result.benchmarks) == 3
+    assert [row.n_targets for row in rows] == [3, 3, 3, 3]
+    assert all(0.0 <= row.mean_best <= 1.0 for row in rows)
