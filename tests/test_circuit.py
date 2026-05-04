@@ -12,6 +12,7 @@ from su2diffusion.circuit import (
     print_joint_circuit_comparison_summary,
     print_solution_stack_circuit_comparison_summary,
     print_solution_stack_dataset_summary,
+    print_skeleton_local_refinement_summary,
     print_target_conditioned_circuit_comparison_summary,
     print_target_conditioned_learning_curve,
     print_target_conditioned_overfit_summary,
@@ -19,6 +20,7 @@ from su2diffusion.circuit import (
     run_circuit_experiment,
     run_joint_circuit_proposal_benchmark,
     run_solution_stack_circuit_experiment,
+    run_skeleton_local_refinement_benchmark,
     run_target_conditioned_circuit_proposal_benchmark,
     run_target_conditioned_learning_curve,
     run_target_conditioned_overfit_diagnostic,
@@ -29,6 +31,7 @@ from su2diffusion.circuit import (
     sample_near_clifford_circuit_stacks,
     sample_target_conditioned_circuit_reverse,
     sample_target_label_conditioned_circuit_reverse,
+    sample_target_label_conditioned_circuit_reverse_from_skeleton,
     synthesize_unitary_from_circuit_stack_report,
     target_unitary_features,
     train_circuit_heat_kernel_model_on_stacks,
@@ -155,6 +158,30 @@ def test_target_label_conditioned_reverse_sampler_returns_normalized_stacks():
         slot_labels=labels,
         n_samples_per_target=3,
         eta=0.0,
+        device="cpu",
+    )
+
+    assert q_stack.shape == (2, 3, 6, 4)
+    assert torch.isfinite(q_stack).all()
+    assert torch.allclose(q_stack.norm(dim=-1), torch.ones(2, 3, 6), atol=1e-5)
+
+
+def test_target_label_conditioned_skeleton_sampler_returns_normalized_stacks():
+    schedule = DiffusionSchedule(T=4)
+    model = TargetLabelConditionedCircuitDenoiser(T=schedule.T, hidden=16, num_labels=24)
+    targets = torch.stack([torch.eye(4, dtype=torch.complex64), two_qubit_gate("cz", device="cpu")])
+    labels = torch.randint(0, 24, (2, 6))
+    centers = centers_for_config(DataConfig(kind="clifford"), device="cpu")
+
+    q_stack = sample_target_label_conditioned_circuit_reverse_from_skeleton(
+        model,
+        schedule,
+        target_unitaries=targets,
+        slot_labels=labels,
+        centers=centers,
+        n_samples_per_target=3,
+        eta=0.0,
+        init_noise_scale=0.01,
         device="cpu",
     )
 
@@ -613,6 +640,70 @@ def test_target_label_conditioned_skeleton_benchmark_smoke(capsys):
     captured = capsys.readouterr().out
     assert "target+labels diffusion" in captured
     assert label_result.generated_stochastic_by_target.shape == (1, 4, 6, 4)
+
+
+def test_skeleton_local_refinement_benchmark_smoke(capsys):
+    data_config = DataConfig(kind="clifford", sigma_data=0.08, label_strategy="balanced")
+    centers = centers_for_config(data_config, device="cpu")
+    names = center_names_for_config(data_config)
+    near_benchmarks = run_near_clifford_two_entangler_benchmark(
+        clifford_gates=centers,
+        clifford_labels=names,
+        generated_gates=centers,
+        generated_labels=names,
+        n_targets=1,
+        perturb_scale=0.05,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        seed=9,
+        keep_fidelities=False,
+    )
+    config = CircuitExperimentConfig(
+        name="tiny-skeleton-local",
+        schedule=DiffusionSchedule(T=4),
+        train=CircuitTrainConfig(batch_size=4, num_steps=1, hidden=16, n_terms=4),
+        sample_count=4,
+    )
+    target_only = run_target_conditioned_synthetic_circuit_experiment(
+        torch.stack([item.target.unitary for item in near_benchmarks]),
+        config,
+        device="cpu",
+        show_progress=False,
+    )
+    target_reports = run_target_conditioned_circuit_proposal_benchmark(
+        near_benchmarks,
+        target_only.generated_stochastic_by_target,
+        top_k=1,
+        keep_fidelities=False,
+    )
+    random_reports = run_joint_circuit_proposal_benchmark(
+        near_benchmarks,
+        q_normalized_random_stacks(8),
+        top_k=1,
+        keep_fidelities=False,
+    )
+    result = run_skeleton_local_refinement_benchmark(
+        near_benchmarks,
+        config,
+        device="cpu",
+        show_progress=False,
+        top_k=1,
+        init_noise_scale=0.01,
+    )
+    print_skeleton_local_refinement_summary(
+        near_benchmarks,
+        random_reports,
+        target_reports,
+        result.global_reports,
+        result.local_reports,
+    )
+
+    captured = capsys.readouterr().out
+    assert "skeleton-local diffusion" in captured
+    assert result.generated_global_by_target.shape == (1, 4, 6, 4)
+    assert result.generated_local_by_target.shape == (1, 4, 6, 4)
 
 
 def q_normalized_random_stacks(n: int) -> torch.Tensor:
