@@ -140,3 +140,57 @@ class TargetConditionedCircuitDenoiser(nn.Module):
             dim=-1,
         )
         return self.net(x).reshape(q_stack.shape[0], self.n_slots, 3)
+
+
+class TargetLabelConditionedCircuitDenoiser(nn.Module):
+    def __init__(
+        self,
+        T: int = 200,
+        n_slots: int = 6,
+        target_dim: int = 32,
+        num_labels: int = 24,
+        label_dim: int = 16,
+        time_dim: int = 64,
+        hidden: int = 512,
+    ):
+        super().__init__()
+        self.T = T
+        self.n_slots = n_slots
+        self.target_dim = target_dim
+        self.num_labels = num_labels
+        self.label_dim = label_dim
+        self.time_dim = time_dim
+        self.label_embedding = nn.Embedding(num_labels, label_dim)
+
+        self.net = nn.Sequential(
+            nn.Linear(n_slots * 4 + target_dim + n_slots * label_dim + time_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, n_slots * 3),
+        )
+
+    def forward(
+        self,
+        q_stack: torch.Tensor,
+        t_idx: torch.Tensor,
+        target_features: torch.Tensor,
+        slot_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        if q_stack.ndim != 3 or q_stack.shape[1:] != (self.n_slots, 4):
+            raise ValueError(f"Expected q_stack with shape (batch, {self.n_slots}, 4)")
+        if target_features.ndim != 2 or target_features.shape != (q_stack.shape[0], self.target_dim):
+            raise ValueError(f"Expected target_features with shape (batch, {self.target_dim})")
+        if slot_labels.ndim != 2 or slot_labels.shape != (q_stack.shape[0], self.n_slots):
+            raise ValueError(f"Expected slot_labels with shape (batch, {self.n_slots})")
+
+        t_scaled = t_idx.float() / self.T
+        temb = timestep_embedding(t_scaled, self.time_dim)
+        labels = self.label_embedding(slot_labels).reshape(q_stack.shape[0], self.n_slots * self.label_dim)
+        x = torch.cat(
+            [q_stack.reshape(q_stack.shape[0], self.n_slots * 4), target_features, labels, temb],
+            dim=-1,
+        )
+        return self.net(x).reshape(q_stack.shape[0], self.n_slots, 3)
