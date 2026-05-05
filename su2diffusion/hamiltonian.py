@@ -7,7 +7,9 @@ import torch
 from .quaternion import sample_haar
 from .synthesis import (
     HiddenShallowCircuitAggregate,
+    RefinementResult,
     SynthesisReport,
+    refine_two_entangler_candidate,
     sample_near_clifford_gates,
     synthesize_unitary_two_entangler_random_report,
 )
@@ -40,6 +42,16 @@ class HamiltonianSynthesisBenchmark:
 @dataclass(frozen=True)
 class HamiltonianSuiteResult:
     benchmarks: list[HamiltonianSynthesisBenchmark]
+
+
+@dataclass(frozen=True)
+class HamiltonianSolutionDataset:
+    targets: list[HamiltonianTarget]
+    benchmarks: list[HamiltonianSynthesisBenchmark]
+    refinements: list[RefinementResult]
+    stacks: torch.Tensor
+    initial_fidelities: torch.Tensor
+    refined_fidelities: torch.Tensor
 
 
 def pauli_matrix(name: str, device: torch.device | str | None = None) -> torch.Tensor:
@@ -317,6 +329,80 @@ def run_hamiltonian_suite_benchmark(
     return HamiltonianSuiteResult(benchmarks=benchmarks)
 
 
+def generate_hamiltonian_solution_dataset(
+    targets: list[HamiltonianTarget],
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    perturb_scale: float = 0.12,
+    entangler: str = "cz",
+    n_random_candidates: int = 100_000,
+    n_analytic_gates: int = 1024,
+    n_haar_gates: int = 1024,
+    top_k: int = 5,
+    seed: int = 0,
+    refinement_steps: int = 200,
+    refinement_lr: float = 0.05,
+    fidelity_threshold: float = 0.0,
+) -> HamiltonianSolutionDataset:
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    if refinement_steps <= 0:
+        raise ValueError("refinement_steps must be positive")
+    if refinement_lr <= 0:
+        raise ValueError("refinement_lr must be positive")
+    if not (0.0 <= fidelity_threshold <= 1.0):
+        raise ValueError("fidelity_threshold must be between 0 and 1")
+
+    suite = run_hamiltonian_suite_benchmark(
+        targets,
+        clifford_gates=clifford_gates,
+        clifford_labels=clifford_labels,
+        generated_gates=generated_gates,
+        generated_labels=generated_labels,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        n_random_candidates=n_random_candidates,
+        n_analytic_gates=n_analytic_gates,
+        n_haar_gates=n_haar_gates,
+        top_k=top_k,
+        seed=seed,
+        keep_fidelities=False,
+    )
+
+    kept_targets = []
+    kept_benchmarks = []
+    refinements = []
+    for benchmark in suite.benchmarks:
+        candidate = benchmark.generated_report.candidates[0]
+        refinement = refine_two_entangler_candidate(
+            generated_gates,
+            candidate,
+            target_unitary=benchmark.target.unitary,
+            entangler=entangler,
+            num_steps=refinement_steps,
+            lr=refinement_lr,
+        )
+        if refinement.refined_fidelity >= fidelity_threshold:
+            kept_targets.append(benchmark.target)
+            kept_benchmarks.append(benchmark)
+            refinements.append(refinement)
+
+    if not refinements:
+        raise RuntimeError("No Hamiltonian solution stacks met the fidelity threshold")
+
+    device = generated_gates.device
+    return HamiltonianSolutionDataset(
+        targets=kept_targets,
+        benchmarks=kept_benchmarks,
+        refinements=refinements,
+        stacks=torch.stack([item.refined_gates for item in refinements]),
+        initial_fidelities=torch.tensor([item.initial_fidelity for item in refinements], dtype=torch.float32, device=device),
+        refined_fidelities=torch.tensor([item.refined_fidelity for item in refinements], dtype=torch.float32, device=device),
+    )
+
+
 def _best(report: SynthesisReport) -> float:
     if not report.candidates:
         raise ValueError("report has no candidates")
@@ -444,6 +530,39 @@ def print_hamiltonian_suite_summary(result: HamiltonianSuiteResult) -> None:
         )
 
 
+def print_hamiltonian_solution_dataset(dataset: HamiltonianSolutionDataset, max_rows: int | None = 6) -> None:
+    header = "target      before   after    gain"
+    print(header)
+    print("-" * len(header))
+    rows = list(zip(dataset.targets, dataset.refinements))
+    rows = rows if max_rows is None else rows[:max_rows]
+    for target, refinement in rows:
+        gain = refinement.refined_fidelity - refinement.initial_fidelity
+        print(
+            f"{target.name:<11} "
+            f"{refinement.initial_fidelity:>7.4f} "
+            f"{refinement.refined_fidelity:>8.4f} "
+            f"{gain:>+7.4f}"
+        )
+    if max_rows is not None and len(dataset.targets) > max_rows:
+        print(f"... {len(dataset.targets) - max_rows} more")
+
+
+def print_hamiltonian_solution_dataset_summary(dataset: HamiltonianSolutionDataset) -> None:
+    gains = dataset.refined_fidelities - dataset.initial_fidelities
+    header = "n   mean before   mean after   median gain   min after   >=0.99 after"
+    print(header)
+    print("-" * len(header))
+    print(
+        f"{len(dataset.targets):<3} "
+        f"{dataset.initial_fidelities.mean().item():>11.4f}   "
+        f"{dataset.refined_fidelities.mean().item():>10.4f}   "
+        f"{gains.median().item():>11.4f}   "
+        f"{dataset.refined_fidelities.min().item():>9.4f}   "
+        f"{(dataset.refined_fidelities >= 0.99).float().mean().item():>10.1%}"
+    )
+
+
 def plot_hamiltonian_two_entangler_benchmark(benchmark: HamiltonianSynthesisBenchmark) -> None:
     values = [
         [_best(benchmark.clifford_report)],
@@ -474,5 +593,18 @@ def plot_hamiltonian_suite(result: HamiltonianSuiteResult) -> None:
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Hamiltonian target synthesis suite")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_solution_dataset(dataset: HamiltonianSolutionDataset) -> None:
+    values = [
+        dataset.initial_fidelities.detach().cpu().tolist(),
+        dataset.refined_fidelities.detach().cpu().tolist(),
+    ]
+    plt.figure(figsize=(7, 4))
+    plt.boxplot(values, labels=["before refinement", "after refinement"], showmeans=True)
+    plt.ylabel("unitary fidelity")
+    plt.title("Hamiltonian solution-stack refinement dataset")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
