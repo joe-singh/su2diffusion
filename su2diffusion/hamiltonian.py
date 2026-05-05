@@ -3,15 +3,22 @@ import re
 
 import matplotlib.pyplot as plt
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from .quaternion import sample_haar
+from .quaternion import q_normalize, sample_haar
 from .synthesis import (
     HiddenShallowCircuitAggregate,
     RefinementResult,
+    SynthesisCandidate,
     SynthesisReport,
+    compose_two_entangler_local,
+    quaternion_to_unitary,
     refine_two_entangler_candidate,
     sample_near_clifford_gates,
     synthesize_unitary_two_entangler_random_report,
+    two_qubit_gate,
+    unitary_fidelity,
 )
 
 
@@ -52,6 +59,45 @@ class HamiltonianSolutionDataset:
     stacks: torch.Tensor
     initial_fidelities: torch.Tensor
     refined_fidelities: torch.Tensor
+
+
+@dataclass(frozen=True)
+class HamiltonianSupervisedTrainConfig:
+    hidden: int = 256
+    num_steps: int = 1000
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    seed: int = 0
+
+
+@dataclass
+class HamiltonianSupervisedResult:
+    model: torch.nn.Module
+    losses: list[float]
+    predicted_stacks: torch.Tensor
+    raw_fidelities: torch.Tensor
+    refined_results: list[RefinementResult] | None = None
+
+
+class HamiltonianStackPredictor(nn.Module):
+    def __init__(self, input_dim: int = 33, hidden: int = 256, n_slots: int = 6):
+        super().__init__()
+        self.input_dim = input_dim
+        self.n_slots = n_slots
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, n_slots * 4),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 2 or features.shape[1] != self.input_dim:
+            raise ValueError(f"Expected features with shape (batch, {self.input_dim})")
+        return q_normalize(self.net(features).reshape(features.shape[0], self.n_slots, 4))
 
 
 def pauli_matrix(name: str, device: torch.device | str | None = None) -> torch.Tensor:
@@ -198,6 +244,25 @@ def make_random_pauli_hamiltonian_targets(
             )
         )
     return targets
+
+
+def hamiltonian_target_features(targets: list[HamiltonianTarget]) -> torch.Tensor:
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    hamiltonians = torch.stack([target.hamiltonian for target in targets]).to(dtype=torch.complex64)
+    times = torch.tensor(
+        [target.time for target in targets],
+        dtype=torch.float32,
+        device=hamiltonians.device,
+    )[:, None]
+    return torch.cat(
+        [
+            hamiltonians.real.reshape(len(targets), -1),
+            hamiltonians.imag.reshape(len(targets), -1),
+            times,
+        ],
+        dim=-1,
+    )
 
 
 def run_hamiltonian_two_entangler_benchmark(
@@ -403,6 +468,171 @@ def generate_hamiltonian_solution_dataset(
     )
 
 
+def _stack_unitary(q_stack: torch.Tensor, entangler: str = "cz") -> torch.Tensor:
+    units = quaternion_to_unitary(q_stack)
+    entangler_unitary = two_qubit_gate(entangler, device=q_stack.device)
+    return compose_two_entangler_local(
+        units[0],
+        units[1],
+        entangler_unitary,
+        units[2],
+        units[3],
+        units[4],
+        units[5],
+    )
+
+
+def _stack_fidelity(q_stack: torch.Tensor, target: HamiltonianTarget, entangler: str = "cz") -> float:
+    return unitary_fidelity(_stack_unitary(q_stack, entangler=entangler), target.unitary)
+
+
+def _aligned_stack_mse(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    direct = (predicted - target).square().mean(dim=(-1, -2))
+    flipped = (predicted + target).square().mean(dim=(-1, -2))
+    return torch.minimum(direct, flipped).mean()
+
+
+def train_hamiltonian_stack_predictor(
+    dataset: HamiltonianSolutionDataset,
+    config: HamiltonianSupervisedTrainConfig | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> tuple[HamiltonianStackPredictor, list[float]]:
+    if not dataset.targets:
+        raise ValueError("dataset must contain at least one target")
+    config = config or HamiltonianSupervisedTrainConfig()
+    device = torch.device(device) if device is not None else dataset.stacks.device
+
+    torch.manual_seed(config.seed)
+    features = hamiltonian_target_features(dataset.targets).to(device=device)
+    stacks = dataset.stacks.to(device=device)
+    model = HamiltonianStackPredictor(
+        input_dim=features.shape[1],
+        hidden=config.hidden,
+        n_slots=stacks.shape[1],
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+
+    losses: list[float] = []
+    iterator = range(1, config.num_steps + 1)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(iterator, desc="Training Hamiltonian stack predictor", dynamic_ncols=True)
+
+    for _ in iterator:
+        predicted = model(features)
+        mse_loss = _aligned_stack_mse(predicted, stacks)
+        norm_loss = (predicted.norm(dim=-1) - 1.0).square().mean()
+        loss = mse_loss + 0.01 * norm_loss
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        loss_value = float(loss.item())
+        losses.append(loss_value)
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix({"loss": f"{loss_value:.5f}"})
+
+    return model, losses
+
+
+@torch.no_grad()
+def predict_hamiltonian_stacks(
+    model: HamiltonianStackPredictor,
+    targets: list[HamiltonianTarget],
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    device = torch.device(device) if device is not None else next(model.parameters()).device
+    features = hamiltonian_target_features(targets).to(device=device)
+    return model(features)
+
+
+def evaluate_hamiltonian_stack_predictor(
+    model: HamiltonianStackPredictor,
+    targets: list[HamiltonianTarget],
+    device: torch.device | str | None = None,
+    entangler: str = "cz",
+    refine: bool = False,
+    refinement_steps: int = 100,
+    refinement_lr: float = 0.05,
+) -> HamiltonianSupervisedResult:
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    device = torch.device(device) if device is not None else next(model.parameters()).device
+    predicted_stacks = predict_hamiltonian_stacks(model, targets, device=device)
+    raw_fidelities = torch.tensor(
+        [
+            _stack_fidelity(stack, target, entangler=entangler)
+            for stack, target in zip(predicted_stacks, targets)
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    refined_results = None
+    if refine:
+        refined_results = []
+        for stack, target, fidelity in zip(predicted_stacks, targets, raw_fidelities.tolist()):
+            candidate = SynthesisCandidate(
+                target=target.name,
+                template="hamiltonian-supervised-stack",
+                entangler=entangler,
+                fidelity=fidelity,
+                slot_indices=(0, 1, 2, 3, 4, 5),
+                slot_labels=("predicted",) * 6,
+            )
+            refined_results.append(
+                refine_two_entangler_candidate(
+                    stack,
+                    candidate,
+                    target_unitary=target.unitary,
+                    entangler=entangler,
+                    num_steps=refinement_steps,
+                    lr=refinement_lr,
+                )
+            )
+
+    return HamiltonianSupervisedResult(
+        model=model,
+        losses=[],
+        predicted_stacks=predicted_stacks.detach(),
+        raw_fidelities=raw_fidelities,
+        refined_results=refined_results,
+    )
+
+
+def run_hamiltonian_supervised_baseline(
+    train_dataset: HamiltonianSolutionDataset,
+    eval_targets: list[HamiltonianTarget] | None = None,
+    config: HamiltonianSupervisedTrainConfig | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    entangler: str = "cz",
+    refine: bool = True,
+    refinement_steps: int = 100,
+    refinement_lr: float = 0.05,
+) -> HamiltonianSupervisedResult:
+    model, losses = train_hamiltonian_stack_predictor(
+        train_dataset,
+        config=config,
+        device=device,
+        show_progress=show_progress,
+    )
+    result = evaluate_hamiltonian_stack_predictor(
+        model,
+        eval_targets or train_dataset.targets,
+        device=device,
+        entangler=entangler,
+        refine=refine,
+        refinement_steps=refinement_steps,
+        refinement_lr=refinement_lr,
+    )
+    result.losses.extend(losses)
+    return result
+
+
 def _best(report: SynthesisReport) -> float:
     if not report.candidates:
         raise ValueError("report has no candidates")
@@ -561,6 +791,60 @@ def print_hamiltonian_solution_dataset_summary(dataset: HamiltonianSolutionDatas
         f"{dataset.refined_fidelities.min().item():>9.4f}   "
         f"{(dataset.refined_fidelities >= 0.99).float().mean().item():>10.1%}"
     )
+
+
+def print_hamiltonian_supervised_summary(result: HamiltonianSupervisedResult) -> None:
+    raw = result.raw_fidelities
+    refined = None
+    if result.refined_results is not None:
+        refined = torch.tensor(
+            [item.refined_fidelity for item in result.refined_results],
+            dtype=torch.float32,
+            device=raw.device,
+        )
+
+    if refined is None:
+        header = "n   mean raw   median   min      max      >=0.95   >=0.99"
+        print(header)
+        print("-" * len(header))
+        print(
+            f"{raw.numel():<3} "
+            f"{raw.mean().item():>8.4f}   "
+            f"{raw.median().item():>6.4f}   "
+            f"{raw.min().item():>6.4f}   "
+            f"{raw.max().item():>6.4f}   "
+            f"{(raw >= 0.95).float().mean().item():>6.1%}   "
+            f"{(raw >= 0.99).float().mean().item():>6.1%}"
+        )
+        return
+
+    gain = refined - raw
+    header = "n   mean raw   mean refined   median gain   min refined   >=0.99 refined"
+    print(header)
+    print("-" * len(header))
+    print(
+        f"{raw.numel():<3} "
+        f"{raw.mean().item():>8.4f}   "
+        f"{refined.mean().item():>12.4f}   "
+        f"{gain.median().item():>11.4f}   "
+        f"{refined.min().item():>11.4f}   "
+        f"{(refined >= 0.99).float().mean().item():>14.1%}"
+    )
+
+
+def plot_hamiltonian_supervised_result(result: HamiltonianSupervisedResult) -> None:
+    values = [result.raw_fidelities.detach().cpu().tolist()]
+    labels = ["raw prediction"]
+    if result.refined_results is not None:
+        values.append([item.refined_fidelity for item in result.refined_results])
+        labels.append("after refinement")
+
+    plt.figure(figsize=(7, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("unitary fidelity")
+    plt.title("Hamiltonian supervised stack predictor")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
 
 
 def plot_hamiltonian_two_entangler_benchmark(benchmark: HamiltonianSynthesisBenchmark) -> None:
