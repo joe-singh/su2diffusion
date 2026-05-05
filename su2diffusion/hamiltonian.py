@@ -85,6 +85,21 @@ class HamiltonianSupervisedSplitResult:
     heldout: HamiltonianSupervisedResult
 
 
+@dataclass(frozen=True)
+class HamiltonianSeedAblationRow:
+    target: str
+    seed_type: str
+    initial_fidelity: float
+    refined_fidelity: float
+    steps_to_threshold: int
+
+
+@dataclass(frozen=True)
+class HamiltonianSeedAblationResult:
+    rows: list[HamiltonianSeedAblationRow]
+    threshold: float
+
+
 class HamiltonianStackPredictor(nn.Module):
     def __init__(self, input_dim: int = 33, hidden: int = 256, n_slots: int = 6):
         super().__init__()
@@ -492,6 +507,31 @@ def _stack_fidelity(q_stack: torch.Tensor, target: HamiltonianTarget, entangler:
     return unitary_fidelity(_stack_unitary(q_stack, entangler=entangler), target.unitary)
 
 
+def _candidate_from_stack(
+    target: HamiltonianTarget,
+    seed_type: str,
+    initial_fidelity: float,
+    entangler: str = "cz",
+) -> SynthesisCandidate:
+    return SynthesisCandidate(
+        target=target.name,
+        template=f"hamiltonian-{seed_type}-stack",
+        entangler=entangler,
+        fidelity=initial_fidelity,
+        slot_indices=(0, 1, 2, 3, 4, 5),
+        slot_labels=(seed_type,) * 6,
+    )
+
+
+def _steps_to_threshold(initial_fidelity: float, trace: tuple[float, ...], threshold: float) -> int:
+    if initial_fidelity >= threshold:
+        return 0
+    for i, value in enumerate(trace, start=1):
+        if value >= threshold:
+            return i
+    return -1
+
+
 def _aligned_stack_mse(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     direct = (predicted - target).square().mean(dim=(-1, -2))
     flipped = (predicted + target).square().mean(dim=(-1, -2))
@@ -581,14 +621,7 @@ def evaluate_hamiltonian_stack_predictor(
     if refine:
         refined_results = []
         for stack, target, fidelity in zip(predicted_stacks, targets, raw_fidelities.tolist()):
-            candidate = SynthesisCandidate(
-                target=target.name,
-                template="hamiltonian-supervised-stack",
-                entangler=entangler,
-                fidelity=fidelity,
-                slot_indices=(0, 1, 2, 3, 4, 5),
-                slot_labels=("predicted",) * 6,
-            )
+            candidate = _candidate_from_stack(target, "predicted", fidelity, entangler=entangler)
             refined_results.append(
                 refine_two_entangler_candidate(
                     stack,
@@ -679,6 +712,80 @@ def run_hamiltonian_supervised_split_baseline(
     )
     heldout_result.losses.extend(losses)
     return HamiltonianSupervisedSplitResult(train=train_result, heldout=heldout_result)
+
+
+def run_hamiltonian_seed_ablation(
+    targets: list[HamiltonianTarget],
+    predicted_stacks: torch.Tensor,
+    generated_suite: HamiltonianSuiteResult,
+    clifford_gates: torch.Tensor,
+    generated_gates: torch.Tensor,
+    entangler: str = "cz",
+    n_haar_seeds: int = 1,
+    refinement_steps: int = 100,
+    refinement_lr: float = 0.05,
+    threshold: float = 0.99,
+    seed: int = 0,
+) -> HamiltonianSeedAblationResult:
+    if not targets:
+        raise ValueError("targets must contain at least one target")
+    if len(targets) != len(generated_suite.benchmarks):
+        raise ValueError("targets and generated_suite must have the same length")
+    if predicted_stacks.shape != (len(targets), 6, 4):
+        raise ValueError("predicted_stacks must have shape (n_targets, 6, 4)")
+    if n_haar_seeds <= 0:
+        raise ValueError("n_haar_seeds must be positive")
+    if refinement_steps <= 0:
+        raise ValueError("refinement_steps must be positive")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("threshold must be between 0 and 1")
+
+    device = predicted_stacks.device
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    rows: list[HamiltonianSeedAblationRow] = []
+
+    def add_seed(target: HamiltonianTarget, seed_type: str, stack: torch.Tensor) -> None:
+        initial = _stack_fidelity(stack, target, entangler=entangler)
+        candidate = _candidate_from_stack(target, seed_type, initial, entangler=entangler)
+        refinement = refine_two_entangler_candidate(
+            stack,
+            candidate,
+            target_unitary=target.unitary,
+            entangler=entangler,
+            num_steps=refinement_steps,
+            lr=refinement_lr,
+        )
+        rows.append(
+            HamiltonianSeedAblationRow(
+                target=target.name,
+                seed_type=seed_type,
+                initial_fidelity=initial,
+                refined_fidelity=refinement.refined_fidelity,
+                steps_to_threshold=_steps_to_threshold(initial, refinement.fidelity_trace, threshold),
+            )
+        )
+
+    for i, (target, benchmark) in enumerate(zip(targets, generated_suite.benchmarks)):
+        add_seed(target, "mlp", predicted_stacks[i])
+        generated_candidate = benchmark.generated_report.candidates[0]
+        add_seed(target, "generated-search", generated_gates[list(generated_candidate.slot_indices)])
+        clifford_candidate = benchmark.clifford_report.candidates[0]
+        add_seed(target, "clifford-search", clifford_gates[list(clifford_candidate.slot_indices)])
+
+        best_haar_stack = None
+        best_haar_fidelity = -1.0
+        for _ in range(n_haar_seeds):
+            stack = sample_haar(6, device=device, generator=generator)
+            fidelity = _stack_fidelity(stack, target, entangler=entangler)
+            if fidelity > best_haar_fidelity:
+                best_haar_stack = stack
+                best_haar_fidelity = fidelity
+        if best_haar_stack is None:
+            raise RuntimeError("failed to sample Haar seed")
+        add_seed(target, "haar", best_haar_stack)
+
+    return HamiltonianSeedAblationResult(rows=rows, threshold=threshold)
 
 
 def _best(report: SynthesisReport) -> float:
@@ -924,6 +1031,49 @@ def print_hamiltonian_supervised_split_summary(result: HamiltonianSupervisedSpli
         )
 
 
+def _seed_ablation_groups(result: HamiltonianSeedAblationResult) -> dict[str, list[HamiltonianSeedAblationRow]]:
+    groups: dict[str, list[HamiltonianSeedAblationRow]] = {}
+    for row in result.rows:
+        groups.setdefault(row.seed_type, []).append(row)
+    return groups
+
+
+def print_hamiltonian_seed_ablation(result: HamiltonianSeedAblationResult, max_rows: int | None = 8) -> None:
+    header = "target      seed              before   after    steps"
+    print(header)
+    print("-" * len(header))
+    rows = result.rows if max_rows is None else result.rows[:max_rows]
+    for row in rows:
+        steps = str(row.steps_to_threshold) if row.steps_to_threshold >= 0 else "miss"
+        print(
+            f"{row.target:<11} {row.seed_type:<17} "
+            f"{row.initial_fidelity:>7.4f} "
+            f"{row.refined_fidelity:>8.4f} "
+            f"{steps:>8}"
+        )
+    if max_rows is not None and len(result.rows) > max_rows:
+        print(f"... {len(result.rows) - max_rows} more")
+
+
+def print_hamiltonian_seed_ablation_summary(result: HamiltonianSeedAblationResult) -> None:
+    header = "seed              n   mean before   mean after   >=threshold   median steps"
+    print(header)
+    print("-" * len(header))
+    for seed_type, rows in _seed_ablation_groups(result).items():
+        initial = torch.tensor([row.initial_fidelity for row in rows], dtype=torch.float32)
+        refined = torch.tensor([row.refined_fidelity for row in rows], dtype=torch.float32)
+        steps = torch.tensor([row.steps_to_threshold for row in rows if row.steps_to_threshold >= 0], dtype=torch.float32)
+        success = (refined >= result.threshold).float().mean().item()
+        median_steps = steps.median().item() if steps.numel() else float("nan")
+        print(
+            f"{seed_type:<17} {len(rows):<3} "
+            f"{initial.mean().item():>11.4f}   "
+            f"{refined.mean().item():>10.4f}   "
+            f"{success:>10.1%}   "
+            f"{median_steps:>12.1f}"
+        )
+
+
 def plot_hamiltonian_supervised_result(result: HamiltonianSupervisedResult) -> None:
     values = [result.raw_fidelities.detach().cpu().tolist()]
     labels = ["raw prediction"]
@@ -959,6 +1109,35 @@ def plot_hamiltonian_supervised_split_result(result: HamiltonianSupervisedSplitR
     plt.ylabel("unitary fidelity")
     plt.title("Hamiltonian supervised train vs heldout")
     plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_seed_ablation(result: HamiltonianSeedAblationResult) -> None:
+    groups = _seed_ablation_groups(result)
+    labels = list(groups)
+    before = [[row.initial_fidelity for row in groups[label]] for label in labels]
+    after = [[row.refined_fidelity for row in groups[label]] for label in labels]
+    step_values = []
+    for label in labels:
+        reached = [row.steps_to_threshold for row in groups[label] if row.steps_to_threshold >= 0]
+        step_values.append(reached if reached else [float("nan")])
+
+    plt.figure(figsize=(11, 4))
+    plt.subplot(1, 2, 1)
+    positions_before = [i * 3 + 1 for i in range(len(labels))]
+    positions_after = [i * 3 + 2 for i in range(len(labels))]
+    plt.boxplot(before, positions=positions_before, widths=0.7, showmeans=True)
+    plt.boxplot(after, positions=positions_after, widths=0.7, showmeans=True)
+    plt.xticks([(a + b) / 2 for a, b in zip(positions_before, positions_after)], labels, rotation=20)
+    plt.ylabel("unitary fidelity")
+    plt.title("Before vs after refinement")
+    plt.ylim(0.0, 1.02)
+
+    plt.subplot(1, 2, 2)
+    plt.boxplot(step_values, labels=labels, showmeans=True)
+    plt.ylabel(f"steps to F >= {result.threshold:g}")
+    plt.title("Refinement speed")
+    plt.xticks(rotation=20)
     plt.tight_layout()
 
 
