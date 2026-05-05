@@ -131,3 +131,10 @@ The solution dataset can keep multiple refined decompositions for the same
 Hamiltonian target. This is important because many different six-gate stacks can
 compile the same `U(t)`, and diffusion is better matched to that one-to-many
 conditional distribution than to an arbitrary single refined solution.
+
+The notebook also includes an overfit diagnostic for this conditioned diffusion
+path. It trains on the multi-solution Hamiltonian dataset and compares generated
+proposal fidelity on the training Hamiltonians versus fresh held-out
+Hamiltonians. If the training row is poor, the next fix is model/sampler
+mechanics; if only the held-out row is poor, the next fix is dataset scale and
+coverage.

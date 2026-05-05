@@ -5,6 +5,7 @@ from su2diffusion.data import center_names_for_config, centers_for_config, DataC
 from su2diffusion.diffusion import DiffusionSchedule
 from su2diffusion.hamiltonian import (
     HamiltonianConditionedDiffusionResult,
+    HamiltonianConditionedOverfitDiagnosticResult,
     HamiltonianStackPredictor,
     HamiltonianPriorTrainConfig,
     HamiltonianSupervisedTrainConfig,
@@ -19,6 +20,8 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_budget_refinement_summary,
     print_hamiltonian_conditioned_diffusion,
     print_hamiltonian_conditioned_diffusion_summary,
+    print_hamiltonian_conditioned_overfit_diagnostic,
+    print_hamiltonian_conditioned_overfit_summary,
     print_hamiltonian_mixture_refinement_summary,
     print_hamiltonian_prior_mixture_summary,
     print_hamiltonian_prior_search,
@@ -35,6 +38,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_two_entangler_benchmark,
     print_hamiltonian_two_entangler_summary,
     run_hamiltonian_conditioned_diffusion_benchmark,
+    run_hamiltonian_conditioned_overfit_diagnostic,
     refine_hamiltonian_prior_mixture,
     refine_hamiltonian_prior_mixture_budget_sweep,
     run_hamiltonian_prior_mixture_sweep,
@@ -46,6 +50,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_two_entangler_benchmark,
     sample_hamiltonian_conditioned_circuit_reverse,
     summarize_hamiltonian_conditioned_diffusion,
+    summarize_hamiltonian_conditioned_overfit_diagnostic,
     summarize_hamiltonian_suite,
     train_hamiltonian_conditioned_circuit_diffusion,
     train_hamiltonian_slot_prior,
@@ -314,6 +319,68 @@ def test_hamiltonian_conditioned_circuit_diffusion_smoke(capsys):
     print_hamiltonian_conditioned_diffusion_summary(baseline, result)
     captured = capsys.readouterr().out
     assert "conditioned" in captured
+
+
+def test_hamiltonian_conditioned_overfit_diagnostic_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=41,
+    )
+    heldout_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=42,
+    )
+    dataset = generate_hamiltonian_solution_dataset(
+        targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=43,
+        solutions_per_target=2,
+    )
+    config = CircuitExperimentConfig(
+        name="test-hamiltonian-overfit",
+        schedule=DiffusionSchedule(T=4, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=4, num_steps=2, hidden=16, n_terms=4),
+        sample_count=3,
+        eta=0.2,
+    )
+    result = run_hamiltonian_conditioned_overfit_diagnostic(
+        dataset,
+        heldout_targets=heldout_targets,
+        config=config,
+        device="cpu",
+        show_progress=False,
+        top_k=1,
+    )
+
+    assert isinstance(result, HamiltonianConditionedOverfitDiagnosticResult)
+    assert len(result.losses) == 2
+    assert len(result.train_targets) == 2
+    assert result.train_generated_by_target.shape == (2, 3, 6, 4)
+    assert result.heldout_generated_by_target.shape == (2, 3, 6, 4)
+    rows = summarize_hamiltonian_conditioned_overfit_diagnostic(result)
+    assert [row.mode for row in rows] == ["train targets", "heldout targets"]
+    print_hamiltonian_conditioned_overfit_diagnostic(result)
+    print_hamiltonian_conditioned_overfit_summary(result)
+    captured = capsys.readouterr().out
+    assert "heldout" in captured
 
 
 def test_hamiltonian_stack_predictor_shapes_and_smoke_training(capsys):

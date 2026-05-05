@@ -76,6 +76,20 @@ class HamiltonianConditionedDiffusionResult:
     reports: list[SynthesisReport]
 
 
+@dataclass
+class HamiltonianConditionedOverfitDiagnosticResult:
+    config: CircuitExperimentConfig
+    model: torch.nn.Module
+    losses: list[float]
+    train_dataset: HamiltonianSolutionDataset
+    train_targets: list[HamiltonianTarget]
+    heldout_targets: list[HamiltonianTarget]
+    train_generated_by_target: torch.Tensor
+    heldout_generated_by_target: torch.Tensor
+    train_reports: list[SynthesisReport]
+    heldout_reports: list[SynthesisReport]
+
+
 @dataclass(frozen=True)
 class HamiltonianSupervisedTrainConfig:
     hidden: int = 256
@@ -987,6 +1001,107 @@ def run_hamiltonian_conditioned_diffusion_benchmark(
     )
 
 
+def _unique_hamiltonian_targets(targets: list[HamiltonianTarget]) -> list[HamiltonianTarget]:
+    unique: dict[str, HamiltonianTarget] = {}
+    for target in targets:
+        unique.setdefault(target.name, target)
+    return list(unique.values())
+
+
+def _hamiltonian_conditioned_reports_from_batches(
+    generated_by_target: torch.Tensor,
+    targets: list[HamiltonianTarget],
+    prefix: str,
+    entangler: str,
+    top_k: int,
+) -> list[SynthesisReport]:
+    from .circuit import synthesize_unitary_from_circuit_stack_report
+
+    if generated_by_target.shape[0] != len(targets):
+        raise ValueError("generated_by_target must contain one batch per target")
+    return [
+        synthesize_unitary_from_circuit_stack_report(
+            stacks,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            top_k=top_k,
+            name=f"{prefix} {target.name} Hamiltonian-conditioned diffusion",
+            keep_fidelities=False,
+        )
+        for target, stacks in zip(targets, generated_by_target)
+    ]
+
+
+def run_hamiltonian_conditioned_overfit_diagnostic(
+    train_dataset: HamiltonianSolutionDataset,
+    heldout_targets: list[HamiltonianTarget],
+    config: CircuitExperimentConfig | str,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    entangler: str = "cz",
+    top_k: int = 5,
+) -> HamiltonianConditionedOverfitDiagnosticResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    if not heldout_targets:
+        raise ValueError("heldout_targets must contain at least one target")
+    device = torch.device(device) if device is not None else train_dataset.stacks.device
+    train_targets = _unique_hamiltonian_targets(train_dataset.targets)
+
+    model, losses = train_hamiltonian_conditioned_circuit_diffusion(
+        train_dataset,
+        train_config=config.train,
+        schedule=config.schedule,
+        device=device,
+        show_progress=show_progress,
+    )
+    train_generated = sample_hamiltonian_conditioned_circuit_reverse(
+        model,
+        config.schedule,
+        train_targets,
+        n_samples_per_target=config.sample_count,
+        eta=config.eta,
+        device=device,
+    )
+    heldout_generated = sample_hamiltonian_conditioned_circuit_reverse(
+        model,
+        config.schedule,
+        heldout_targets,
+        n_samples_per_target=config.sample_count,
+        eta=config.eta,
+        device=device,
+    )
+    train_reports = _hamiltonian_conditioned_reports_from_batches(
+        train_generated,
+        train_targets,
+        prefix="train",
+        entangler=entangler,
+        top_k=top_k,
+    )
+    heldout_reports = _hamiltonian_conditioned_reports_from_batches(
+        heldout_generated,
+        heldout_targets,
+        prefix="heldout",
+        entangler=entangler,
+        top_k=top_k,
+    )
+    return HamiltonianConditionedOverfitDiagnosticResult(
+        config=config,
+        model=model,
+        losses=losses,
+        train_dataset=train_dataset,
+        train_targets=train_targets,
+        heldout_targets=heldout_targets,
+        train_generated_by_target=train_generated,
+        heldout_generated_by_target=heldout_generated,
+        train_reports=train_reports,
+        heldout_reports=heldout_reports,
+    )
+
+
 def _slot_label_targets(
     dataset: HamiltonianSolutionDataset,
     label_names: tuple[str, ...] | list[str],
@@ -1488,6 +1603,15 @@ def summarize_hamiltonian_conditioned_diffusion(
     ]
 
 
+def summarize_hamiltonian_conditioned_overfit_diagnostic(
+    result: HamiltonianConditionedOverfitDiagnosticResult,
+) -> list[HiddenShallowCircuitAggregate]:
+    return [
+        _aggregate_reports("train targets", result.train_reports),
+        _aggregate_reports("heldout targets", result.heldout_reports),
+    ]
+
+
 def summarize_hamiltonian_prior_search(result: HamiltonianPriorSearchResult) -> list[HiddenShallowCircuitAggregate]:
     if not result.benchmarks:
         raise ValueError("result must contain at least one benchmark")
@@ -1613,6 +1737,40 @@ def print_hamiltonian_conditioned_diffusion_summary(
     for item in summarize_hamiltonian_conditioned_diffusion(baseline, conditioned):
         print(
             f"{item.mode:<33} {item.n_targets:<3} "
+            f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
+            f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
+            f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
+def print_hamiltonian_conditioned_overfit_diagnostic(
+    result: HamiltonianConditionedOverfitDiagnosticResult,
+    max_rows: int | None = 6,
+) -> None:
+    header = "split    target      conditioned"
+    print(header)
+    print("-" * len(header))
+    rows = [
+        *[("train", target, report) for target, report in zip(result.train_targets, result.train_reports)],
+        *[("heldout", target, report) for target, report in zip(result.heldout_targets, result.heldout_reports)],
+    ]
+    rows = rows if max_rows is None else rows[:max_rows]
+    for split, target, report in rows:
+        print(f"{split:<8} {target.name:<11} {_best(report):>11.4f}")
+    total_rows = len(result.train_reports) + len(result.heldout_reports)
+    if max_rows is not None and total_rows > max_rows:
+        print(f"... {total_rows - max_rows} more")
+
+
+def print_hamiltonian_conditioned_overfit_summary(
+    result: HamiltonianConditionedOverfitDiagnosticResult,
+) -> None:
+    header = "split            n   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for item in summarize_hamiltonian_conditioned_overfit_diagnostic(result):
+        print(
+            f"{item.mode:<15} {item.n_targets:<3} "
             f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
             f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
             f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
@@ -1998,6 +2156,21 @@ def plot_hamiltonian_conditioned_diffusion(
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Hamiltonian-conditioned SU(2)^6 diffusion proposals")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_conditioned_overfit_diagnostic(
+    result: HamiltonianConditionedOverfitDiagnosticResult,
+) -> None:
+    values = [
+        [_best(report) for report in result.train_reports],
+        [_best(report) for report in result.heldout_reports],
+    ]
+    plt.figure(figsize=(7, 4))
+    plt.boxplot(values, labels=["train targets", "heldout targets"], showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Hamiltonian-conditioned diffusion overfit diagnostic")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 
