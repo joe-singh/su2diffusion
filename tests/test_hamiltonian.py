@@ -5,12 +5,15 @@ from su2diffusion.data import center_names_for_config, centers_for_config, DataC
 from su2diffusion.diffusion import DiffusionSchedule
 from su2diffusion.hamiltonian import (
     HamiltonianConditionedDiffusionResult,
+    HamiltonianDenoiseDiagnosticResult,
     HamiltonianConditionedOverfitDiagnosticResult,
     HamiltonianStackPredictor,
     HamiltonianPriorTrainConfig,
     HamiltonianSupervisedTrainConfig,
+    evaluate_hamiltonian_conditioned_denoising,
     evaluate_hamiltonian_stack_predictor,
     generate_hamiltonian_solution_dataset,
+    hamiltonian_denoise_diagnostic_from_model,
     hamiltonian_from_terms,
     hamiltonian_target_features,
     make_hamiltonian_target,
@@ -20,6 +23,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_budget_refinement_summary,
     print_hamiltonian_conditioned_diffusion,
     print_hamiltonian_conditioned_diffusion_summary,
+    print_hamiltonian_denoise_diagnostic,
     print_hamiltonian_conditioned_overfit_diagnostic,
     print_hamiltonian_conditioned_overfit_summary,
     print_hamiltonian_mixture_refinement_summary,
@@ -38,6 +42,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_two_entangler_benchmark,
     print_hamiltonian_two_entangler_summary,
     run_hamiltonian_conditioned_diffusion_benchmark,
+    run_hamiltonian_conditioned_denoise_diagnostic,
     run_hamiltonian_conditioned_overfit_diagnostic,
     refine_hamiltonian_prior_mixture,
     refine_hamiltonian_prior_mixture_budget_sweep,
@@ -49,6 +54,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_suite_benchmark,
     run_hamiltonian_two_entangler_benchmark,
     sample_hamiltonian_conditioned_circuit_reverse,
+    summarize_hamiltonian_denoise_diagnostic,
     summarize_hamiltonian_conditioned_diffusion,
     summarize_hamiltonian_conditioned_overfit_diagnostic,
     summarize_hamiltonian_suite,
@@ -381,6 +387,87 @@ def test_hamiltonian_conditioned_overfit_diagnostic_smoke(capsys):
     print_hamiltonian_conditioned_overfit_summary(result)
     captured = capsys.readouterr().out
     assert "heldout" in captured
+
+
+def test_hamiltonian_conditioned_denoise_diagnostic_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=51,
+    )
+    dataset = generate_hamiltonian_solution_dataset(
+        targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=52,
+        solutions_per_target=2,
+    )
+    config = CircuitExperimentConfig(
+        name="test-hamiltonian-denoise",
+        schedule=DiffusionSchedule(T=4, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=4, num_steps=2, hidden=16, n_terms=4),
+        sample_count=3,
+        eta=0.2,
+    )
+    result = run_hamiltonian_conditioned_denoise_diagnostic(
+        dataset,
+        config=config,
+        device="cpu",
+        show_progress=False,
+        timesteps=(1, 2, 4),
+        seed=53,
+    )
+    rows = summarize_hamiltonian_denoise_diagnostic(result)
+    direct_rows = evaluate_hamiltonian_conditioned_denoising(
+        result.model,
+        dataset,
+        config.schedule,
+        timesteps=(1,),
+        n_terms=4,
+        device="cpu",
+        seed=54,
+    )
+    reused = hamiltonian_denoise_diagnostic_from_model(
+        result.model,
+        dataset,
+        config=config,
+        losses=result.losses,
+        device="cpu",
+        timesteps=(1,),
+        seed=55,
+    )
+    print_hamiltonian_denoise_diagnostic(result)
+
+    captured = capsys.readouterr().out
+    assert isinstance(result, HamiltonianDenoiseDiagnosticResult)
+    assert "rel mse" in captured
+    assert len(result.losses) == 2
+    assert len(rows) == 3
+    assert len(direct_rows) == 1
+    assert len(reused.rows) == 1
+    assert reused.losses == result.losses
+    for row in [*rows, *direct_rows]:
+        assert 1 <= row.timestep <= config.schedule.T
+        assert row.mse >= 0.0
+        assert row.zero_mse >= 0.0
+        assert row.relative_mse >= 0.0
+        assert -1.0001 <= row.cosine <= 1.0001
+        assert row.target_norm >= 0.0
+        assert row.pred_norm >= 0.0
+        assert torch.isfinite(torch.tensor([row.mse, row.relative_mse, row.cosine])).all()
 
 
 def test_hamiltonian_stack_predictor_shapes_and_smoke_training(capsys):
