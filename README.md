@@ -114,3 +114,15 @@ the harder 15-term Pauli stress test showed poor distribution transfer. For now,
 uniform generated search plus local `SU(2)` refinement is the main synthesis
 baseline; learned priors should be revisited only with a more principled
 Hamiltonian family or a continuous circuit-diffusion objective.
+
+The first continuous Hamiltonian-conditioned circuit diffusion path is now
+available as a proposal-quality check. It trains on refined Hamiltonian solution
+stacks and samples directly from
+
+```text
+p(q1, ..., q6 | H, t) on SU(2)^6.
+```
+
+This is intentionally separate from the old discrete slot-label prior: the
+diffusion model predicts six tangent denoising directions and keeps every local
+gate on the `SU(2)` manifold during reverse sampling.

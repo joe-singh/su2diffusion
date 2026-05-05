@@ -6,7 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .quaternion import q_normalize, sample_haar
+from .circuit import CircuitExperimentConfig, CircuitTrainConfig, circuit_forward_heat_target
+from .diffusion import DiffusionSchedule
+from .model import TargetConditionedCircuitDenoiser
+from .quaternion import q_exp, q_mul, q_normalize, sample_haar
 from .synthesis import (
     HiddenShallowCircuitAggregate,
     RefinementResult,
@@ -60,6 +63,17 @@ class HamiltonianSolutionDataset:
     stacks: torch.Tensor
     initial_fidelities: torch.Tensor
     refined_fidelities: torch.Tensor
+
+
+@dataclass
+class HamiltonianConditionedDiffusionResult:
+    config: CircuitExperimentConfig
+    model: torch.nn.Module
+    losses: list[float]
+    train_dataset: HamiltonianSolutionDataset
+    eval_targets: list[HamiltonianTarget]
+    generated_by_target: torch.Tensor
+    reports: list[SynthesisReport]
 
 
 @dataclass(frozen=True)
@@ -800,6 +814,176 @@ def run_hamiltonian_supervised_split_baseline(
     return HamiltonianSupervisedSplitResult(train=train_result, heldout=heldout_result)
 
 
+def train_hamiltonian_conditioned_circuit_diffusion(
+    dataset: HamiltonianSolutionDataset,
+    train_config: CircuitTrainConfig | None = None,
+    schedule: DiffusionSchedule | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> tuple[TargetConditionedCircuitDenoiser, list[float]]:
+    if not dataset.targets:
+        raise ValueError("dataset must contain at least one Hamiltonian target")
+    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
+        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    if dataset.stacks.shape[0] != len(dataset.targets):
+        raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
+
+    train_config = train_config or CircuitTrainConfig()
+    schedule = schedule or DiffusionSchedule()
+    device = torch.device(device) if device is not None else dataset.stacks.device
+    stacks = q_normalize(dataset.stacks.to(device=device))
+    features = hamiltonian_target_features(dataset.targets).to(device=device)
+
+    torch.manual_seed(train_config.seed)
+    model = TargetConditionedCircuitDenoiser(
+        T=schedule.T,
+        target_dim=features.shape[1],
+        hidden=train_config.hidden,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+
+    losses: list[float] = []
+    iterator = range(1, train_config.num_steps + 1)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(iterator, desc="Training Hamiltonian-conditioned circuit diffusion", dynamic_ncols=True)
+
+    for _ in iterator:
+        rows = torch.randint(
+            low=0,
+            high=stacks.shape[0],
+            size=(train_config.batch_size,),
+            device=device,
+        )
+        q0_stack = stacks[rows]
+        batch_features = features[rows]
+        t_idx = torch.randint(1, schedule.T + 1, (train_config.batch_size,), device=device)
+
+        with torch.no_grad():
+            qt_stack, eps_target = circuit_forward_heat_target(
+                q0_stack,
+                t_idx,
+                schedule=schedule,
+                n_terms=train_config.n_terms,
+            )
+
+        eps_pred = model(qt_stack, t_idx, batch_features)
+        loss = F.mse_loss(eps_pred, eps_target)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        loss_value = float(loss.item())
+        losses.append(loss_value)
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix({"loss": f"{loss_value:.5f}"})
+
+    return model, losses
+
+
+@torch.no_grad()
+def sample_hamiltonian_conditioned_circuit_reverse(
+    model: TargetConditionedCircuitDenoiser,
+    schedule: DiffusionSchedule,
+    targets: list[HamiltonianTarget],
+    n_samples_per_target: int = 1000,
+    eta: float = 1.0,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    if n_samples_per_target <= 0:
+        raise ValueError("n_samples_per_target must be positive")
+
+    device = torch.device(device) if device is not None else next(model.parameters()).device
+    n_targets = len(targets)
+    n_slots = getattr(model, "n_slots", 6)
+    n_total = n_targets * n_samples_per_target
+    features = hamiltonian_target_features(targets).to(device=device)
+    if features.shape[1] != model.target_dim:
+        raise ValueError(f"Model expects {model.target_dim} Hamiltonian features, got {features.shape[1]}")
+    features = features[:, None, :].expand(n_targets, n_samples_per_target, features.shape[-1])
+    features = features.reshape(n_total, features.shape[-1])
+
+    betas, _, sigmas = schedule.tensors(device)
+    q_stack = sample_haar(n_total * n_slots, device=device).reshape(n_total, n_slots, 4)
+
+    for s in reversed(range(schedule.T)):
+        t_idx = torch.full((n_total,), s + 1, device=device, dtype=torch.long)
+        eps_pred = model(q_stack, t_idx, features)
+
+        beta = betas[s]
+        sigma = sigmas[s]
+        drift = -(beta / sigma.clamp_min(1e-8)) * eps_pred
+
+        if s > 0 and eta > 0:
+            noise = eta * torch.sqrt(beta) * torch.randn(n_total, n_slots, 3, device=device)
+        else:
+            noise = torch.zeros_like(drift)
+
+        q_stack = q_mul(q_stack, q_exp(drift + noise))
+        q_stack = q_normalize(q_stack)
+
+    return q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
+
+
+def run_hamiltonian_conditioned_diffusion_benchmark(
+    train_dataset: HamiltonianSolutionDataset,
+    eval_targets: list[HamiltonianTarget],
+    config: CircuitExperimentConfig | str,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    entangler: str = "cz",
+    top_k: int = 5,
+) -> HamiltonianConditionedDiffusionResult:
+    from .circuit import get_circuit_experiment_config, synthesize_unitary_from_circuit_stack_report
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    if not eval_targets:
+        raise ValueError("eval_targets must contain at least one Hamiltonian target")
+    device = torch.device(device) if device is not None else train_dataset.stacks.device
+
+    model, losses = train_hamiltonian_conditioned_circuit_diffusion(
+        train_dataset,
+        train_config=config.train,
+        schedule=config.schedule,
+        device=device,
+        show_progress=show_progress,
+    )
+    generated_by_target = sample_hamiltonian_conditioned_circuit_reverse(
+        model,
+        config.schedule,
+        eval_targets,
+        n_samples_per_target=config.sample_count,
+        eta=config.eta,
+        device=device,
+    )
+    reports = [
+        synthesize_unitary_from_circuit_stack_report(
+            stacks,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            top_k=top_k,
+            name=f"{target.name} Hamiltonian-conditioned diffusion",
+            keep_fidelities=False,
+        )
+        for target, stacks in zip(eval_targets, generated_by_target)
+    ]
+    return HamiltonianConditionedDiffusionResult(
+        config=config,
+        model=model,
+        losses=losses,
+        train_dataset=train_dataset,
+        eval_targets=eval_targets,
+        generated_by_target=generated_by_target,
+        reports=reports,
+    )
+
+
 def _slot_label_targets(
     dataset: HamiltonianSolutionDataset,
     label_names: tuple[str, ...] | list[str],
@@ -1289,6 +1473,18 @@ def summarize_hamiltonian_suite(result: HamiltonianSuiteResult) -> list[HiddenSh
     ]
 
 
+def summarize_hamiltonian_conditioned_diffusion(
+    baseline: HamiltonianSuiteResult,
+    conditioned: HamiltonianConditionedDiffusionResult,
+) -> list[HiddenShallowCircuitAggregate]:
+    if len(baseline.benchmarks) != len(conditioned.reports):
+        raise ValueError("baseline and conditioned result must cover the same number of targets")
+    return [
+        *summarize_hamiltonian_suite(baseline),
+        _aggregate_reports("Hamiltonian-conditioned diffusion", conditioned.reports),
+    ]
+
+
 def summarize_hamiltonian_prior_search(result: HamiltonianPriorSearchResult) -> list[HiddenShallowCircuitAggregate]:
     if not result.benchmarks:
         raise ValueError("result must contain at least one benchmark")
@@ -1382,6 +1578,38 @@ def print_hamiltonian_suite_summary(result: HamiltonianSuiteResult) -> None:
     for item in summarize_hamiltonian_suite(result):
         print(
             f"{item.mode:<22} {item.n_targets:<3} "
+            f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
+            f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
+            f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
+def print_hamiltonian_conditioned_diffusion(
+    result: HamiltonianConditionedDiffusionResult,
+    max_rows: int | None = 6,
+) -> None:
+    header = "target      conditioned   best labels"
+    print(header)
+    print("-" * len(header))
+    rows = list(zip(result.eval_targets, result.reports))
+    rows = rows if max_rows is None else rows[:max_rows]
+    for target, report in rows:
+        labels = ", ".join(label if label is not None else "?" for label in report.candidates[0].slot_labels)
+        print(f"{target.name:<11} {_best(report):>11.4f}   {labels}")
+    if max_rows is not None and len(result.reports) > max_rows:
+        print(f"... {len(result.reports) - max_rows} more")
+
+
+def print_hamiltonian_conditioned_diffusion_summary(
+    baseline: HamiltonianSuiteResult,
+    conditioned: HamiltonianConditionedDiffusionResult,
+) -> None:
+    header = "mode                              n   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for item in summarize_hamiltonian_conditioned_diffusion(baseline, conditioned):
+        print(
+            f"{item.mode:<33} {item.n_targets:<3} "
             f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
             f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
             f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
@@ -1741,6 +1969,30 @@ def plot_hamiltonian_suite(result: HamiltonianSuiteResult) -> None:
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Hamiltonian target synthesis suite")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_conditioned_diffusion(
+    baseline: HamiltonianSuiteResult,
+    conditioned: HamiltonianConditionedDiffusionResult,
+) -> None:
+    if not baseline.benchmarks:
+        raise ValueError("baseline must contain at least one benchmark")
+    if len(baseline.benchmarks) != len(conditioned.reports):
+        raise ValueError("baseline and conditioned result must cover the same number of targets")
+    values = [
+        [_best(item.clifford_report) for item in baseline.benchmarks],
+        [_best(item.analytic_report) for item in baseline.benchmarks],
+        [_best(item.generated_report) for item in baseline.benchmarks],
+        [_best(item.haar_report) for item in baseline.benchmarks],
+        [_best(report) for report in conditioned.reports],
+    ]
+    labels = ["Clifford", "analytic", "generated", "Haar", "H-cond diffusion"]
+    plt.figure(figsize=(10, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Hamiltonian-conditioned SU(2)^6 diffusion proposals")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 
