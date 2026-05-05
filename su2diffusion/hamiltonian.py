@@ -135,6 +135,21 @@ class HamiltonianPriorMixtureResult:
     alpha_results: dict[float, HamiltonianPriorSearchResult]
 
 
+@dataclass(frozen=True)
+class HamiltonianMixtureRefinementRow:
+    target: str
+    alpha: float
+    initial_fidelity: float
+    refined_fidelity: float
+    steps_to_threshold: int
+
+
+@dataclass(frozen=True)
+class HamiltonianMixtureRefinementResult:
+    rows: list[HamiltonianMixtureRefinementRow]
+    threshold: float
+
+
 class HamiltonianStackPredictor(nn.Module):
     def __init__(self, input_dim: int = 33, hidden: int = 256, n_slots: int = 6):
         super().__init__()
@@ -1039,6 +1054,53 @@ def run_hamiltonian_prior_mixture_sweep(
     return HamiltonianPriorMixtureResult(alpha_results=alpha_results)
 
 
+def refine_hamiltonian_prior_mixture(
+    result: HamiltonianPriorMixtureResult,
+    local_gates: torch.Tensor,
+    entangler: str = "cz",
+    refinement_steps: int = 100,
+    refinement_lr: float = 0.05,
+    threshold: float = 0.99,
+) -> HamiltonianMixtureRefinementResult:
+    if not result.alpha_results:
+        raise ValueError("result must contain at least one alpha")
+    if local_gates.shape[0] == 0:
+        raise ValueError("local_gates must contain at least one gate")
+    if refinement_steps <= 0:
+        raise ValueError("refinement_steps must be positive")
+    if refinement_lr <= 0:
+        raise ValueError("refinement_lr must be positive")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("threshold must be between 0 and 1")
+
+    rows = []
+    for alpha, alpha_result in result.alpha_results.items():
+        for benchmark in alpha_result.benchmarks:
+            candidate = benchmark.prior_report.candidates[0]
+            refinement = refine_two_entangler_candidate(
+                local_gates,
+                candidate,
+                target_unitary=benchmark.target.unitary,
+                entangler=entangler,
+                num_steps=refinement_steps,
+                lr=refinement_lr,
+            )
+            rows.append(
+                HamiltonianMixtureRefinementRow(
+                    target=benchmark.target.name,
+                    alpha=float(alpha),
+                    initial_fidelity=refinement.initial_fidelity,
+                    refined_fidelity=refinement.refined_fidelity,
+                    steps_to_threshold=_steps_to_threshold(
+                        refinement.initial_fidelity,
+                        refinement.fidelity_trace,
+                        threshold,
+                    ),
+                )
+            )
+    return HamiltonianMixtureRefinementResult(rows=rows, threshold=threshold)
+
+
 def run_hamiltonian_seed_ablation(
     targets: list[HamiltonianTarget],
     predicted_stacks: torch.Tensor,
@@ -1191,6 +1253,15 @@ def summarize_hamiltonian_prior_mixture(result: HamiltonianPriorMixtureResult) -
     return rows
 
 
+def _mixture_refinement_groups(
+    result: HamiltonianMixtureRefinementResult,
+) -> dict[float, list[HamiltonianMixtureRefinementRow]]:
+    groups: dict[float, list[HamiltonianMixtureRefinementRow]] = {}
+    for row in result.rows:
+        groups.setdefault(row.alpha, []).append(row)
+    return groups
+
+
 def print_hamiltonian_target(target: HamiltonianTarget) -> None:
     print(f"target: {target.name}")
     print(f"time:   {target.time:g}")
@@ -1297,6 +1368,42 @@ def print_hamiltonian_prior_mixture_summary(result: HamiltonianPriorMixtureResul
             f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
             f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
             f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
+def print_hamiltonian_mixture_refinement(result: HamiltonianMixtureRefinementResult, max_rows: int | None = 8) -> None:
+    header = "target      alpha   before   after    steps"
+    print(header)
+    print("-" * len(header))
+    rows = result.rows if max_rows is None else result.rows[:max_rows]
+    for row in rows:
+        steps = str(row.steps_to_threshold) if row.steps_to_threshold >= 0 else "miss"
+        print(
+            f"{row.target:<11} {row.alpha:<7g} "
+            f"{row.initial_fidelity:>7.4f} "
+            f"{row.refined_fidelity:>8.4f} "
+            f"{steps:>8}"
+        )
+    if max_rows is not None and len(result.rows) > max_rows:
+        print(f"... {len(result.rows) - max_rows} more")
+
+
+def print_hamiltonian_mixture_refinement_summary(result: HamiltonianMixtureRefinementResult) -> None:
+    header = "alpha   n   mean before   mean after   >=threshold   median steps"
+    print(header)
+    print("-" * len(header))
+    for alpha, rows in _mixture_refinement_groups(result).items():
+        initial = torch.tensor([row.initial_fidelity for row in rows], dtype=torch.float32)
+        refined = torch.tensor([row.refined_fidelity for row in rows], dtype=torch.float32)
+        steps = torch.tensor([row.steps_to_threshold for row in rows if row.steps_to_threshold >= 0], dtype=torch.float32)
+        success = (refined >= result.threshold).float().mean().item()
+        median_steps = steps.median().item() if steps.numel() else float("nan")
+        print(
+            f"{alpha:<7g} {len(rows):<3} "
+            f"{initial.mean().item():>11.4f}   "
+            f"{refined.mean().item():>10.4f}   "
+            f"{success:>10.1%}   "
+            f"{median_steps:>12.1f}"
         )
 
 
@@ -1589,6 +1696,39 @@ def plot_hamiltonian_prior_mixture(result: HamiltonianPriorMixtureResult) -> Non
     plt.ylabel("best unitary fidelity")
     plt.title("Hamiltonian prior-mixture search")
     plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_mixture_refinement(result: HamiltonianMixtureRefinementResult) -> None:
+    groups = _mixture_refinement_groups(result)
+    alphas = list(groups)
+    before = [[row.initial_fidelity for row in groups[alpha]] for alpha in alphas]
+    after = [[row.refined_fidelity for row in groups[alpha]] for alpha in alphas]
+    step_values = []
+    for alpha in alphas:
+        reached = [row.steps_to_threshold for row in groups[alpha] if row.steps_to_threshold >= 0]
+        step_values.append(reached if reached else [float("nan")])
+
+    plt.figure(figsize=(11, 4))
+    plt.subplot(1, 2, 1)
+    positions_before = [i * 3 + 1 for i in range(len(alphas))]
+    positions_after = [i * 3 + 2 for i in range(len(alphas))]
+    plt.boxplot(before, positions=positions_before, widths=0.7, showmeans=True)
+    plt.boxplot(after, positions=positions_after, widths=0.7, showmeans=True)
+    plt.xticks(
+        [(a + b) / 2 for a, b in zip(positions_before, positions_after)],
+        [f"{alpha:g}" for alpha in alphas],
+    )
+    plt.xlabel("prior mixture alpha")
+    plt.ylabel("unitary fidelity")
+    plt.title("Before vs after refinement")
+    plt.ylim(0.0, 1.02)
+
+    plt.subplot(1, 2, 2)
+    plt.boxplot(step_values, labels=[f"{alpha:g}" for alpha in alphas], showmeans=True)
+    plt.xlabel("prior mixture alpha")
+    plt.ylabel(f"steps to F >= {result.threshold:g}")
+    plt.title("Refinement speed")
     plt.tight_layout()
 
 
