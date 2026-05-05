@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 
 import matplotlib.pyplot as plt
@@ -109,6 +109,25 @@ class HamiltonianDenoiseDiagnosticResult:
     losses: list[float]
     train_dataset: HamiltonianSolutionDataset
     rows: list[HamiltonianDenoiseDiagnosticRow]
+
+
+@dataclass(frozen=True)
+class HamiltonianDenoiseAblationRow:
+    name: str
+    num_steps: int
+    hidden: int
+    final_loss: float
+    t1_relative_mse: float
+    final_relative_mse: float
+    final_cosine: float
+    final_pred_target_norm_ratio: float
+
+
+@dataclass
+class HamiltonianDenoiseAblationResult:
+    train_dataset: HamiltonianSolutionDataset
+    diagnostics: list[HamiltonianDenoiseDiagnosticResult]
+    rows: list[HamiltonianDenoiseAblationRow]
 
 
 @dataclass(frozen=True)
@@ -1255,6 +1274,82 @@ def hamiltonian_denoise_diagnostic_from_model(
     )
 
 
+def _default_hamiltonian_denoise_ablation_configs(
+    base_config: CircuitExperimentConfig,
+) -> list[CircuitExperimentConfig]:
+    base_train = base_config.train
+    longer_steps = max(base_train.num_steps * 10, base_train.num_steps + 100)
+    wider_hidden = max(base_train.hidden * 4, base_train.hidden + 128)
+    variants = [
+        ("current", base_train),
+        ("longer", replace(base_train, num_steps=longer_steps)),
+        ("wider", replace(base_train, hidden=wider_hidden)),
+        ("wider-longer", replace(base_train, hidden=wider_hidden, num_steps=longer_steps)),
+    ]
+    return [
+        replace(
+            base_config,
+            name=f"{base_config.name}-{name}",
+            train=train_config,
+        )
+        for name, train_config in variants
+    ]
+
+
+def _hamiltonian_denoise_ablation_row(
+    result: HamiltonianDenoiseDiagnosticResult,
+) -> HamiltonianDenoiseAblationRow:
+    if not result.rows:
+        raise ValueError("diagnostic result must contain at least one denoising row")
+    first = min(result.rows, key=lambda row: row.timestep)
+    final = max(result.rows, key=lambda row: row.timestep)
+    final_loss = float(result.losses[-1]) if result.losses else float("nan")
+    return HamiltonianDenoiseAblationRow(
+        name=result.config.name,
+        num_steps=result.config.train.num_steps,
+        hidden=result.config.train.hidden,
+        final_loss=final_loss,
+        t1_relative_mse=first.relative_mse,
+        final_relative_mse=final.relative_mse,
+        final_cosine=final.cosine,
+        final_pred_target_norm_ratio=final.pred_norm / max(final.target_norm, 1e-12),
+    )
+
+
+def run_hamiltonian_denoise_ablation(
+    train_dataset: HamiltonianSolutionDataset,
+    base_config: CircuitExperimentConfig | str,
+    configs: list[CircuitExperimentConfig] | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    timesteps: tuple[int, ...] | None = None,
+    seed: int = 0,
+) -> HamiltonianDenoiseAblationResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(base_config, str):
+        base_config = get_circuit_experiment_config(base_config)
+    configs = configs or _default_hamiltonian_denoise_ablation_configs(base_config)
+    diagnostics = []
+    for index, config in enumerate(configs):
+        diagnostics.append(
+            run_hamiltonian_conditioned_denoise_diagnostic(
+                train_dataset,
+                config=config,
+                device=device,
+                show_progress=show_progress,
+                timesteps=timesteps,
+                seed=seed + index,
+            )
+        )
+    rows = [_hamiltonian_denoise_ablation_row(item) for item in diagnostics]
+    return HamiltonianDenoiseAblationResult(
+        train_dataset=train_dataset,
+        diagnostics=diagnostics,
+        rows=rows,
+    )
+
+
 def _slot_label_targets(
     dataset: HamiltonianSolutionDataset,
     label_names: tuple[str, ...] | list[str],
@@ -1771,6 +1866,12 @@ def summarize_hamiltonian_denoise_diagnostic(
     return result.rows
 
 
+def summarize_hamiltonian_denoise_ablation(
+    result: HamiltonianDenoiseAblationResult,
+) -> list[HamiltonianDenoiseAblationRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_prior_search(result: HamiltonianPriorSearchResult) -> list[HiddenShallowCircuitAggregate]:
     if not result.benchmarks:
         raise ValueError("result must contain at least one benchmark")
@@ -1950,6 +2051,26 @@ def print_hamiltonian_denoise_diagnostic(result: HamiltonianDenoiseDiagnosticRes
             f"{row.cosine:>8.4f} "
             f"{row.target_norm:>11.4f} "
             f"{row.pred_norm:>10.4f}"
+        )
+
+
+def print_hamiltonian_denoise_ablation(result: HamiltonianDenoiseAblationResult) -> None:
+    header = (
+        "config                         steps   hidden   final loss   "
+        "rel mse t=1   rel mse t=T   cosine t=T   pred/target"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in summarize_hamiltonian_denoise_ablation(result):
+        print(
+            f"{row.name:<30} "
+            f"{row.num_steps:>5}   "
+            f"{row.hidden:>6}   "
+            f"{row.final_loss:>10.6f}   "
+            f"{row.t1_relative_mse:>11.4f}   "
+            f"{row.final_relative_mse:>11.4f}   "
+            f"{row.final_cosine:>10.4f}   "
+            f"{row.final_pred_target_norm_ratio:>11.4f}"
         )
 
 
@@ -2371,6 +2492,38 @@ def plot_hamiltonian_denoise_diagnostic(result: HamiltonianDenoiseDiagnosticResu
     plt.ylabel("mean cosine")
     plt.title("Predicted tangent alignment")
     plt.ylim(-1.0, 1.0)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_denoise_ablation(result: HamiltonianDenoiseAblationResult) -> None:
+    rows = summarize_hamiltonian_denoise_ablation(result)
+    labels = [row.name.replace(result.diagnostics[0].config.name.rsplit("-", 1)[0] + "-", "") for row in rows]
+    rel_mse = [row.final_relative_mse for row in rows]
+    cosine = [row.final_cosine for row in rows]
+    ratio = [row.final_pred_target_norm_ratio for row in rows]
+
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 3, 1)
+    plt.bar(labels, rel_mse)
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    plt.ylabel("MSE / zero-predictor MSE")
+    plt.title("Final-step denoising")
+    plt.xticks(rotation=20, ha="right")
+
+    plt.subplot(1, 3, 2)
+    plt.bar(labels, cosine)
+    plt.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    plt.ylabel("mean cosine")
+    plt.title("Final-step alignment")
+    plt.ylim(-1.0, 1.0)
+    plt.xticks(rotation=20, ha="right")
+
+    plt.subplot(1, 3, 3)
+    plt.bar(labels, ratio)
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    plt.ylabel("pred norm / target norm")
+    plt.title("Output scale")
+    plt.xticks(rotation=20, ha="right")
     plt.tight_layout()
 
 

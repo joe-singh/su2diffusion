@@ -5,6 +5,7 @@ from su2diffusion.data import center_names_for_config, centers_for_config, DataC
 from su2diffusion.diffusion import DiffusionSchedule
 from su2diffusion.hamiltonian import (
     HamiltonianConditionedDiffusionResult,
+    HamiltonianDenoiseAblationResult,
     HamiltonianDenoiseDiagnosticResult,
     HamiltonianConditionedOverfitDiagnosticResult,
     HamiltonianStackPredictor,
@@ -23,6 +24,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_budget_refinement_summary,
     print_hamiltonian_conditioned_diffusion,
     print_hamiltonian_conditioned_diffusion_summary,
+    print_hamiltonian_denoise_ablation,
     print_hamiltonian_denoise_diagnostic,
     print_hamiltonian_conditioned_overfit_diagnostic,
     print_hamiltonian_conditioned_overfit_summary,
@@ -44,6 +46,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_conditioned_diffusion_benchmark,
     run_hamiltonian_conditioned_denoise_diagnostic,
     run_hamiltonian_conditioned_overfit_diagnostic,
+    run_hamiltonian_denoise_ablation,
     refine_hamiltonian_prior_mixture,
     refine_hamiltonian_prior_mixture_budget_sweep,
     run_hamiltonian_prior_mixture_sweep,
@@ -55,6 +58,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_two_entangler_benchmark,
     sample_hamiltonian_conditioned_circuit_reverse,
     summarize_hamiltonian_denoise_diagnostic,
+    summarize_hamiltonian_denoise_ablation,
     summarize_hamiltonian_conditioned_diffusion,
     summarize_hamiltonian_conditioned_overfit_diagnostic,
     summarize_hamiltonian_suite,
@@ -468,6 +472,77 @@ def test_hamiltonian_conditioned_denoise_diagnostic_smoke(capsys):
         assert row.target_norm >= 0.0
         assert row.pred_norm >= 0.0
         assert torch.isfinite(torch.tensor([row.mse, row.relative_mse, row.cosine])).all()
+
+
+def test_hamiltonian_denoise_ablation_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=56,
+    )
+    dataset = generate_hamiltonian_solution_dataset(
+        targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=57,
+        solutions_per_target=2,
+    )
+    base = CircuitExperimentConfig(
+        name="test-ablation",
+        schedule=DiffusionSchedule(T=4, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=4, num_steps=2, hidden=16, n_terms=4),
+        sample_count=3,
+        eta=0.2,
+    )
+    configs = [
+        base,
+        CircuitExperimentConfig(
+            name="test-ablation-wider",
+            schedule=base.schedule,
+            train=CircuitTrainConfig(batch_size=4, num_steps=2, hidden=24, n_terms=4),
+            sample_count=base.sample_count,
+            eta=base.eta,
+        ),
+    ]
+    result = run_hamiltonian_denoise_ablation(
+        dataset,
+        base_config=base,
+        configs=configs,
+        device="cpu",
+        show_progress=False,
+        timesteps=(1, 4),
+        seed=58,
+    )
+    rows = summarize_hamiltonian_denoise_ablation(result)
+    print_hamiltonian_denoise_ablation(result)
+
+    captured = capsys.readouterr().out
+    assert isinstance(result, HamiltonianDenoiseAblationResult)
+    assert "pred/target" in captured
+    assert len(result.diagnostics) == 2
+    assert len(rows) == 2
+    assert [row.name for row in rows] == ["test-ablation", "test-ablation-wider"]
+    for row in rows:
+        assert row.num_steps == 2
+        assert row.hidden in {16, 24}
+        assert row.final_loss >= 0.0
+        assert row.t1_relative_mse >= 0.0
+        assert row.final_relative_mse >= 0.0
+        assert -1.0001 <= row.final_cosine <= 1.0001
+        assert row.final_pred_target_norm_ratio >= 0.0
 
 
 def test_hamiltonian_stack_predictor_shapes_and_smoke_training(capsys):
