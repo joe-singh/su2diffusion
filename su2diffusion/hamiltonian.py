@@ -79,6 +79,12 @@ class HamiltonianSupervisedResult:
     refined_results: list[RefinementResult] | None = None
 
 
+@dataclass
+class HamiltonianSupervisedSplitResult:
+    train: HamiltonianSupervisedResult
+    heldout: HamiltonianSupervisedResult
+
+
 class HamiltonianStackPredictor(nn.Module):
     def __init__(self, input_dim: int = 33, hidden: int = 256, n_slots: int = 6):
         super().__init__()
@@ -633,6 +639,48 @@ def run_hamiltonian_supervised_baseline(
     return result
 
 
+def run_hamiltonian_supervised_split_baseline(
+    train_dataset: HamiltonianSolutionDataset,
+    heldout_targets: list[HamiltonianTarget],
+    config: HamiltonianSupervisedTrainConfig | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    entangler: str = "cz",
+    refine: bool = True,
+    refinement_steps: int = 100,
+    refinement_lr: float = 0.05,
+) -> HamiltonianSupervisedSplitResult:
+    if not heldout_targets:
+        raise ValueError("heldout_targets must contain at least one target")
+    model, losses = train_hamiltonian_stack_predictor(
+        train_dataset,
+        config=config,
+        device=device,
+        show_progress=show_progress,
+    )
+    train_result = evaluate_hamiltonian_stack_predictor(
+        model,
+        train_dataset.targets,
+        device=device,
+        entangler=entangler,
+        refine=refine,
+        refinement_steps=refinement_steps,
+        refinement_lr=refinement_lr,
+    )
+    train_result.losses.extend(losses)
+    heldout_result = evaluate_hamiltonian_stack_predictor(
+        model,
+        heldout_targets,
+        device=device,
+        entangler=entangler,
+        refine=refine,
+        refinement_steps=refinement_steps,
+        refinement_lr=refinement_lr,
+    )
+    heldout_result.losses.extend(losses)
+    return HamiltonianSupervisedSplitResult(train=train_result, heldout=heldout_result)
+
+
 def _best(report: SynthesisReport) -> float:
     if not report.candidates:
         raise ValueError("report has no candidates")
@@ -832,6 +880,50 @@ def print_hamiltonian_supervised_summary(result: HamiltonianSupervisedResult) ->
     )
 
 
+def _supervised_summary_values(result: HamiltonianSupervisedResult) -> tuple[float, float | None, float | None, float, float]:
+    raw = result.raw_fidelities
+    if result.refined_results is None:
+        return (
+            float(raw.mean().item()),
+            None,
+            None,
+            float(raw.min().item()),
+            float((raw >= 0.99).float().mean().item()),
+        )
+    refined = torch.tensor(
+        [item.refined_fidelity for item in result.refined_results],
+        dtype=torch.float32,
+        device=raw.device,
+    )
+    gain = refined - raw
+    return (
+        float(raw.mean().item()),
+        float(refined.mean().item()),
+        float(gain.median().item()),
+        float(refined.min().item()),
+        float((refined >= 0.99).float().mean().item()),
+    )
+
+
+def print_hamiltonian_supervised_split_summary(result: HamiltonianSupervisedSplitResult) -> None:
+    header = "split     n   mean raw   mean refined   median gain   min refined   >=0.99 refined"
+    print(header)
+    print("-" * len(header))
+    for split, item in [("train", result.train), ("heldout", result.heldout)]:
+        mean_raw, mean_refined, median_gain, min_refined, success_99 = _supervised_summary_values(item)
+        if mean_refined is None or median_gain is None:
+            mean_refined = mean_raw
+            median_gain = 0.0
+        print(
+            f"{split:<8} {item.raw_fidelities.numel():<3} "
+            f"{mean_raw:>8.4f}   "
+            f"{mean_refined:>12.4f}   "
+            f"{median_gain:>11.4f}   "
+            f"{min_refined:>11.4f}   "
+            f"{success_99:>14.1%}"
+        )
+
+
 def plot_hamiltonian_supervised_result(result: HamiltonianSupervisedResult) -> None:
     values = [result.raw_fidelities.detach().cpu().tolist()]
     labels = ["raw prediction"]
@@ -843,6 +935,29 @@ def plot_hamiltonian_supervised_result(result: HamiltonianSupervisedResult) -> N
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("unitary fidelity")
     plt.title("Hamiltonian supervised stack predictor")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_supervised_split_result(result: HamiltonianSupervisedSplitResult) -> None:
+    values = [
+        result.train.raw_fidelities.detach().cpu().tolist(),
+        result.heldout.raw_fidelities.detach().cpu().tolist(),
+    ]
+    labels = ["train raw", "heldout raw"]
+    if result.train.refined_results is not None and result.heldout.refined_results is not None:
+        values.extend(
+            [
+                [item.refined_fidelity for item in result.train.refined_results],
+                [item.refined_fidelity for item in result.heldout.refined_results],
+            ]
+        )
+        labels.extend(["train refined", "heldout refined"])
+
+    plt.figure(figsize=(9, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("unitary fidelity")
+    plt.title("Hamiltonian supervised train vs heldout")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 

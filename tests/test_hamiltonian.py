@@ -16,11 +16,13 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_solution_dataset,
     print_hamiltonian_solution_dataset_summary,
     print_hamiltonian_supervised_summary,
+    print_hamiltonian_supervised_split_summary,
     print_hamiltonian_suite,
     print_hamiltonian_suite_summary,
     print_hamiltonian_two_entangler_benchmark,
     print_hamiltonian_two_entangler_summary,
     run_hamiltonian_supervised_baseline,
+    run_hamiltonian_supervised_split_baseline,
     run_hamiltonian_suite_benchmark,
     run_hamiltonian_two_entangler_benchmark,
     summarize_hamiltonian_suite,
@@ -220,3 +222,52 @@ def test_hamiltonian_stack_predictor_shapes_and_smoke_training(capsys):
     assert result.predicted_stacks.shape == (2, 6, 4)
     assert evaluated.raw_fidelities.shape == (2,)
     assert torch.isfinite(result.raw_fidelities).all()
+
+
+def test_hamiltonian_supervised_split_baseline_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    train_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=11,
+    )
+    heldout_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=12,
+    )
+    train_dataset = generate_hamiltonian_solution_dataset(
+        train_targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=13,
+    )
+
+    result = run_hamiltonian_supervised_split_baseline(
+        train_dataset,
+        heldout_targets,
+        config=HamiltonianSupervisedTrainConfig(hidden=16, num_steps=2, lr=1e-3),
+        device="cpu",
+        show_progress=False,
+        refine=False,
+    )
+    print_hamiltonian_supervised_split_summary(result)
+
+    captured = capsys.readouterr().out
+    assert "heldout" in captured
+    assert result.train.raw_fidelities.shape == (2,)
+    assert result.heldout.raw_fidelities.shape == (2,)
