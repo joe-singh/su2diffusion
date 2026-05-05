@@ -143,3 +143,8 @@ A one-step denoising diagnostic now reuses the overfit model and measures
 whether it predicts the heat-kernel tangent targets on the training stacks. This
 separates basic denoiser fit from failures introduced by the full reverse
 sampling chain.
+
+The denoising scale ablation runs the same one-step check across current,
+longer, wider, and wider-longer Hamiltonian-conditioned denoisers. Its purpose is
+to decide whether the near-zero denoiser collapse responds to ordinary
+training/capacity before changing the model family.
