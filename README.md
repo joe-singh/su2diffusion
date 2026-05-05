@@ -138,3 +138,8 @@ proposal fidelity on the training Hamiltonians versus fresh held-out
 Hamiltonians. If the training row is poor, the next fix is model/sampler
 mechanics; if only the held-out row is poor, the next fix is dataset scale and
 coverage.
+
+A one-step denoising diagnostic now reuses the overfit model and measures
+whether it predicts the heat-kernel tangent targets on the training stacks. This
+separates basic denoiser fit from failures introduced by the full reverse
+sampling chain.

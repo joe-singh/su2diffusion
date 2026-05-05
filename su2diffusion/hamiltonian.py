@@ -91,6 +91,27 @@ class HamiltonianConditionedOverfitDiagnosticResult:
 
 
 @dataclass(frozen=True)
+class HamiltonianDenoiseDiagnosticRow:
+    timestep: int
+    sigma: float
+    mse: float
+    zero_mse: float
+    relative_mse: float
+    cosine: float
+    target_norm: float
+    pred_norm: float
+
+
+@dataclass
+class HamiltonianDenoiseDiagnosticResult:
+    config: CircuitExperimentConfig
+    model: torch.nn.Module
+    losses: list[float]
+    train_dataset: HamiltonianSolutionDataset
+    rows: list[HamiltonianDenoiseDiagnosticRow]
+
+
+@dataclass(frozen=True)
 class HamiltonianSupervisedTrainConfig:
     hidden: int = 256
     num_steps: int = 1000
@@ -1102,6 +1123,138 @@ def run_hamiltonian_conditioned_overfit_diagnostic(
     )
 
 
+def evaluate_hamiltonian_conditioned_denoising(
+    model: TargetConditionedCircuitDenoiser,
+    dataset: HamiltonianSolutionDataset,
+    schedule: DiffusionSchedule,
+    timesteps: tuple[int, ...] | None = None,
+    n_terms: int = 128,
+    device: torch.device | str | None = None,
+    seed: int = 0,
+) -> list[HamiltonianDenoiseDiagnosticRow]:
+    if not dataset.targets:
+        raise ValueError("dataset must contain at least one Hamiltonian target")
+    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
+        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    if dataset.stacks.shape[0] != len(dataset.targets):
+        raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
+
+    device = torch.device(device) if device is not None else next(model.parameters()).device
+    timesteps = timesteps or (1, max(1, schedule.T // 4), max(1, schedule.T // 2), schedule.T)
+    for timestep in timesteps:
+        if timestep < 1 or timestep > schedule.T:
+            raise ValueError(f"timestep {timestep} is outside [1, {schedule.T}]")
+
+    stacks = q_normalize(dataset.stacks.to(device=device))
+    features = hamiltonian_target_features(dataset.targets).to(device=device)
+    if features.shape[1] != model.target_dim:
+        raise ValueError(f"Model expects {model.target_dim} Hamiltonian features, got {features.shape[1]}")
+
+    _, _, sigmas = schedule.tensors(device)
+    rows = []
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        for timestep in timesteps:
+            t_idx = torch.full((stacks.shape[0],), timestep, device=device, dtype=torch.long)
+            qt_stack, eps_target = circuit_forward_heat_target(
+                stacks,
+                t_idx,
+                schedule=schedule,
+                n_terms=n_terms,
+            )
+            eps_pred = model(qt_stack, t_idx, features)
+
+            mse = F.mse_loss(eps_pred, eps_target).item()
+            zero_mse = eps_target.square().mean().item()
+            flat_pred = eps_pred.reshape(-1, 3)
+            flat_target = eps_target.reshape(-1, 3)
+            cosine = F.cosine_similarity(flat_pred, flat_target, dim=-1, eps=1e-8).mean().item()
+            target_norm = flat_target.norm(dim=-1).mean().item()
+            pred_norm = flat_pred.norm(dim=-1).mean().item()
+            rows.append(
+                HamiltonianDenoiseDiagnosticRow(
+                    timestep=int(timestep),
+                    sigma=float(sigmas[timestep - 1].item()),
+                    mse=float(mse),
+                    zero_mse=float(zero_mse),
+                    relative_mse=float(mse / max(zero_mse, 1e-12)),
+                    cosine=float(cosine),
+                    target_norm=float(target_norm),
+                    pred_norm=float(pred_norm),
+                )
+            )
+    return rows
+
+
+def run_hamiltonian_conditioned_denoise_diagnostic(
+    train_dataset: HamiltonianSolutionDataset,
+    config: CircuitExperimentConfig | str,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    timesteps: tuple[int, ...] | None = None,
+    seed: int = 0,
+) -> HamiltonianDenoiseDiagnosticResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    device = torch.device(device) if device is not None else train_dataset.stacks.device
+    model, losses = train_hamiltonian_conditioned_circuit_diffusion(
+        train_dataset,
+        train_config=config.train,
+        schedule=config.schedule,
+        device=device,
+        show_progress=show_progress,
+    )
+    rows = evaluate_hamiltonian_conditioned_denoising(
+        model,
+        train_dataset,
+        config.schedule,
+        timesteps=timesteps,
+        n_terms=config.train.n_terms,
+        device=device,
+        seed=seed,
+    )
+    return HamiltonianDenoiseDiagnosticResult(
+        config=config,
+        model=model,
+        losses=losses,
+        train_dataset=train_dataset,
+        rows=rows,
+    )
+
+
+def hamiltonian_denoise_diagnostic_from_model(
+    model: TargetConditionedCircuitDenoiser,
+    train_dataset: HamiltonianSolutionDataset,
+    config: CircuitExperimentConfig | str,
+    losses: list[float] | None = None,
+    device: torch.device | str | None = None,
+    timesteps: tuple[int, ...] | None = None,
+    seed: int = 0,
+) -> HamiltonianDenoiseDiagnosticResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    rows = evaluate_hamiltonian_conditioned_denoising(
+        model,
+        train_dataset,
+        config.schedule,
+        timesteps=timesteps,
+        n_terms=config.train.n_terms,
+        device=device,
+        seed=seed,
+    )
+    return HamiltonianDenoiseDiagnosticResult(
+        config=config,
+        model=model,
+        losses=list(losses or []),
+        train_dataset=train_dataset,
+        rows=rows,
+    )
+
+
 def _slot_label_targets(
     dataset: HamiltonianSolutionDataset,
     label_names: tuple[str, ...] | list[str],
@@ -1612,6 +1765,12 @@ def summarize_hamiltonian_conditioned_overfit_diagnostic(
     ]
 
 
+def summarize_hamiltonian_denoise_diagnostic(
+    result: HamiltonianDenoiseDiagnosticResult,
+) -> list[HamiltonianDenoiseDiagnosticRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_prior_search(result: HamiltonianPriorSearchResult) -> list[HiddenShallowCircuitAggregate]:
     if not result.benchmarks:
         raise ValueError("result must contain at least one benchmark")
@@ -1774,6 +1933,23 @@ def print_hamiltonian_conditioned_overfit_summary(
             f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
             f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
             f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
+def print_hamiltonian_denoise_diagnostic(result: HamiltonianDenoiseDiagnosticResult) -> None:
+    header = "timestep   sigma    mse      zero mse  rel mse   cosine   target norm   pred norm"
+    print(header)
+    print("-" * len(header))
+    for row in summarize_hamiltonian_denoise_diagnostic(result):
+        print(
+            f"{row.timestep:<9} "
+            f"{row.sigma:>7.4f} "
+            f"{row.mse:>8.4f} "
+            f"{row.zero_mse:>9.4f} "
+            f"{row.relative_mse:>8.4f} "
+            f"{row.cosine:>8.4f} "
+            f"{row.target_norm:>11.4f} "
+            f"{row.pred_norm:>10.4f}"
         )
 
 
@@ -2172,6 +2348,29 @@ def plot_hamiltonian_conditioned_overfit_diagnostic(
     plt.ylabel("best unitary fidelity")
     plt.title("Hamiltonian-conditioned diffusion overfit diagnostic")
     plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_denoise_diagnostic(result: HamiltonianDenoiseDiagnosticResult) -> None:
+    rows = summarize_hamiltonian_denoise_diagnostic(result)
+    timesteps = [row.timestep for row in rows]
+    rel_mse = [row.relative_mse for row in rows]
+    cosine = [row.cosine for row in rows]
+
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(timesteps, rel_mse, marker="o")
+    plt.xlabel("diffusion timestep")
+    plt.ylabel("MSE / zero-predictor MSE")
+    plt.title("Denoising target fit")
+    plt.ylim(bottom=0.0)
+
+    plt.subplot(1, 2, 2)
+    plt.plot(timesteps, cosine, marker="o")
+    plt.xlabel("diffusion timestep")
+    plt.ylabel("mean cosine")
+    plt.title("Predicted tangent alignment")
+    plt.ylim(-1.0, 1.0)
     plt.tight_layout()
 
 
