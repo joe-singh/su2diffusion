@@ -131,6 +131,23 @@ class HamiltonianDenoiseAblationResult:
 
 
 @dataclass(frozen=True)
+class HamiltonianDenoiseNormalizationRow:
+    variant: str
+    target_scale: float
+    final_loss: float
+    final_relative_mse: float
+    final_cosine: float
+    final_pred_target_norm_ratio: float
+
+
+@dataclass
+class HamiltonianDenoiseNormalizationResult:
+    train_dataset: HamiltonianSolutionDataset
+    diagnostics: list[HamiltonianDenoiseDiagnosticResult]
+    rows: list[HamiltonianDenoiseNormalizationRow]
+
+
+@dataclass(frozen=True)
 class HamiltonianSupervisedTrainConfig:
     hidden: int = 256
     num_steps: int = 1000
@@ -871,12 +888,68 @@ def run_hamiltonian_supervised_split_baseline(
     return HamiltonianSupervisedSplitResult(train=train_result, heldout=heldout_result)
 
 
+def _eps_output_scale(model: torch.nn.Module) -> float:
+    return float(getattr(model, "eps_output_scale", 1.0))
+
+
+def _predict_hamiltonian_eps(
+    model: TargetConditionedCircuitDenoiser,
+    q_stack: torch.Tensor,
+    t_idx: torch.Tensor,
+    features: torch.Tensor,
+) -> torch.Tensor:
+    return model(q_stack, t_idx, features) * _eps_output_scale(model)
+
+
+def estimate_hamiltonian_denoise_target_scale(
+    dataset: HamiltonianSolutionDataset,
+    schedule: DiffusionSchedule,
+    batch_size: int = 512,
+    n_batches: int = 8,
+    n_terms: int = 128,
+    device: torch.device | str | None = None,
+    seed: int = 0,
+) -> float:
+    if not dataset.targets:
+        raise ValueError("dataset must contain at least one Hamiltonian target")
+    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
+        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if n_batches <= 0:
+        raise ValueError("n_batches must be positive")
+
+    device = torch.device(device) if device is not None else dataset.stacks.device
+    stacks = q_normalize(dataset.stacks.to(device=device))
+    sq_means = []
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        for _ in range(n_batches):
+            rows = torch.randint(
+                low=0,
+                high=stacks.shape[0],
+                size=(batch_size,),
+                device=device,
+            )
+            t_idx = torch.randint(1, schedule.T + 1, (batch_size,), device=device)
+            _, eps_target = circuit_forward_heat_target(
+                stacks[rows],
+                t_idx,
+                schedule=schedule,
+                n_terms=n_terms,
+            )
+            sq_means.append(eps_target.square().mean())
+    scale = torch.stack(sq_means).mean().sqrt().item()
+    return float(max(scale, 1e-6))
+
+
 def train_hamiltonian_conditioned_circuit_diffusion(
     dataset: HamiltonianSolutionDataset,
     train_config: CircuitTrainConfig | None = None,
     schedule: DiffusionSchedule | None = None,
     device: torch.device | str | None = None,
     show_progress: bool = True,
+    target_scale: float = 1.0,
 ) -> tuple[TargetConditionedCircuitDenoiser, list[float]]:
     if not dataset.targets:
         raise ValueError("dataset must contain at least one Hamiltonian target")
@@ -887,6 +960,8 @@ def train_hamiltonian_conditioned_circuit_diffusion(
 
     train_config = train_config or CircuitTrainConfig()
     schedule = schedule or DiffusionSchedule()
+    if target_scale <= 0:
+        raise ValueError("target_scale must be positive")
     device = torch.device(device) if device is not None else dataset.stacks.device
     stacks = q_normalize(dataset.stacks.to(device=device))
     features = hamiltonian_target_features(dataset.targets).to(device=device)
@@ -897,6 +972,7 @@ def train_hamiltonian_conditioned_circuit_diffusion(
         target_dim=features.shape[1],
         hidden=train_config.hidden,
     ).to(device)
+    model.eps_output_scale = float(target_scale)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
 
     losses: list[float] = []
@@ -926,7 +1002,7 @@ def train_hamiltonian_conditioned_circuit_diffusion(
             )
 
         eps_pred = model(qt_stack, t_idx, batch_features)
-        loss = F.mse_loss(eps_pred, eps_target)
+        loss = F.mse_loss(eps_pred, eps_target / target_scale)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -969,7 +1045,7 @@ def sample_hamiltonian_conditioned_circuit_reverse(
 
     for s in reversed(range(schedule.T)):
         t_idx = torch.full((n_total,), s + 1, device=device, dtype=torch.long)
-        eps_pred = model(q_stack, t_idx, features)
+        eps_pred = _predict_hamiltonian_eps(model, q_stack, t_idx, features)
 
         beta = betas[s]
         sigma = sigmas[s]
@@ -1181,7 +1257,7 @@ def evaluate_hamiltonian_conditioned_denoising(
                 schedule=schedule,
                 n_terms=n_terms,
             )
-            eps_pred = model(qt_stack, t_idx, features)
+            eps_pred = _predict_hamiltonian_eps(model, qt_stack, t_idx, features)
 
             mse = F.mse_loss(eps_pred, eps_target).item()
             zero_mse = eps_target.square().mean().item()
@@ -1212,6 +1288,7 @@ def run_hamiltonian_conditioned_denoise_diagnostic(
     show_progress: bool = True,
     timesteps: tuple[int, ...] | None = None,
     seed: int = 0,
+    target_scale: float = 1.0,
 ) -> HamiltonianDenoiseDiagnosticResult:
     from .circuit import get_circuit_experiment_config
 
@@ -1224,6 +1301,7 @@ def run_hamiltonian_conditioned_denoise_diagnostic(
         schedule=config.schedule,
         device=device,
         show_progress=show_progress,
+        target_scale=target_scale,
     )
     rows = evaluate_hamiltonian_conditioned_denoising(
         model,
@@ -1313,6 +1391,79 @@ def _hamiltonian_denoise_ablation_row(
         final_relative_mse=final.relative_mse,
         final_cosine=final.cosine,
         final_pred_target_norm_ratio=final.pred_norm / max(final.target_norm, 1e-12),
+    )
+
+
+def _hamiltonian_denoise_normalization_row(
+    variant: str,
+    result: HamiltonianDenoiseDiagnosticResult,
+) -> HamiltonianDenoiseNormalizationRow:
+    if not result.rows:
+        raise ValueError("diagnostic result must contain at least one denoising row")
+    final = max(result.rows, key=lambda row: row.timestep)
+    final_loss = float(result.losses[-1]) if result.losses else float("nan")
+    return HamiltonianDenoiseNormalizationRow(
+        variant=variant,
+        target_scale=_eps_output_scale(result.model),
+        final_loss=final_loss,
+        final_relative_mse=final.relative_mse,
+        final_cosine=final.cosine,
+        final_pred_target_norm_ratio=final.pred_norm / max(final.target_norm, 1e-12),
+    )
+
+
+def run_hamiltonian_denoise_normalization_comparison(
+    train_dataset: HamiltonianSolutionDataset,
+    base_config: CircuitExperimentConfig | str,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    timesteps: tuple[int, ...] | None = None,
+    seed: int = 0,
+) -> HamiltonianDenoiseNormalizationResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(base_config, str):
+        base_config = get_circuit_experiment_config(base_config)
+    device = torch.device(device) if device is not None else train_dataset.stacks.device
+    target_scale = estimate_hamiltonian_denoise_target_scale(
+        train_dataset,
+        base_config.schedule,
+        batch_size=base_config.train.batch_size,
+        n_batches=8,
+        n_terms=base_config.train.n_terms,
+        device=device,
+        seed=seed,
+    )
+    wider_config = replace(
+        base_config,
+        name=f"{base_config.name}-normalized-wider",
+        train=replace(base_config.train, hidden=max(base_config.train.hidden * 4, base_config.train.hidden + 128)),
+    )
+    variants = [
+        ("unnormalized", base_config, 1.0),
+        ("normalized", replace(base_config, name=f"{base_config.name}-normalized"), target_scale),
+        ("normalized+wider", wider_config, target_scale),
+    ]
+
+    diagnostics = []
+    rows = []
+    for index, (variant, config, scale) in enumerate(variants):
+        result = run_hamiltonian_conditioned_denoise_diagnostic(
+            train_dataset,
+            config=config,
+            device=device,
+            show_progress=show_progress,
+            timesteps=timesteps,
+            seed=seed + index + 1,
+            target_scale=scale,
+        )
+        diagnostics.append(result)
+        rows.append(_hamiltonian_denoise_normalization_row(variant, result))
+
+    return HamiltonianDenoiseNormalizationResult(
+        train_dataset=train_dataset,
+        diagnostics=diagnostics,
+        rows=rows,
     )
 
 
@@ -1872,6 +2023,12 @@ def summarize_hamiltonian_denoise_ablation(
     return result.rows
 
 
+def summarize_hamiltonian_denoise_normalization(
+    result: HamiltonianDenoiseNormalizationResult,
+) -> list[HamiltonianDenoiseNormalizationRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_prior_search(result: HamiltonianPriorSearchResult) -> list[HiddenShallowCircuitAggregate]:
     if not result.benchmarks:
         raise ValueError("result must contain at least one benchmark")
@@ -2068,6 +2225,21 @@ def print_hamiltonian_denoise_ablation(result: HamiltonianDenoiseAblationResult)
             f"{row.hidden:>6}   "
             f"{row.final_loss:>10.6f}   "
             f"{row.t1_relative_mse:>11.4f}   "
+            f"{row.final_relative_mse:>11.4f}   "
+            f"{row.final_cosine:>10.4f}   "
+            f"{row.final_pred_target_norm_ratio:>11.4f}"
+        )
+
+
+def print_hamiltonian_denoise_normalization(result: HamiltonianDenoiseNormalizationResult) -> None:
+    header = "variant             target scale   final loss   rel mse t=T   cosine t=T   pred/target"
+    print(header)
+    print("-" * len(header))
+    for row in summarize_hamiltonian_denoise_normalization(result):
+        print(
+            f"{row.variant:<18} "
+            f"{row.target_scale:>12.4f}   "
+            f"{row.final_loss:>10.6f}   "
             f"{row.final_relative_mse:>11.4f}   "
             f"{row.final_cosine:>10.4f}   "
             f"{row.final_pred_target_norm_ratio:>11.4f}"
@@ -2515,6 +2687,38 @@ def plot_hamiltonian_denoise_ablation(result: HamiltonianDenoiseAblationResult) 
     plt.axhline(0.0, color="black", linestyle="--", linewidth=1)
     plt.ylabel("mean cosine")
     plt.title("Final-step alignment")
+    plt.ylim(-1.0, 1.0)
+    plt.xticks(rotation=20, ha="right")
+
+    plt.subplot(1, 3, 3)
+    plt.bar(labels, ratio)
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    plt.ylabel("pred norm / target norm")
+    plt.title("Output scale")
+    plt.xticks(rotation=20, ha="right")
+    plt.tight_layout()
+
+
+def plot_hamiltonian_denoise_normalization(result: HamiltonianDenoiseNormalizationResult) -> None:
+    rows = summarize_hamiltonian_denoise_normalization(result)
+    labels = [row.variant for row in rows]
+    rel_mse = [row.final_relative_mse for row in rows]
+    cosine = [row.final_cosine for row in rows]
+    ratio = [row.final_pred_target_norm_ratio for row in rows]
+
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 3, 1)
+    plt.bar(labels, rel_mse)
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    plt.ylabel("MSE / zero-predictor MSE")
+    plt.title("Normalized target fit")
+    plt.xticks(rotation=20, ha="right")
+
+    plt.subplot(1, 3, 2)
+    plt.bar(labels, cosine)
+    plt.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    plt.ylabel("mean cosine")
+    plt.title("Tangent alignment")
     plt.ylim(-1.0, 1.0)
     plt.xticks(rotation=20, ha="right")
 

@@ -148,3 +148,8 @@ The denoising scale ablation runs the same one-step check across current,
 longer, wider, and wider-longer Hamiltonian-conditioned denoisers. Its purpose is
 to decide whether the near-zero denoiser collapse responds to ordinary
 training/capacity before changing the model family.
+
+The target-normalization diagnostic trains the same conditioned denoiser on
+scaled tangent targets, then unscales predictions before reporting the standard
+one-step metrics. This tests whether output collapse is caused by the raw
+tangent-target scale or by a more structural modeling issue.

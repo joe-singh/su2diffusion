@@ -7,10 +7,12 @@ from su2diffusion.hamiltonian import (
     HamiltonianConditionedDiffusionResult,
     HamiltonianDenoiseAblationResult,
     HamiltonianDenoiseDiagnosticResult,
+    HamiltonianDenoiseNormalizationResult,
     HamiltonianConditionedOverfitDiagnosticResult,
     HamiltonianStackPredictor,
     HamiltonianPriorTrainConfig,
     HamiltonianSupervisedTrainConfig,
+    estimate_hamiltonian_denoise_target_scale,
     evaluate_hamiltonian_conditioned_denoising,
     evaluate_hamiltonian_stack_predictor,
     generate_hamiltonian_solution_dataset,
@@ -26,6 +28,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_conditioned_diffusion_summary,
     print_hamiltonian_denoise_ablation,
     print_hamiltonian_denoise_diagnostic,
+    print_hamiltonian_denoise_normalization,
     print_hamiltonian_conditioned_overfit_diagnostic,
     print_hamiltonian_conditioned_overfit_summary,
     print_hamiltonian_mixture_refinement_summary,
@@ -47,6 +50,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_conditioned_denoise_diagnostic,
     run_hamiltonian_conditioned_overfit_diagnostic,
     run_hamiltonian_denoise_ablation,
+    run_hamiltonian_denoise_normalization_comparison,
     refine_hamiltonian_prior_mixture,
     refine_hamiltonian_prior_mixture_budget_sweep,
     run_hamiltonian_prior_mixture_sweep,
@@ -59,6 +63,7 @@ from su2diffusion.hamiltonian import (
     sample_hamiltonian_conditioned_circuit_reverse,
     summarize_hamiltonian_denoise_diagnostic,
     summarize_hamiltonian_denoise_ablation,
+    summarize_hamiltonian_denoise_normalization,
     summarize_hamiltonian_conditioned_diffusion,
     summarize_hamiltonian_conditioned_overfit_diagnostic,
     summarize_hamiltonian_suite,
@@ -540,6 +545,75 @@ def test_hamiltonian_denoise_ablation_smoke(capsys):
         assert row.hidden in {16, 24}
         assert row.final_loss >= 0.0
         assert row.t1_relative_mse >= 0.0
+        assert row.final_relative_mse >= 0.0
+        assert -1.0001 <= row.final_cosine <= 1.0001
+        assert row.final_pred_target_norm_ratio >= 0.0
+
+
+def test_hamiltonian_denoise_normalization_comparison_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=59,
+    )
+    dataset = generate_hamiltonian_solution_dataset(
+        targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=60,
+        solutions_per_target=2,
+    )
+    config = CircuitExperimentConfig(
+        name="test-normalization",
+        schedule=DiffusionSchedule(T=4, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=4, num_steps=2, hidden=16, n_terms=4),
+        sample_count=3,
+        eta=0.2,
+    )
+    scale = estimate_hamiltonian_denoise_target_scale(
+        dataset,
+        config.schedule,
+        batch_size=4,
+        n_batches=2,
+        n_terms=4,
+        device="cpu",
+        seed=61,
+    )
+    result = run_hamiltonian_denoise_normalization_comparison(
+        dataset,
+        base_config=config,
+        device="cpu",
+        show_progress=False,
+        timesteps=(1, 4),
+        seed=62,
+    )
+    rows = summarize_hamiltonian_denoise_normalization(result)
+    print_hamiltonian_denoise_normalization(result)
+
+    captured = capsys.readouterr().out
+    assert isinstance(result, HamiltonianDenoiseNormalizationResult)
+    assert "target scale" in captured
+    assert scale > 0.0
+    assert len(result.diagnostics) == 3
+    assert [row.variant for row in rows] == ["unnormalized", "normalized", "normalized+wider"]
+    assert rows[0].target_scale == 1.0
+    assert rows[1].target_scale > 0.0
+    assert rows[2].target_scale == rows[1].target_scale
+    for row in rows:
+        assert row.final_loss >= 0.0
         assert row.final_relative_mse >= 0.0
         assert -1.0001 <= row.final_cosine <= 1.0001
         assert row.final_pred_target_norm_ratio >= 0.0
