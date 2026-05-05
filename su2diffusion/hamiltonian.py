@@ -130,6 +130,11 @@ class HamiltonianPriorSearchResult:
     benchmarks: list[HamiltonianPriorSearchBenchmark]
 
 
+@dataclass(frozen=True)
+class HamiltonianPriorMixtureResult:
+    alpha_results: dict[float, HamiltonianPriorSearchResult]
+
+
 class HamiltonianStackPredictor(nn.Module):
     def __init__(self, input_dim: int = 33, hidden: int = 256, n_slots: int = 6):
         super().__init__()
@@ -884,6 +889,7 @@ def synthesize_hamiltonian_prior_search_report(
     seed: int = 0,
     name: str | None = None,
     keep_fidelities: bool = False,
+    prior_weight: float = 1.0,
 ) -> SynthesisReport:
     if n_candidates <= 0:
         raise ValueError("n_candidates must be positive")
@@ -891,6 +897,8 @@ def synthesize_hamiltonian_prior_search_report(
         raise ValueError("top_k must be positive")
     if local_gates.shape[0] == 0:
         raise ValueError("local_gates must contain at least one gate")
+    if not (0.0 <= prior_weight <= 1.0):
+        raise ValueError("prior_weight must be between 0 and 1")
     label_names = tuple(label_names)
     device = local_gates.device
     model = model.to(device)
@@ -898,6 +906,8 @@ def synthesize_hamiltonian_prior_search_report(
     with torch.no_grad():
         features = hamiltonian_target_features([target]).to(device=device, dtype=torch.float32)
         probabilities = F.softmax(model(features)[0], dim=-1)
+        uniform = torch.full_like(probabilities, 1.0 / probabilities.shape[-1])
+        probabilities = prior_weight * probabilities + (1.0 - prior_weight) * uniform
 
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
@@ -936,7 +946,7 @@ def synthesize_hamiltonian_prior_search_report(
         )
     return SynthesisReport(
         name=name or f"{target.name} Hamiltonian prior search",
-        mode="hamiltonian-prior",
+        mode=f"prior alpha={prior_weight:g}",
         target=target.name.lower(),
         entangler=entangler,
         candidates=candidates,
@@ -954,6 +964,7 @@ def run_hamiltonian_prior_search_benchmark(
     top_k: int = 5,
     seed: int = 0,
     keep_fidelities: bool = False,
+    prior_weight: float = 1.0,
 ) -> HamiltonianPriorSearchResult:
     if not targets:
         raise ValueError("targets must contain at least one target")
@@ -981,8 +992,9 @@ def run_hamiltonian_prior_search_benchmark(
             n_candidates=n_candidates,
             top_k=top_k,
             seed=seed + 20_000 + i,
-            name=f"{target.name} learned-prior search",
+            name=f"{target.name} learned-prior alpha={prior_weight:g} search",
             keep_fidelities=keep_fidelities,
+            prior_weight=prior_weight,
         )
         benchmarks.append(
             HamiltonianPriorSearchBenchmark(
@@ -992,6 +1004,39 @@ def run_hamiltonian_prior_search_benchmark(
             )
         )
     return HamiltonianPriorSearchResult(benchmarks=benchmarks)
+
+
+def run_hamiltonian_prior_mixture_sweep(
+    prior: HamiltonianPriorResult,
+    targets: list[HamiltonianTarget],
+    local_gates: torch.Tensor,
+    local_labels: list[str],
+    alphas: tuple[float, ...] | list[float] = (0.0, 0.25, 0.5, 0.75, 1.0),
+    entangler: str = "cz",
+    n_candidates: int = 100_000,
+    top_k: int = 5,
+    seed: int = 0,
+    keep_fidelities: bool = False,
+) -> HamiltonianPriorMixtureResult:
+    if not alphas:
+        raise ValueError("alphas must contain at least one value")
+    alpha_results = {}
+    for i, alpha in enumerate(alphas):
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError("alphas must be between 0 and 1")
+        alpha_results[float(alpha)] = run_hamiltonian_prior_search_benchmark(
+            prior,
+            targets,
+            local_gates=local_gates,
+            local_labels=local_labels,
+            entangler=entangler,
+            n_candidates=n_candidates,
+            top_k=top_k,
+            seed=seed + 50_000 * i,
+            keep_fidelities=keep_fidelities,
+            prior_weight=float(alpha),
+        )
+    return HamiltonianPriorMixtureResult(alpha_results=alpha_results)
 
 
 def run_hamiltonian_seed_ablation(
@@ -1139,6 +1184,13 @@ def summarize_hamiltonian_prior_search(result: HamiltonianPriorSearchResult) -> 
     ]
 
 
+def summarize_hamiltonian_prior_mixture(result: HamiltonianPriorMixtureResult) -> list[HiddenShallowCircuitAggregate]:
+    rows = []
+    for alpha, alpha_result in result.alpha_results.items():
+        rows.append(_aggregate_reports(f"alpha={alpha:g}", [item.prior_report for item in alpha_result.benchmarks]))
+    return rows
+
+
 def print_hamiltonian_target(target: HamiltonianTarget) -> None:
     print(f"target: {target.name}")
     print(f"time:   {target.time:g}")
@@ -1228,6 +1280,20 @@ def print_hamiltonian_prior_search_summary(result: HamiltonianPriorSearchResult)
     for item in summarize_hamiltonian_prior_search(result):
         print(
             f"{item.mode:<22} {item.n_targets:<3} "
+            f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
+            f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
+            f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
+def print_hamiltonian_prior_mixture_summary(result: HamiltonianPriorMixtureResult) -> None:
+    header = "alpha   n   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for item in summarize_hamiltonian_prior_mixture(result):
+        alpha = item.mode.removeprefix("alpha=")
+        print(
+            f"{alpha:<7} {item.n_targets:<3} "
             f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
             f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
             f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
@@ -1505,6 +1571,23 @@ def plot_hamiltonian_prior_search(result: HamiltonianPriorSearchResult) -> None:
     plt.boxplot(values, labels=["uniform generated", "learned prior"], showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Hamiltonian learned-prior search")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_prior_mixture(result: HamiltonianPriorMixtureResult) -> None:
+    if not result.alpha_results:
+        raise ValueError("result must contain at least one alpha")
+    alphas = list(result.alpha_results)
+    values = [
+        [_best(item.prior_report) for item in result.alpha_results[alpha].benchmarks]
+        for alpha in alphas
+    ]
+    plt.figure(figsize=(8, 4))
+    plt.boxplot(values, labels=[f"{alpha:g}" for alpha in alphas], showmeans=True)
+    plt.xlabel("prior mixture alpha")
+    plt.ylabel("best unitary fidelity")
+    plt.title("Hamiltonian prior-mixture search")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 
