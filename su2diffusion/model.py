@@ -142,6 +142,67 @@ class TargetConditionedCircuitDenoiser(nn.Module):
         return self.net(x).reshape(q_stack.shape[0], self.n_slots, 3)
 
 
+class SlotwiseTargetConditionedCircuitDenoiser(nn.Module):
+    def __init__(
+        self,
+        T: int = 200,
+        n_slots: int = 6,
+        target_dim: int = 32,
+        time_dim: int = 64,
+        slot_dim: int = 16,
+        hidden: int = 512,
+    ):
+        super().__init__()
+        self.T = T
+        self.n_slots = n_slots
+        self.target_dim = target_dim
+        self.time_dim = time_dim
+        self.slot_dim = slot_dim
+        self.slot_embedding = nn.Embedding(n_slots, slot_dim)
+
+        self.net = nn.Sequential(
+            nn.Linear(4 + target_dim + time_dim + slot_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 3),
+        )
+
+    def forward(self, q_stack: torch.Tensor, t_idx: torch.Tensor, target_features: torch.Tensor) -> torch.Tensor:
+        if q_stack.ndim != 3 or q_stack.shape[1:] != (self.n_slots, 4):
+            raise ValueError(f"Expected q_stack with shape (batch, {self.n_slots}, 4)")
+        if target_features.ndim != 2 or target_features.shape != (q_stack.shape[0], self.target_dim):
+            raise ValueError(f"Expected target_features with shape (batch, {self.target_dim})")
+
+        batch = q_stack.shape[0]
+        t_scaled = t_idx.float() / self.T
+        temb = timestep_embedding(t_scaled, self.time_dim)
+        slot_ids = torch.arange(self.n_slots, device=q_stack.device)
+        slot_emb = self.slot_embedding(slot_ids)
+
+        x = torch.cat(
+            [
+                q_stack.reshape(batch * self.n_slots, 4),
+                target_features[:, None, :].expand(batch, self.n_slots, self.target_dim).reshape(
+                    batch * self.n_slots,
+                    self.target_dim,
+                ),
+                temb[:, None, :].expand(batch, self.n_slots, self.time_dim).reshape(
+                    batch * self.n_slots,
+                    self.time_dim,
+                ),
+                slot_emb[None, :, :].expand(batch, self.n_slots, self.slot_dim).reshape(
+                    batch * self.n_slots,
+                    self.slot_dim,
+                ),
+            ],
+            dim=-1,
+        )
+        return self.net(x).reshape(batch, self.n_slots, 3)
+
+
 class TargetLabelConditionedCircuitDenoiser(nn.Module):
     def __init__(
         self,

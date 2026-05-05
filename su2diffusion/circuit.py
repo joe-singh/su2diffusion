@@ -8,7 +8,12 @@ from tqdm.auto import tqdm
 from .data import DataConfig, center_names_for_config, centers_for_config
 from .device import get_default_device
 from .diffusion import DiffusionSchedule, brownian_forward_heat_target
-from .model import CircuitDenoiser, TargetConditionedCircuitDenoiser, TargetLabelConditionedCircuitDenoiser
+from .model import (
+    CircuitDenoiser,
+    SlotwiseTargetConditionedCircuitDenoiser,
+    TargetConditionedCircuitDenoiser,
+    TargetLabelConditionedCircuitDenoiser,
+)
 from .quaternion import q_exp, q_mul, q_normalize, sample_haar
 from .synthesis import (
     HiddenShallowCircuitAggregate,
