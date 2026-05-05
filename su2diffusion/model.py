@@ -203,6 +203,73 @@ class SlotwiseTargetConditionedCircuitDenoiser(nn.Module):
         return self.net(x).reshape(batch, self.n_slots, 3)
 
 
+class TargetConditionedCircuitTokenDenoiser(nn.Module):
+    def __init__(
+        self,
+        T: int = 200,
+        n_slots: int = 6,
+        target_dim: int = 32,
+        time_dim: int = 64,
+        hidden: int = 256,
+        num_layers: int = 4,
+        num_heads: int = 4,
+        ff_mult: int = 4,
+    ):
+        super().__init__()
+        if hidden % num_heads != 0:
+            raise ValueError("hidden must be divisible by num_heads")
+
+        self.T = T
+        self.n_slots = n_slots
+        self.target_dim = target_dim
+        self.time_dim = time_dim
+        self.hidden = hidden
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+
+        self.q_proj = nn.Linear(4, hidden)
+        self.target_proj = nn.Linear(target_dim, hidden)
+        self.time_proj = nn.Linear(time_dim, hidden)
+        self.slot_embedding = nn.Embedding(n_slots, hidden)
+        self.target_token = nn.Parameter(torch.zeros(hidden))
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=num_heads,
+            dim_feedforward=ff_mult * hidden,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(hidden)
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 3),
+        )
+
+    def forward(self, q_stack: torch.Tensor, t_idx: torch.Tensor, target_features: torch.Tensor) -> torch.Tensor:
+        if q_stack.ndim != 3 or q_stack.shape[1:] != (self.n_slots, 4):
+            raise ValueError(f"Expected q_stack with shape (batch, {self.n_slots}, 4)")
+        if target_features.ndim != 2 or target_features.shape != (q_stack.shape[0], self.target_dim):
+            raise ValueError(f"Expected target_features with shape (batch, {self.target_dim})")
+
+        batch = q_stack.shape[0]
+        t_scaled = t_idx.float() / self.T
+        temb = self.time_proj(timestep_embedding(t_scaled, self.time_dim))
+        slot_ids = torch.arange(self.n_slots, device=q_stack.device)
+
+        gate_tokens = self.q_proj(q_stack)
+        gate_tokens = gate_tokens + self.slot_embedding(slot_ids)[None, :, :] + temb[:, None, :]
+        target_token = self.target_proj(target_features) + temb + self.target_token[None, :]
+        tokens = torch.cat([target_token[:, None, :], gate_tokens], dim=1)
+
+        encoded = self.norm(self.encoder(tokens))
+        return self.head(encoded[:, 1:, :]).reshape(batch, self.n_slots, 3)
+
+
 class TargetLabelConditionedCircuitDenoiser(nn.Module):
     def __init__(
         self,

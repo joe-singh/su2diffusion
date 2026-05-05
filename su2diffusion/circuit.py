@@ -12,6 +12,7 @@ from .model import (
     CircuitDenoiser,
     SlotwiseTargetConditionedCircuitDenoiser,
     TargetConditionedCircuitDenoiser,
+    TargetConditionedCircuitTokenDenoiser,
     TargetLabelConditionedCircuitDenoiser,
 )
 from .quaternion import q_exp, q_mul, q_normalize, sample_haar

@@ -6,6 +6,7 @@ from su2diffusion.circuit import (
     CircuitTrainConfig,
     SlotwiseTargetConditionedCircuitDenoiser,
     TargetConditionedCircuitDenoiser,
+    TargetConditionedCircuitTokenDenoiser,
     TargetLabelConditionedCircuitDenoiser,
     circuit_forward_heat_target,
     generate_solution_stack_dataset,
@@ -106,6 +107,18 @@ def test_target_conditioned_circuit_denoiser_output_shape():
 
 def test_slotwise_target_conditioned_circuit_denoiser_output_shape():
     model = SlotwiseTargetConditionedCircuitDenoiser(T=8, hidden=16, target_dim=10)
+    q_stack = torch.randn(5, 6, 4)
+    q_stack = q_stack / q_stack.norm(dim=-1, keepdim=True)
+    t_idx = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
+    features = torch.randn(5, 10)
+
+    eps = model(q_stack, t_idx, features)
+
+    assert eps.shape == (5, 6, 3)
+
+
+def test_target_conditioned_circuit_token_denoiser_output_shape():
+    model = TargetConditionedCircuitTokenDenoiser(T=8, hidden=16, target_dim=10, num_layers=1, num_heads=4)
     q_stack = torch.randn(5, 6, 4)
     q_stack = q_stack / q_stack.norm(dim=-1, keepdim=True)
     t_idx = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)

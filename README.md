@@ -154,8 +154,10 @@ scaled tangent targets, then unscales predictions before reporting the standard
 one-step metrics. This tests whether output collapse is caused by the raw
 tangent-target scale or by a more structural modeling issue.
 
-The active follow-up is a slot-wise Hamiltonian denoising diagnostic: it compares
-the original flat circuit MLP against a shared per-slot MLP with learned slot
-embeddings. Both models still denoise on `SU(2)^6`; the diagnostic asks whether
-respecting the product-manifold slot structure improves the collapsed tangent
-predictions before we spend time on larger architectures.
+The active follow-up is a circuit-token Hamiltonian denoising diagnostic. It
+compares the original flat circuit MLP against a small attention model with one
+Hamiltonian conditioning token and six local-gate tokens. Both models still
+denoise on `SU(2)^6`; the diagnostic asks whether a model that explicitly lets
+the six local gates communicate can fit the tangent targets before we either
+scale architecture further or freeze direct Hamiltonian-conditioned diffusion as
+a negative result.
