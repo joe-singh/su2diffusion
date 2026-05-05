@@ -531,6 +531,7 @@ def generate_hamiltonian_solution_dataset(
     refinement_steps: int = 200,
     refinement_lr: float = 0.05,
     fidelity_threshold: float = 0.0,
+    solutions_per_target: int = 1,
 ) -> HamiltonianSolutionDataset:
     if not targets:
         raise ValueError("targets must contain at least one Hamiltonian target")
@@ -540,6 +541,8 @@ def generate_hamiltonian_solution_dataset(
         raise ValueError("refinement_lr must be positive")
     if not (0.0 <= fidelity_threshold <= 1.0):
         raise ValueError("fidelity_threshold must be between 0 and 1")
+    if solutions_per_target <= 0:
+        raise ValueError("solutions_per_target must be positive")
 
     suite = run_hamiltonian_suite_benchmark(
         targets,
@@ -552,7 +555,7 @@ def generate_hamiltonian_solution_dataset(
         n_random_candidates=n_random_candidates,
         n_analytic_gates=n_analytic_gates,
         n_haar_gates=n_haar_gates,
-        top_k=top_k,
+        top_k=max(top_k, solutions_per_target),
         seed=seed,
         keep_fidelities=False,
     )
@@ -561,19 +564,19 @@ def generate_hamiltonian_solution_dataset(
     kept_benchmarks = []
     refinements = []
     for benchmark in suite.benchmarks:
-        candidate = benchmark.generated_report.candidates[0]
-        refinement = refine_two_entangler_candidate(
-            generated_gates,
-            candidate,
-            target_unitary=benchmark.target.unitary,
-            entangler=entangler,
-            num_steps=refinement_steps,
-            lr=refinement_lr,
-        )
-        if refinement.refined_fidelity >= fidelity_threshold:
-            kept_targets.append(benchmark.target)
-            kept_benchmarks.append(benchmark)
-            refinements.append(refinement)
+        for candidate in benchmark.generated_report.candidates[:solutions_per_target]:
+            refinement = refine_two_entangler_candidate(
+                generated_gates,
+                candidate,
+                target_unitary=benchmark.target.unitary,
+                entangler=entangler,
+                num_steps=refinement_steps,
+                lr=refinement_lr,
+            )
+            if refinement.refined_fidelity >= fidelity_threshold:
+                kept_targets.append(benchmark.target)
+                kept_benchmarks.append(benchmark)
+                refinements.append(refinement)
 
     if not refinements:
         raise RuntimeError("No Hamiltonian solution stacks met the fidelity threshold")
@@ -1733,11 +1736,13 @@ def print_hamiltonian_solution_dataset(dataset: HamiltonianSolutionDataset, max_
 
 def print_hamiltonian_solution_dataset_summary(dataset: HamiltonianSolutionDataset) -> None:
     gains = dataset.refined_fidelities - dataset.initial_fidelities
-    header = "n   mean before   mean after   median gain   min after   >=0.99 after"
+    n_unique = len({target.name for target in dataset.targets})
+    header = "n stacks   n targets   mean before   mean after   median gain   min after   >=0.99 after"
     print(header)
     print("-" * len(header))
     print(
         f"{len(dataset.targets):<3} "
+        f"{n_unique:<9} "
         f"{dataset.initial_fidelities.mean().item():>11.4f}   "
         f"{dataset.refined_fidelities.mean().item():>10.4f}   "
         f"{gains.median().item():>11.4f}   "

@@ -126,3 +126,8 @@ p(q1, ..., q6 | H, t) on SU(2)^6.
 This is intentionally separate from the old discrete slot-label prior: the
 diffusion model predicts six tangent denoising directions and keeps every local
 gate on the `SU(2)` manifold during reverse sampling.
+
+The solution dataset can keep multiple refined decompositions for the same
+Hamiltonian target. This is important because many different six-gate stacks can
+compile the same `U(t)`, and diffusion is better matched to that one-to-many
+conditional distribution than to an arbitrary single refined solution.
