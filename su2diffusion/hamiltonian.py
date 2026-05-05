@@ -19,6 +19,7 @@ from .synthesis import (
     synthesize_unitary_two_entangler_random_report,
     two_qubit_gate,
     unitary_fidelity,
+    unitary_fidelity_batch,
 )
 
 
@@ -100,6 +101,35 @@ class HamiltonianSeedAblationResult:
     threshold: float
 
 
+@dataclass(frozen=True)
+class HamiltonianPriorTrainConfig:
+    hidden: int = 128
+    num_steps: int = 500
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    seed: int = 0
+
+
+@dataclass
+class HamiltonianPriorResult:
+    model: torch.nn.Module
+    losses: list[float]
+    label_names: tuple[str, ...]
+    train_accuracy: float
+
+
+@dataclass(frozen=True)
+class HamiltonianPriorSearchBenchmark:
+    target: HamiltonianTarget
+    uniform_report: SynthesisReport
+    prior_report: SynthesisReport
+
+
+@dataclass(frozen=True)
+class HamiltonianPriorSearchResult:
+    benchmarks: list[HamiltonianPriorSearchBenchmark]
+
+
 class HamiltonianStackPredictor(nn.Module):
     def __init__(self, input_dim: int = 33, hidden: int = 256, n_slots: int = 6):
         super().__init__()
@@ -119,6 +149,26 @@ class HamiltonianStackPredictor(nn.Module):
         if features.ndim != 2 or features.shape[1] != self.input_dim:
             raise ValueError(f"Expected features with shape (batch, {self.input_dim})")
         return q_normalize(self.net(features).reshape(features.shape[0], self.n_slots, 4))
+
+
+class HamiltonianSlotPriorPredictor(nn.Module):
+    def __init__(self, input_dim: int = 33, hidden: int = 128, n_slots: int = 6, n_labels: int = 24):
+        super().__init__()
+        self.input_dim = input_dim
+        self.n_slots = n_slots
+        self.n_labels = n_labels
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, n_slots * n_labels),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 2 or features.shape[1] != self.input_dim:
+            raise ValueError(f"Expected features with shape (batch, {self.input_dim})")
+        return self.net(features).reshape(features.shape[0], self.n_slots, self.n_labels)
 
 
 def pauli_matrix(name: str, device: torch.device | str | None = None) -> torch.Tensor:
@@ -714,6 +764,236 @@ def run_hamiltonian_supervised_split_baseline(
     return HamiltonianSupervisedSplitResult(train=train_result, heldout=heldout_result)
 
 
+def _slot_label_targets(
+    dataset: HamiltonianSolutionDataset,
+    label_names: tuple[str, ...] | list[str],
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    label_to_index = {label: i for i, label in enumerate(label_names)}
+    rows = []
+    for refinement in dataset.refinements:
+        if len(refinement.slot_labels) != 6:
+            raise ValueError("Hamiltonian prior training expects six slot labels per refinement")
+        row = []
+        for label in refinement.slot_labels:
+            if label not in label_to_index:
+                raise ValueError(f"Unknown slot label {label!r}")
+            row.append(label_to_index[label])
+        rows.append(row)
+    return torch.tensor(rows, dtype=torch.long, device=device)
+
+
+def train_hamiltonian_slot_prior(
+    dataset: HamiltonianSolutionDataset,
+    label_names: tuple[str, ...] | list[str],
+    config: HamiltonianPriorTrainConfig | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> HamiltonianPriorResult:
+    if not dataset.targets:
+        raise ValueError("dataset must contain at least one target")
+    if not label_names:
+        raise ValueError("label_names must contain at least one label")
+    config = config or HamiltonianPriorTrainConfig()
+    device = device or dataset.stacks.device
+
+    torch.manual_seed(config.seed)
+    features = hamiltonian_target_features(dataset.targets).to(device=device, dtype=torch.float32)
+    targets = _slot_label_targets(dataset, label_names, device=device)
+    model = HamiltonianSlotPriorPredictor(
+        input_dim=features.shape[1],
+        hidden=config.hidden,
+        n_slots=targets.shape[1],
+        n_labels=len(label_names),
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    losses = []
+    iterator = range(config.num_steps)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(iterator, desc="Training Hamiltonian slot prior")
+    for _ in iterator:
+        logits = model(features)
+        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach().cpu()))
+        if show_progress:
+            iterator.set_postfix(loss=losses[-1])
+
+    with torch.no_grad():
+        predicted = model(features).argmax(dim=-1)
+        accuracy = (predicted == targets).float().mean().item()
+    return HamiltonianPriorResult(
+        model=model,
+        losses=losses,
+        label_names=tuple(label_names),
+        train_accuracy=accuracy,
+    )
+
+
+def _batched_local_layer(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.einsum("nab,ncd->nacbd", a, b).reshape(a.shape[0], 4, 4)
+
+
+def _indices_by_label(local_labels: list[str], label_names: tuple[str, ...], device: torch.device) -> list[torch.Tensor]:
+    pools = []
+    for label in label_names:
+        indices = [i for i, local_label in enumerate(local_labels) if local_label == label]
+        if not indices:
+            raise ValueError(f"No local gates found for label {label!r}")
+        pools.append(torch.tensor(indices, dtype=torch.long, device=device))
+    return pools
+
+
+def _sample_prior_slots(
+    probabilities: torch.Tensor,
+    local_labels: list[str],
+    label_names: tuple[str, ...],
+    n_candidates: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    if probabilities.shape != (6, len(label_names)):
+        raise ValueError("probabilities must have shape (6, n_labels)")
+    device = probabilities.device
+    pools = _indices_by_label(local_labels, label_names, device=device)
+    label_slots = torch.multinomial(probabilities, num_samples=n_candidates, replacement=True, generator=generator).T
+    slots = torch.empty(n_candidates, 6, dtype=torch.long, device=device)
+    for slot in range(6):
+        for label_index, pool in enumerate(pools):
+            mask = label_slots[:, slot] == label_index
+            n_items = int(mask.sum().item())
+            if n_items == 0:
+                continue
+            choices = torch.randint(pool.numel(), (n_items,), device=device, generator=generator)
+            slots[mask, slot] = pool[choices]
+    return slots
+
+
+def synthesize_hamiltonian_prior_search_report(
+    model: HamiltonianSlotPriorPredictor,
+    target: HamiltonianTarget,
+    local_gates: torch.Tensor,
+    local_labels: list[str],
+    label_names: tuple[str, ...] | list[str],
+    entangler: str = "cz",
+    n_candidates: int = 100_000,
+    top_k: int = 5,
+    seed: int = 0,
+    name: str | None = None,
+    keep_fidelities: bool = False,
+) -> SynthesisReport:
+    if n_candidates <= 0:
+        raise ValueError("n_candidates must be positive")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if local_gates.shape[0] == 0:
+        raise ValueError("local_gates must contain at least one gate")
+    label_names = tuple(label_names)
+    device = local_gates.device
+    model = model.to(device)
+    model.eval()
+    with torch.no_grad():
+        features = hamiltonian_target_features([target]).to(device=device, dtype=torch.float32)
+        probabilities = F.softmax(model(features)[0], dim=-1)
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    indices = _sample_prior_slots(
+        probabilities=probabilities,
+        local_labels=local_labels,
+        label_names=label_names,
+        n_candidates=n_candidates,
+        generator=generator,
+    )
+
+    entangler = entangler.lower()
+    units = quaternion_to_unitary(local_gates)
+    target_unitary = target.unitary.to(device=device, dtype=torch.complex64)
+    entangler_unitary = two_qubit_gate(entangler, device=device)
+    first = _batched_local_layer(units[indices[:, 0]], units[indices[:, 1]])
+    middle = _batched_local_layer(units[indices[:, 2]], units[indices[:, 3]])
+    second = _batched_local_layer(units[indices[:, 4]], units[indices[:, 5]])
+    entanglers = entangler_unitary.expand(n_candidates, 4, 4)
+    unitaries = first @ entanglers @ middle @ entanglers @ second
+    fidelities = unitary_fidelity_batch(unitaries, target_unitary)
+    values, rows = torch.topk(fidelities, k=min(top_k, fidelities.numel()))
+
+    candidates = []
+    for value, row in zip(values.tolist(), rows.tolist()):
+        slots = indices[row].tolist()
+        candidates.append(
+            SynthesisCandidate(
+                target=target.name.lower(),
+                template="hamiltonian-prior-two-entangler-local",
+                entangler=entangler,
+                fidelity=value,
+                slot_indices=tuple(slots),
+                slot_labels=tuple(local_labels[index] for index in slots),
+            )
+        )
+    return SynthesisReport(
+        name=name or f"{target.name} Hamiltonian prior search",
+        mode="hamiltonian-prior",
+        target=target.name.lower(),
+        entangler=entangler,
+        candidates=candidates,
+        fidelities=fidelities.tolist() if keep_fidelities else tuple(float(candidate.fidelity) for candidate in candidates),
+    )
+
+
+def run_hamiltonian_prior_search_benchmark(
+    prior: HamiltonianPriorResult,
+    targets: list[HamiltonianTarget],
+    local_gates: torch.Tensor,
+    local_labels: list[str],
+    entangler: str = "cz",
+    n_candidates: int = 100_000,
+    top_k: int = 5,
+    seed: int = 0,
+    keep_fidelities: bool = False,
+) -> HamiltonianPriorSearchResult:
+    if not targets:
+        raise ValueError("targets must contain at least one target")
+    benchmarks = []
+    for i, target in enumerate(targets):
+        uniform_report = synthesize_unitary_two_entangler_random_report(
+            local_gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            entangler=entangler,
+            n_candidates=n_candidates,
+            top_k=top_k,
+            local_labels=local_labels,
+            seed=seed + 10_000 + i,
+            name=f"{target.name} uniform generated search",
+            keep_fidelities=keep_fidelities,
+        )
+        prior_report = synthesize_hamiltonian_prior_search_report(
+            prior.model,
+            target,
+            local_gates=local_gates,
+            local_labels=local_labels,
+            label_names=prior.label_names,
+            entangler=entangler,
+            n_candidates=n_candidates,
+            top_k=top_k,
+            seed=seed + 20_000 + i,
+            name=f"{target.name} learned-prior search",
+            keep_fidelities=keep_fidelities,
+        )
+        benchmarks.append(
+            HamiltonianPriorSearchBenchmark(
+                target=target,
+                uniform_report=uniform_report,
+                prior_report=prior_report,
+            )
+        )
+    return HamiltonianPriorSearchResult(benchmarks=benchmarks)
+
+
 def run_hamiltonian_seed_ablation(
     targets: list[HamiltonianTarget],
     predicted_stacks: torch.Tensor,
@@ -850,6 +1130,15 @@ def summarize_hamiltonian_suite(result: HamiltonianSuiteResult) -> list[HiddenSh
     ]
 
 
+def summarize_hamiltonian_prior_search(result: HamiltonianPriorSearchResult) -> list[HiddenShallowCircuitAggregate]:
+    if not result.benchmarks:
+        raise ValueError("result must contain at least one benchmark")
+    return [
+        _aggregate_reports("uniform generated", [item.uniform_report for item in result.benchmarks]),
+        _aggregate_reports("learned prior", [item.prior_report for item in result.benchmarks]),
+    ]
+
+
 def print_hamiltonian_target(target: HamiltonianTarget) -> None:
     print(f"target: {target.name}")
     print(f"time:   {target.time:g}")
@@ -907,6 +1196,36 @@ def print_hamiltonian_suite_summary(result: HamiltonianSuiteResult) -> None:
     print(header)
     print("-" * len(header))
     for item in summarize_hamiltonian_suite(result):
+        print(
+            f"{item.mode:<22} {item.n_targets:<3} "
+            f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
+            f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
+            f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
+def print_hamiltonian_prior_search(result: HamiltonianPriorSearchResult, max_rows: int | None = 6) -> None:
+    header = "target      uniform   prior    best prior labels"
+    print(header)
+    print("-" * len(header))
+    rows = result.benchmarks if max_rows is None else result.benchmarks[:max_rows]
+    for item in rows:
+        labels = ", ".join(label if label is not None else "?" for label in item.prior_report.candidates[0].slot_labels)
+        print(
+            f"{item.target.name:<11} "
+            f"{_best(item.uniform_report):>7.4f} "
+            f"{_best(item.prior_report):>7.4f}   "
+            f"{labels}"
+        )
+    if max_rows is not None and len(result.benchmarks) > max_rows:
+        print(f"... {len(result.benchmarks) - max_rows} more")
+
+
+def print_hamiltonian_prior_search_summary(result: HamiltonianPriorSearchResult) -> None:
+    header = "mode                   n   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for item in summarize_hamiltonian_prior_search(result):
         print(
             f"{item.mode:<22} {item.n_targets:<3} "
             f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
@@ -1171,6 +1490,21 @@ def plot_hamiltonian_suite(result: HamiltonianSuiteResult) -> None:
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Hamiltonian target synthesis suite")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_prior_search(result: HamiltonianPriorSearchResult) -> None:
+    if not result.benchmarks:
+        raise ValueError("result must contain at least one benchmark")
+    values = [
+        [_best(item.uniform_report) for item in result.benchmarks],
+        [_best(item.prior_report) for item in result.benchmarks],
+    ]
+    plt.figure(figsize=(7, 4))
+    plt.boxplot(values, labels=["uniform generated", "learned prior"], showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Hamiltonian learned-prior search")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 

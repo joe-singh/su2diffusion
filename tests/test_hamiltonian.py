@@ -3,6 +3,7 @@ import torch
 from su2diffusion.data import center_names_for_config, centers_for_config, DataConfig
 from su2diffusion.hamiltonian import (
     HamiltonianStackPredictor,
+    HamiltonianPriorTrainConfig,
     HamiltonianSupervisedTrainConfig,
     evaluate_hamiltonian_stack_predictor,
     generate_hamiltonian_solution_dataset,
@@ -12,6 +13,8 @@ from su2diffusion.hamiltonian import (
     make_random_pauli_hamiltonian_targets,
     parse_pauli_string,
     pauli_string_matrix,
+    print_hamiltonian_prior_search,
+    print_hamiltonian_prior_search_summary,
     print_hamiltonian_target,
     print_hamiltonian_solution_dataset,
     print_hamiltonian_solution_dataset_summary,
@@ -23,12 +26,14 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_suite_summary,
     print_hamiltonian_two_entangler_benchmark,
     print_hamiltonian_two_entangler_summary,
+    run_hamiltonian_prior_search_benchmark,
     run_hamiltonian_seed_ablation,
     run_hamiltonian_supervised_baseline,
     run_hamiltonian_supervised_split_baseline,
     run_hamiltonian_suite_benchmark,
     run_hamiltonian_two_entangler_benchmark,
     summarize_hamiltonian_suite,
+    train_hamiltonian_slot_prior,
     unitary_from_hamiltonian,
 )
 
@@ -356,3 +361,63 @@ def test_hamiltonian_seed_ablation_smoke(capsys):
     }
     assert all(0.0 <= row.initial_fidelity <= 1.0 for row in ablation.rows)
     assert all(0.0 <= row.refined_fidelity <= 1.0 for row in ablation.rows)
+
+
+def test_hamiltonian_prior_search_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    train_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=3,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=31,
+    )
+    heldout_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=32,
+    )
+    train_dataset = generate_hamiltonian_solution_dataset(
+        train_targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=33,
+    )
+    prior = train_hamiltonian_slot_prior(
+        train_dataset,
+        labels,
+        config=HamiltonianPriorTrainConfig(hidden=16, num_steps=2, lr=1e-3),
+        device="cpu",
+        show_progress=False,
+    )
+    benchmark = run_hamiltonian_prior_search_benchmark(
+        prior,
+        heldout_targets,
+        local_gates=centers,
+        local_labels=labels,
+        n_candidates=16,
+        top_k=1,
+        seed=34,
+    )
+    print_hamiltonian_prior_search(benchmark)
+    print_hamiltonian_prior_search_summary(benchmark)
+
+    captured = capsys.readouterr().out
+    assert "learned prior" in captured
+    assert len(prior.losses) == 2
+    assert 0.0 <= prior.train_accuracy <= 1.0
+    assert len(benchmark.benchmarks) == 2
+    assert all(item.prior_report.candidates for item in benchmark.benchmarks)
+    assert all(0.0 <= item.prior_report.candidates[0].fidelity <= 1.0 for item in benchmark.benchmarks)
