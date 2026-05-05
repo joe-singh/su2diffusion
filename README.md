@@ -153,3 +153,9 @@ The target-normalization diagnostic trains the same conditioned denoiser on
 scaled tangent targets, then unscales predictions before reporting the standard
 one-step metrics. This tests whether output collapse is caused by the raw
 tangent-target scale or by a more structural modeling issue.
+
+The active follow-up is a skeleton-conditioned Hamiltonian denoising diagnostic:
+the denoiser sees `(H, t)` plus the six local-gate slot labels for each refined
+solution stack. This tests whether the zero-vector collapse is caused by
+averaging incompatible denoising directions across multiple valid
+decompositions of the same Hamiltonian target.

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from .circuit import CircuitExperimentConfig, CircuitTrainConfig, circuit_forward_heat_target
 from .diffusion import DiffusionSchedule
-from .model import TargetConditionedCircuitDenoiser
+from .model import TargetConditionedCircuitDenoiser, TargetLabelConditionedCircuitDenoiser
 from .quaternion import q_exp, q_mul, q_normalize, sample_haar
 from .synthesis import (
     HiddenShallowCircuitAggregate,
@@ -145,6 +145,32 @@ class HamiltonianDenoiseNormalizationResult:
     train_dataset: HamiltonianSolutionDataset
     diagnostics: list[HamiltonianDenoiseDiagnosticResult]
     rows: list[HamiltonianDenoiseNormalizationRow]
+
+
+@dataclass
+class HamiltonianSkeletonDenoiseDiagnosticResult:
+    config: CircuitExperimentConfig
+    model: torch.nn.Module
+    losses: list[float]
+    train_dataset: HamiltonianSolutionDataset
+    label_names: tuple[str, ...]
+    rows: list[HamiltonianDenoiseDiagnosticRow]
+
+
+@dataclass(frozen=True)
+class HamiltonianSkeletonDenoiseComparisonRow:
+    variant: str
+    final_loss: float
+    final_relative_mse: float
+    final_cosine: float
+    final_pred_target_norm_ratio: float
+
+
+@dataclass
+class HamiltonianSkeletonDenoiseComparisonResult:
+    unconditioned: HamiltonianDenoiseDiagnosticResult
+    skeleton_conditioned: HamiltonianSkeletonDenoiseDiagnosticResult
+    rows: list[HamiltonianSkeletonDenoiseComparisonRow]
 
 
 @dataclass(frozen=True)
@@ -901,6 +927,16 @@ def _predict_hamiltonian_eps(
     return model(q_stack, t_idx, features) * _eps_output_scale(model)
 
 
+def _predict_hamiltonian_skeleton_eps(
+    model: TargetLabelConditionedCircuitDenoiser,
+    q_stack: torch.Tensor,
+    t_idx: torch.Tensor,
+    features: torch.Tensor,
+    slot_labels: torch.Tensor,
+) -> torch.Tensor:
+    return model(q_stack, t_idx, features, slot_labels) * _eps_output_scale(model)
+
+
 def estimate_hamiltonian_denoise_target_scale(
     dataset: HamiltonianSolutionDataset,
     schedule: DiffusionSchedule,
@@ -1002,6 +1038,83 @@ def train_hamiltonian_conditioned_circuit_diffusion(
             )
 
         eps_pred = model(qt_stack, t_idx, batch_features)
+        loss = F.mse_loss(eps_pred, eps_target / target_scale)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        loss_value = float(loss.item())
+        losses.append(loss_value)
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix({"loss": f"{loss_value:.5f}"})
+
+    return model, losses
+
+
+def train_hamiltonian_skeleton_conditioned_circuit_diffusion(
+    dataset: HamiltonianSolutionDataset,
+    label_names: tuple[str, ...] | list[str],
+    train_config: CircuitTrainConfig | None = None,
+    schedule: DiffusionSchedule | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    target_scale: float = 1.0,
+) -> tuple[TargetLabelConditionedCircuitDenoiser, list[float]]:
+    if not dataset.targets:
+        raise ValueError("dataset must contain at least one Hamiltonian target")
+    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
+        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    if dataset.stacks.shape[0] != len(dataset.targets):
+        raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
+
+    train_config = train_config or CircuitTrainConfig()
+    schedule = schedule or DiffusionSchedule()
+    if target_scale <= 0:
+        raise ValueError("target_scale must be positive")
+    device = torch.device(device) if device is not None else dataset.stacks.device
+    stacks = q_normalize(dataset.stacks.to(device=device))
+    features = hamiltonian_target_features(dataset.targets).to(device=device)
+    slot_labels = _slot_label_targets(dataset, label_names, device=device)
+
+    torch.manual_seed(train_config.seed)
+    model = TargetLabelConditionedCircuitDenoiser(
+        T=schedule.T,
+        target_dim=features.shape[1],
+        num_labels=len(label_names),
+        hidden=train_config.hidden,
+    ).to(device)
+    model.eps_output_scale = float(target_scale)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+
+    losses: list[float] = []
+    iterator = range(1, train_config.num_steps + 1)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(iterator, desc="Training Hamiltonian skeleton-conditioned diffusion", dynamic_ncols=True)
+
+    for _ in iterator:
+        rows = torch.randint(
+            low=0,
+            high=stacks.shape[0],
+            size=(train_config.batch_size,),
+            device=device,
+        )
+        q0_stack = stacks[rows]
+        batch_features = features[rows]
+        batch_labels = slot_labels[rows]
+        t_idx = torch.randint(1, schedule.T + 1, (train_config.batch_size,), device=device)
+
+        with torch.no_grad():
+            qt_stack, eps_target = circuit_forward_heat_target(
+                q0_stack,
+                t_idx,
+                schedule=schedule,
+                n_terms=train_config.n_terms,
+            )
+
+        eps_pred = model(qt_stack, t_idx, batch_features, batch_labels)
         loss = F.mse_loss(eps_pred, eps_target / target_scale)
 
         optimizer.zero_grad(set_to_none=True)
@@ -1281,6 +1394,73 @@ def evaluate_hamiltonian_conditioned_denoising(
     return rows
 
 
+def evaluate_hamiltonian_skeleton_conditioned_denoising(
+    model: TargetLabelConditionedCircuitDenoiser,
+    dataset: HamiltonianSolutionDataset,
+    label_names: tuple[str, ...] | list[str],
+    schedule: DiffusionSchedule,
+    timesteps: tuple[int, ...] | None = None,
+    n_terms: int = 128,
+    device: torch.device | str | None = None,
+    seed: int = 0,
+) -> list[HamiltonianDenoiseDiagnosticRow]:
+    if not dataset.targets:
+        raise ValueError("dataset must contain at least one Hamiltonian target")
+    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
+        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    if dataset.stacks.shape[0] != len(dataset.targets):
+        raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
+
+    device = torch.device(device) if device is not None else next(model.parameters()).device
+    timesteps = timesteps or (1, max(1, schedule.T // 4), max(1, schedule.T // 2), schedule.T)
+    for timestep in timesteps:
+        if timestep < 1 or timestep > schedule.T:
+            raise ValueError(f"timestep {timestep} is outside [1, {schedule.T}]")
+
+    stacks = q_normalize(dataset.stacks.to(device=device))
+    features = hamiltonian_target_features(dataset.targets).to(device=device)
+    if features.shape[1] != model.target_dim:
+        raise ValueError(f"Model expects {model.target_dim} Hamiltonian features, got {features.shape[1]}")
+    slot_labels = _slot_label_targets(dataset, label_names, device=device)
+    if int(slot_labels.max().item()) >= model.num_labels or int(slot_labels.min().item()) < 0:
+        raise ValueError("slot labels are outside model label range")
+
+    _, _, sigmas = schedule.tensors(device)
+    rows = []
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        for timestep in timesteps:
+            t_idx = torch.full((stacks.shape[0],), timestep, device=device, dtype=torch.long)
+            qt_stack, eps_target = circuit_forward_heat_target(
+                stacks,
+                t_idx,
+                schedule=schedule,
+                n_terms=n_terms,
+            )
+            eps_pred = _predict_hamiltonian_skeleton_eps(model, qt_stack, t_idx, features, slot_labels)
+
+            mse = F.mse_loss(eps_pred, eps_target).item()
+            zero_mse = eps_target.square().mean().item()
+            flat_pred = eps_pred.reshape(-1, 3)
+            flat_target = eps_target.reshape(-1, 3)
+            cosine = F.cosine_similarity(flat_pred, flat_target, dim=-1, eps=1e-8).mean().item()
+            target_norm = flat_target.norm(dim=-1).mean().item()
+            pred_norm = flat_pred.norm(dim=-1).mean().item()
+            rows.append(
+                HamiltonianDenoiseDiagnosticRow(
+                    timestep=int(timestep),
+                    sigma=float(sigmas[timestep - 1].item()),
+                    mse=float(mse),
+                    zero_mse=float(zero_mse),
+                    relative_mse=float(mse / max(zero_mse, 1e-12)),
+                    cosine=float(cosine),
+                    target_norm=float(target_norm),
+                    pred_norm=float(pred_norm),
+                )
+            )
+    return rows
+
+
 def run_hamiltonian_conditioned_denoise_diagnostic(
     train_dataset: HamiltonianSolutionDataset,
     config: CircuitExperimentConfig | str,
@@ -1317,6 +1497,51 @@ def run_hamiltonian_conditioned_denoise_diagnostic(
         model=model,
         losses=losses,
         train_dataset=train_dataset,
+        rows=rows,
+    )
+
+
+def run_hamiltonian_skeleton_denoise_diagnostic(
+    train_dataset: HamiltonianSolutionDataset,
+    label_names: tuple[str, ...] | list[str],
+    config: CircuitExperimentConfig | str,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    timesteps: tuple[int, ...] | None = None,
+    seed: int = 0,
+    target_scale: float = 1.0,
+) -> HamiltonianSkeletonDenoiseDiagnosticResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    device = torch.device(device) if device is not None else train_dataset.stacks.device
+    label_names = tuple(label_names)
+    model, losses = train_hamiltonian_skeleton_conditioned_circuit_diffusion(
+        train_dataset,
+        label_names,
+        train_config=config.train,
+        schedule=config.schedule,
+        device=device,
+        show_progress=show_progress,
+        target_scale=target_scale,
+    )
+    rows = evaluate_hamiltonian_skeleton_conditioned_denoising(
+        model,
+        train_dataset,
+        label_names,
+        config.schedule,
+        timesteps=timesteps,
+        n_terms=config.train.n_terms,
+        device=device,
+        seed=seed,
+    )
+    return HamiltonianSkeletonDenoiseDiagnosticResult(
+        config=config,
+        model=model,
+        losses=losses,
+        train_dataset=train_dataset,
+        label_names=label_names,
         rows=rows,
     )
 
@@ -1409,6 +1634,63 @@ def _hamiltonian_denoise_normalization_row(
         final_relative_mse=final.relative_mse,
         final_cosine=final.cosine,
         final_pred_target_norm_ratio=final.pred_norm / max(final.target_norm, 1e-12),
+    )
+
+
+def _hamiltonian_skeleton_denoise_comparison_row(
+    variant: str,
+    result: HamiltonianDenoiseDiagnosticResult | HamiltonianSkeletonDenoiseDiagnosticResult,
+) -> HamiltonianSkeletonDenoiseComparisonRow:
+    if not result.rows:
+        raise ValueError("diagnostic result must contain at least one denoising row")
+    final = max(result.rows, key=lambda row: row.timestep)
+    final_loss = float(result.losses[-1]) if result.losses else float("nan")
+    return HamiltonianSkeletonDenoiseComparisonRow(
+        variant=variant,
+        final_loss=final_loss,
+        final_relative_mse=final.relative_mse,
+        final_cosine=final.cosine,
+        final_pred_target_norm_ratio=final.pred_norm / max(final.target_norm, 1e-12),
+    )
+
+
+def run_hamiltonian_skeleton_denoise_comparison(
+    train_dataset: HamiltonianSolutionDataset,
+    label_names: tuple[str, ...] | list[str],
+    base_config: CircuitExperimentConfig | str,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    timesteps: tuple[int, ...] | None = None,
+    seed: int = 0,
+) -> HamiltonianSkeletonDenoiseComparisonResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(base_config, str):
+        base_config = get_circuit_experiment_config(base_config)
+    unconditioned = run_hamiltonian_conditioned_denoise_diagnostic(
+        train_dataset,
+        config=base_config,
+        device=device,
+        show_progress=show_progress,
+        timesteps=timesteps,
+        seed=seed,
+    )
+    skeleton_conditioned = run_hamiltonian_skeleton_denoise_diagnostic(
+        train_dataset,
+        label_names=label_names,
+        config=replace(base_config, name=f"{base_config.name}-skeleton"),
+        device=device,
+        show_progress=show_progress,
+        timesteps=timesteps,
+        seed=seed + 1,
+    )
+    return HamiltonianSkeletonDenoiseComparisonResult(
+        unconditioned=unconditioned,
+        skeleton_conditioned=skeleton_conditioned,
+        rows=[
+            _hamiltonian_skeleton_denoise_comparison_row("H-only", unconditioned),
+            _hamiltonian_skeleton_denoise_comparison_row("H+slot labels", skeleton_conditioned),
+        ],
     )
 
 
@@ -2029,6 +2311,12 @@ def summarize_hamiltonian_denoise_normalization(
     return result.rows
 
 
+def summarize_hamiltonian_skeleton_denoise_comparison(
+    result: HamiltonianSkeletonDenoiseComparisonResult,
+) -> list[HamiltonianSkeletonDenoiseComparisonRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_prior_search(result: HamiltonianPriorSearchResult) -> list[HiddenShallowCircuitAggregate]:
     if not result.benchmarks:
         raise ValueError("result must contain at least one benchmark")
@@ -2239,6 +2527,20 @@ def print_hamiltonian_denoise_normalization(result: HamiltonianDenoiseNormalizat
         print(
             f"{row.variant:<18} "
             f"{row.target_scale:>12.4f}   "
+            f"{row.final_loss:>10.6f}   "
+            f"{row.final_relative_mse:>11.4f}   "
+            f"{row.final_cosine:>10.4f}   "
+            f"{row.final_pred_target_norm_ratio:>11.4f}"
+        )
+
+
+def print_hamiltonian_skeleton_denoise_comparison(result: HamiltonianSkeletonDenoiseComparisonResult) -> None:
+    header = "variant          final loss   rel mse t=T   cosine t=T   pred/target"
+    print(header)
+    print("-" * len(header))
+    for row in summarize_hamiltonian_skeleton_denoise_comparison(result):
+        print(
+            f"{row.variant:<16} "
             f"{row.final_loss:>10.6f}   "
             f"{row.final_relative_mse:>11.4f}   "
             f"{row.final_cosine:>10.4f}   "
@@ -2728,6 +3030,38 @@ def plot_hamiltonian_denoise_normalization(result: HamiltonianDenoiseNormalizati
     plt.ylabel("pred norm / target norm")
     plt.title("Output scale")
     plt.xticks(rotation=20, ha="right")
+    plt.tight_layout()
+
+
+def plot_hamiltonian_skeleton_denoise_comparison(result: HamiltonianSkeletonDenoiseComparisonResult) -> None:
+    rows = summarize_hamiltonian_skeleton_denoise_comparison(result)
+    labels = [row.variant for row in rows]
+    rel_mse = [row.final_relative_mse for row in rows]
+    cosine = [row.final_cosine for row in rows]
+    ratio = [row.final_pred_target_norm_ratio for row in rows]
+
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 3, 1)
+    plt.bar(labels, rel_mse)
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    plt.ylabel("MSE / zero-predictor MSE")
+    plt.title("Skeleton denoising")
+    plt.xticks(rotation=15, ha="right")
+
+    plt.subplot(1, 3, 2)
+    plt.bar(labels, cosine)
+    plt.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    plt.ylabel("mean cosine")
+    plt.title("Tangent alignment")
+    plt.ylim(-1.0, 1.0)
+    plt.xticks(rotation=15, ha="right")
+
+    plt.subplot(1, 3, 3)
+    plt.bar(labels, ratio)
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    plt.ylabel("pred norm / target norm")
+    plt.title("Output scale")
+    plt.xticks(rotation=15, ha="right")
     plt.tight_layout()
 
 
