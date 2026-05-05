@@ -150,6 +150,22 @@ class HamiltonianMixtureRefinementResult:
     threshold: float
 
 
+@dataclass(frozen=True)
+class HamiltonianBudgetRefinementRow:
+    budget: int
+    target: str
+    alpha: float
+    initial_fidelity: float
+    refined_fidelity: float
+    reached_threshold: bool
+
+
+@dataclass(frozen=True)
+class HamiltonianBudgetRefinementResult:
+    rows: list[HamiltonianBudgetRefinementRow]
+    threshold: float
+
+
 class HamiltonianStackPredictor(nn.Module):
     def __init__(self, input_dim: int = 33, hidden: int = 256, n_slots: int = 6):
         super().__init__()
@@ -1101,6 +1117,42 @@ def refine_hamiltonian_prior_mixture(
     return HamiltonianMixtureRefinementResult(rows=rows, threshold=threshold)
 
 
+def refine_hamiltonian_prior_mixture_budget_sweep(
+    result: HamiltonianPriorMixtureResult,
+    local_gates: torch.Tensor,
+    budgets: tuple[int, ...] | list[int] = (5, 10, 20, 50),
+    entangler: str = "cz",
+    refinement_lr: float = 0.05,
+    threshold: float = 0.99,
+) -> HamiltonianBudgetRefinementResult:
+    if not budgets:
+        raise ValueError("budgets must contain at least one value")
+    rows = []
+    for budget in budgets:
+        if budget <= 0:
+            raise ValueError("budgets must be positive")
+        refined = refine_hamiltonian_prior_mixture(
+            result,
+            local_gates=local_gates,
+            entangler=entangler,
+            refinement_steps=int(budget),
+            refinement_lr=refinement_lr,
+            threshold=threshold,
+        )
+        for row in refined.rows:
+            rows.append(
+                HamiltonianBudgetRefinementRow(
+                    budget=int(budget),
+                    target=row.target,
+                    alpha=row.alpha,
+                    initial_fidelity=row.initial_fidelity,
+                    refined_fidelity=row.refined_fidelity,
+                    reached_threshold=row.refined_fidelity >= threshold,
+                )
+            )
+    return HamiltonianBudgetRefinementResult(rows=rows, threshold=threshold)
+
+
 def run_hamiltonian_seed_ablation(
     targets: list[HamiltonianTarget],
     predicted_stacks: torch.Tensor,
@@ -1262,6 +1314,15 @@ def _mixture_refinement_groups(
     return groups
 
 
+def _budget_refinement_groups(
+    result: HamiltonianBudgetRefinementResult,
+) -> dict[tuple[int, float], list[HamiltonianBudgetRefinementRow]]:
+    groups: dict[tuple[int, float], list[HamiltonianBudgetRefinementRow]] = {}
+    for row in result.rows:
+        groups.setdefault((row.budget, row.alpha), []).append(row)
+    return groups
+
+
 def print_hamiltonian_target(target: HamiltonianTarget) -> None:
     print(f"target: {target.name}")
     print(f"time:   {target.time:g}")
@@ -1404,6 +1465,23 @@ def print_hamiltonian_mixture_refinement_summary(result: HamiltonianMixtureRefin
             f"{refined.mean().item():>10.4f}   "
             f"{success:>10.1%}   "
             f"{median_steps:>12.1f}"
+        )
+
+
+def print_hamiltonian_budget_refinement_summary(result: HamiltonianBudgetRefinementResult) -> None:
+    header = "budget   alpha   n   mean before   mean after   >=threshold   min after"
+    print(header)
+    print("-" * len(header))
+    for (budget, alpha), rows in _budget_refinement_groups(result).items():
+        initial = torch.tensor([row.initial_fidelity for row in rows], dtype=torch.float32)
+        refined = torch.tensor([row.refined_fidelity for row in rows], dtype=torch.float32)
+        success = torch.tensor([row.reached_threshold for row in rows], dtype=torch.float32).mean().item()
+        print(
+            f"{budget:<8} {alpha:<7g} {len(rows):<3} "
+            f"{initial.mean().item():>11.4f}   "
+            f"{refined.mean().item():>10.4f}   "
+            f"{success:>10.1%}   "
+            f"{refined.min().item():>9.4f}"
         )
 
 
@@ -1729,6 +1807,42 @@ def plot_hamiltonian_mixture_refinement(result: HamiltonianMixtureRefinementResu
     plt.xlabel("prior mixture alpha")
     plt.ylabel(f"steps to F >= {result.threshold:g}")
     plt.title("Refinement speed")
+    plt.tight_layout()
+
+
+def plot_hamiltonian_budget_refinement(result: HamiltonianBudgetRefinementResult) -> None:
+    if not result.rows:
+        raise ValueError("result must contain at least one row")
+    groups = _budget_refinement_groups(result)
+    budgets = sorted({budget for budget, _ in groups})
+    alphas = sorted({alpha for _, alpha in groups})
+
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    for alpha in alphas:
+        means = []
+        for budget in budgets:
+            rows = groups[(budget, alpha)]
+            means.append(torch.tensor([row.refined_fidelity for row in rows], dtype=torch.float32).mean().item())
+        plt.plot(budgets, means, marker="o", label=f"alpha={alpha:g}")
+    plt.xlabel("refinement steps")
+    plt.ylabel("mean refined fidelity")
+    plt.title("Budgeted refinement quality")
+    plt.ylim(0.0, 1.02)
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    for alpha in alphas:
+        rates = []
+        for budget in budgets:
+            rows = groups[(budget, alpha)]
+            rates.append(torch.tensor([row.reached_threshold for row in rows], dtype=torch.float32).mean().item())
+        plt.plot(budgets, rates, marker="o", label=f"alpha={alpha:g}")
+    plt.xlabel("refinement steps")
+    plt.ylabel(f"fraction with F >= {result.threshold:g}")
+    plt.title("Budgeted success rate")
+    plt.ylim(0.0, 1.02)
+    plt.legend()
     plt.tight_layout()
 
 
