@@ -8,12 +8,14 @@ from su2diffusion.hamiltonian import (
     HamiltonianDenoiseAblationResult,
     HamiltonianDenoiseDiagnosticResult,
     HamiltonianDenoiseNormalizationResult,
+    HamiltonianSkeletonDenoiseComparisonResult,
     HamiltonianConditionedOverfitDiagnosticResult,
     HamiltonianStackPredictor,
     HamiltonianPriorTrainConfig,
     HamiltonianSupervisedTrainConfig,
     estimate_hamiltonian_denoise_target_scale,
     evaluate_hamiltonian_conditioned_denoising,
+    evaluate_hamiltonian_skeleton_conditioned_denoising,
     evaluate_hamiltonian_stack_predictor,
     generate_hamiltonian_solution_dataset,
     hamiltonian_denoise_diagnostic_from_model,
@@ -29,6 +31,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_denoise_ablation,
     print_hamiltonian_denoise_diagnostic,
     print_hamiltonian_denoise_normalization,
+    print_hamiltonian_skeleton_denoise_comparison,
     print_hamiltonian_conditioned_overfit_diagnostic,
     print_hamiltonian_conditioned_overfit_summary,
     print_hamiltonian_mixture_refinement_summary,
@@ -51,6 +54,8 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_conditioned_overfit_diagnostic,
     run_hamiltonian_denoise_ablation,
     run_hamiltonian_denoise_normalization_comparison,
+    run_hamiltonian_skeleton_denoise_comparison,
+    run_hamiltonian_skeleton_denoise_diagnostic,
     refine_hamiltonian_prior_mixture,
     refine_hamiltonian_prior_mixture_budget_sweep,
     run_hamiltonian_prior_mixture_sweep,
@@ -64,10 +69,12 @@ from su2diffusion.hamiltonian import (
     summarize_hamiltonian_denoise_diagnostic,
     summarize_hamiltonian_denoise_ablation,
     summarize_hamiltonian_denoise_normalization,
+    summarize_hamiltonian_skeleton_denoise_comparison,
     summarize_hamiltonian_conditioned_diffusion,
     summarize_hamiltonian_conditioned_overfit_diagnostic,
     summarize_hamiltonian_suite,
     train_hamiltonian_conditioned_circuit_diffusion,
+    train_hamiltonian_skeleton_conditioned_circuit_diffusion,
     train_hamiltonian_slot_prior,
     unitary_from_hamiltonian,
 )
@@ -612,6 +619,93 @@ def test_hamiltonian_denoise_normalization_comparison_smoke(capsys):
     assert rows[0].target_scale == 1.0
     assert rows[1].target_scale > 0.0
     assert rows[2].target_scale == rows[1].target_scale
+    for row in rows:
+        assert row.final_loss >= 0.0
+        assert row.final_relative_mse >= 0.0
+        assert -1.0001 <= row.final_cosine <= 1.0001
+        assert row.final_pred_target_norm_ratio >= 0.0
+
+
+def test_hamiltonian_skeleton_denoise_comparison_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=63,
+    )
+    dataset = generate_hamiltonian_solution_dataset(
+        targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=64,
+        solutions_per_target=2,
+    )
+    config = CircuitExperimentConfig(
+        name="test-skeleton-denoise",
+        schedule=DiffusionSchedule(T=4, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=4, num_steps=2, hidden=16, n_terms=4),
+        sample_count=3,
+        eta=0.2,
+    )
+    model, losses = train_hamiltonian_skeleton_conditioned_circuit_diffusion(
+        dataset,
+        labels,
+        train_config=config.train,
+        schedule=config.schedule,
+        device="cpu",
+        show_progress=False,
+    )
+    direct_rows = evaluate_hamiltonian_skeleton_conditioned_denoising(
+        model,
+        dataset,
+        labels,
+        config.schedule,
+        timesteps=(1,),
+        n_terms=4,
+        device="cpu",
+        seed=65,
+    )
+    diagnostic = run_hamiltonian_skeleton_denoise_diagnostic(
+        dataset,
+        labels,
+        config=config,
+        device="cpu",
+        show_progress=False,
+        timesteps=(1, 4),
+        seed=66,
+    )
+    comparison = run_hamiltonian_skeleton_denoise_comparison(
+        dataset,
+        labels,
+        base_config=config,
+        device="cpu",
+        show_progress=False,
+        timesteps=(1, 4),
+        seed=67,
+    )
+    rows = summarize_hamiltonian_skeleton_denoise_comparison(comparison)
+    print_hamiltonian_skeleton_denoise_comparison(comparison)
+
+    captured = capsys.readouterr().out
+    assert "H+slot labels" in captured
+    assert isinstance(comparison, HamiltonianSkeletonDenoiseComparisonResult)
+    assert len(losses) == 2
+    assert len(direct_rows) == 1
+    assert len(diagnostic.rows) == 2
+    assert len(rows) == 2
+    assert [row.variant for row in rows] == ["H-only", "H+slot labels"]
     for row in rows:
         assert row.final_loss >= 0.0
         assert row.final_relative_mse >= 0.0
