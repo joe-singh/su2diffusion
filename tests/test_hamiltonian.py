@@ -13,6 +13,7 @@ from su2diffusion.hamiltonian import (
     make_random_pauli_hamiltonian_targets,
     parse_pauli_string,
     pauli_string_matrix,
+    print_hamiltonian_budget_refinement_summary,
     print_hamiltonian_mixture_refinement_summary,
     print_hamiltonian_prior_mixture_summary,
     print_hamiltonian_prior_search,
@@ -29,6 +30,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_two_entangler_benchmark,
     print_hamiltonian_two_entangler_summary,
     refine_hamiltonian_prior_mixture,
+    refine_hamiltonian_prior_mixture_budget_sweep,
     run_hamiltonian_prior_mixture_sweep,
     run_hamiltonian_prior_search_benchmark,
     run_hamiltonian_seed_ablation,
@@ -436,6 +438,14 @@ def test_hamiltonian_prior_search_smoke(capsys):
         threshold=0.5,
     )
     print_hamiltonian_mixture_refinement_summary(refined)
+    budgeted = refine_hamiltonian_prior_mixture_budget_sweep(
+        mixture,
+        local_gates=centers,
+        budgets=(1, 2),
+        refinement_lr=0.02,
+        threshold=0.5,
+    )
+    print_hamiltonian_budget_refinement_summary(budgeted)
 
     captured = capsys.readouterr().out
     assert "learned prior" in captured
@@ -445,6 +455,8 @@ def test_hamiltonian_prior_search_smoke(capsys):
     assert len(benchmark.benchmarks) == 2
     assert set(mixture.alpha_results) == {0.0, 1.0}
     assert len(refined.rows) == 4
+    assert len(budgeted.rows) == 8
     assert all(item.prior_report.candidates for item in benchmark.benchmarks)
     assert all(0.0 <= item.prior_report.candidates[0].fidelity <= 1.0 for item in benchmark.benchmarks)
     assert all(0.0 <= row.refined_fidelity <= 1.0 for row in refined.rows)
+    assert all(0.0 <= row.refined_fidelity <= 1.0 for row in budgeted.rows)
