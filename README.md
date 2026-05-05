@@ -86,3 +86,31 @@ near-Clifford targets are solved by search plus local `SU(2)` refinement, and
 the refined six-gate stacks train a second joint circuit diffusion model. This
 tests whether learning from successful circuits improves proposal quality over
 random near-Clifford circuit stacks.
+
+## Hamiltonian Synthesis Workflow
+
+The current Hamiltonian-to-circuit path synthesizes two-qubit targets
+
+```text
+U(t) = exp(-i H t)
+```
+
+with the fixed depth-2 template
+
+```text
+(A tensor B) CZ (C tensor D) CZ (E tensor F)
+```
+
+where each local gate is represented on `SU(2)`. The default baseline is:
+
+1. train the conditional single-qubit `SU(2)` generator;
+2. sample generated local gates;
+3. search uniformly over six-slot generated-gate candidates;
+4. refine the best candidate directly on `SU(2)^6`.
+
+The notebook also keeps learned slot-label prior experiments as optional
+diagnostics. Those priors can help on nearby/easy Hamiltonian distributions, but
+the harder 15-term Pauli stress test showed poor distribution transfer. For now,
+uniform generated search plus local `SU(2)` refinement is the main synthesis
+baseline; learned priors should be revisited only with a more principled
+Hamiltonian family or a continuous circuit-diffusion objective.
