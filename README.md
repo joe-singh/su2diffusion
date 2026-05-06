@@ -174,3 +174,9 @@ architecture and the same held-out suite for every row, so the resulting curve
 asks a direct question: does more refined Hamiltonian solution data improve
 fresh-target proposal quality, or was the strong train-target result mostly
 memorization?
+
+The follow-up training-budget check fixes the larger Hamiltonian dataset and
+instead varies the number of token-denoiser optimization steps. This separates a
+data effect from an undertraining effect: if held-out proposal quality recovers
+as the step budget grows, the next scale-up should increase data and training
+budget together before changing model architecture.
