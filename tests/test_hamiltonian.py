@@ -16,6 +16,7 @@ from su2diffusion.hamiltonian import (
     HamiltonianTokenRepeatabilityResult,
     HamiltonianRepeatabilityRefinementResult,
     HamiltonianLevel1HeadlineResult,
+    HamiltonianTemplateComparisonResult,
     HamiltonianConditionedOverfitDiagnosticResult,
     HamiltonianStackPredictor,
     HamiltonianPriorTrainConfig,
@@ -58,6 +59,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_target,
     print_hamiltonian_solution_dataset,
     print_hamiltonian_solution_dataset_summary,
+    print_hamiltonian_template_comparison,
     print_hamiltonian_seed_ablation,
     print_hamiltonian_seed_ablation_summary,
     print_hamiltonian_supervised_summary,
@@ -91,6 +93,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_supervised_baseline,
     run_hamiltonian_supervised_split_baseline,
     run_hamiltonian_suite_benchmark,
+    run_hamiltonian_template_comparison,
     run_hamiltonian_two_entangler_benchmark,
     sample_hamiltonian_conditioned_circuit_reverse,
     summarize_hamiltonian_denoise_diagnostic,
@@ -294,6 +297,74 @@ def test_hamiltonian_solution_dataset_can_keep_multiple_solutions_per_target():
     assert len(dataset.targets) == 4
     assert len({target.name for target in dataset.targets}) == 2
     assert torch.allclose(dataset.stacks.norm(dim=-1), torch.ones(4, 6), atol=1e-5)
+
+
+def test_hamiltonian_solution_dataset_supports_three_entanglers():
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=23,
+    )
+
+    dataset = generate_hamiltonian_solution_dataset(
+        targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_entanglers=3,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=24,
+    )
+
+    assert dataset.stacks.shape == (2, 8, 4)
+    assert len(dataset.refinements[0].slot_labels) == 8
+    assert torch.allclose(dataset.stacks.norm(dim=-1), torch.ones(2, 8), atol=1e-5)
+
+
+def test_hamiltonian_template_comparison_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=25,
+    )
+
+    result = run_hamiltonian_template_comparison(
+        targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=26,
+    )
+    print_hamiltonian_template_comparison(result)
+
+    captured = capsys.readouterr().out
+    assert isinstance(result, HamiltonianTemplateComparisonResult)
+    assert "3 CZ" in captured
+    assert result.rows[0].n_slots == 6
+    assert result.rows[1].n_slots == 8
 
 
 def test_hamiltonian_conditioned_circuit_diffusion_smoke(capsys):

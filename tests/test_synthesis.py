@@ -3,6 +3,7 @@ import torch
 from su2diffusion.synthesis import (
     SynthesisCandidate,
     bell_state_fidelity,
+    compose_local_entangler_chain_units,
     compose_local_entangler_local,
     compose_two_entangler_local,
     local_layer,
@@ -96,6 +97,26 @@ def test_two_entangler_composition_matches_manual_product():
 
     actual = compose_two_entangler_local(identity, h, cz, h, identity, identity, h)
     expected = local_layer(identity, h) @ cz @ local_layer(h, identity) @ cz @ local_layer(identity, h)
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_local_entangler_chain_supports_three_cz_template():
+    h = quaternion_to_unitary(_h_quaternion())
+    identity = torch.eye(2, dtype=torch.complex64)
+    cz = two_qubit_gate("cz")
+    units = torch.stack([identity, h, h, identity, identity, h, h, h])
+
+    actual = compose_local_entangler_chain_units(units, cz)
+    expected = (
+        local_layer(identity, h)
+        @ cz
+        @ local_layer(h, identity)
+        @ cz
+        @ local_layer(identity, h)
+        @ cz
+        @ local_layer(h, h)
+    )
 
     assert torch.allclose(actual, expected, atol=1e-6)
 
@@ -558,6 +579,45 @@ def test_two_entangler_refinement_improves_perturbed_candidate(capsys):
     assert result.refined_gates.shape == (6, 4)
     assert result.refined_fidelity > result.initial_fidelity + 1e-3
     assert result.refined_fidelity > 0.99
+
+
+def test_three_entangler_random_report_and_refinement_use_eight_slots():
+    exact_gates = torch.stack(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            _h_quaternion(),
+        ]
+    )
+    units = quaternion_to_unitary(exact_gates)
+    target = compose_local_entangler_chain_units(
+        torch.stack([units[0], units[1], units[0], units[1], units[0], units[1], units[0], units[1]]),
+        two_qubit_gate("cz"),
+    )
+
+    report = synthesize_unitary_two_entangler_random_report(
+        exact_gates,
+        target_unitary=target,
+        target_name="depth3",
+        entangler="cz",
+        n_entanglers=3,
+        n_candidates=64,
+        top_k=1,
+        local_labels=["I", "H"],
+        keep_fidelities=False,
+    )
+    candidate = report.candidates[0]
+    result = refine_two_entangler_candidate(
+        exact_gates,
+        candidate,
+        target,
+        num_steps=2,
+        lr=0.01,
+    )
+
+    assert report.mode == "3-entangler-random"
+    assert len(candidate.slot_indices) == 8
+    assert result.refined_gates.shape == (8, 4)
+    assert torch.allclose(result.refined_gates.norm(dim=-1), torch.ones(8), atol=1e-5)
 
 
 def test_refine_hidden_two_entangler_benchmark_uses_generated_report_candidate():

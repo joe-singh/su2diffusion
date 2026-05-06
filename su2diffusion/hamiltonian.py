@@ -20,7 +20,7 @@ from .synthesis import (
     RefinementResult,
     SynthesisCandidate,
     SynthesisReport,
-    compose_two_entangler_local,
+    compose_local_entangler_chain_units,
     quaternion_to_unitary,
     refine_two_entangler_candidate,
     sample_near_clifford_gates,
@@ -331,6 +331,26 @@ class HamiltonianLevel1HeadlineResult:
     threshold: float
     proposal_advantage_mean: float
     proposal_advantage_std: float
+
+
+@dataclass(frozen=True)
+class HamiltonianTemplateComparisonRow:
+    template: str
+    n_entanglers: int
+    n_slots: int
+    n_stacks: int
+    proposal_mean: float
+    refined_mean: float
+    refinement_success: float
+    median_steps: float
+
+
+@dataclass(frozen=True)
+class HamiltonianTemplateComparisonResult:
+    two_entangler: HamiltonianSolutionDataset
+    three_entangler: HamiltonianSolutionDataset
+    rows: list[HamiltonianTemplateComparisonRow]
+    threshold: float
 
 
 @dataclass(frozen=True)
@@ -651,6 +671,7 @@ def run_hamiltonian_two_entangler_benchmark(
     generated_labels: list[str],
     perturb_scale: float = 0.12,
     entangler: str = "cz",
+    n_entanglers: int = 2,
     n_random_candidates: int = 200_000,
     n_analytic_gates: int = 1024,
     n_haar_gates: int = 1024,
@@ -658,6 +679,8 @@ def run_hamiltonian_two_entangler_benchmark(
     seed: int = 0,
     keep_fidelities: bool = True,
 ) -> HamiltonianSynthesisBenchmark:
+    if n_entanglers <= 0:
+        raise ValueError("n_entanglers must be positive")
     if n_analytic_gates <= 0:
         raise ValueError("n_analytic_gates must be positive")
     if n_haar_gates <= 0:
@@ -682,11 +705,12 @@ def run_hamiltonian_two_entangler_benchmark(
         target_unitary=target_unitary,
         target_name=target.name,
         entangler=entangler,
+        n_entanglers=n_entanglers,
         n_candidates=n_random_candidates,
         top_k=top_k,
         local_labels=clifford_labels,
         seed=seed + 10_000,
-        name=f"{target.name} Clifford random",
+        name=f"{target.name} Clifford {n_entanglers}-entangler random",
         keep_fidelities=keep_fidelities,
     )
     analytic_report = synthesize_unitary_two_entangler_random_report(
@@ -694,11 +718,12 @@ def run_hamiltonian_two_entangler_benchmark(
         target_unitary=target_unitary,
         target_name=target.name,
         entangler=entangler,
+        n_entanglers=n_entanglers,
         n_candidates=n_random_candidates,
         top_k=top_k,
         local_labels=analytic_labels,
         seed=seed + 15_000,
-        name=f"{target.name} analytic near-Clifford random",
+        name=f"{target.name} analytic near-Clifford {n_entanglers}-entangler random",
         keep_fidelities=keep_fidelities,
     )
     generated_report = synthesize_unitary_two_entangler_random_report(
@@ -706,11 +731,12 @@ def run_hamiltonian_two_entangler_benchmark(
         target_unitary=target_unitary,
         target_name=target.name,
         entangler=entangler,
+        n_entanglers=n_entanglers,
         n_candidates=n_random_candidates,
         top_k=top_k,
         local_labels=generated_labels,
         seed=seed + 20_000,
-        name=f"{target.name} generated random",
+        name=f"{target.name} generated {n_entanglers}-entangler random",
         keep_fidelities=keep_fidelities,
     )
     haar_report = synthesize_unitary_two_entangler_random_report(
@@ -718,11 +744,12 @@ def run_hamiltonian_two_entangler_benchmark(
         target_unitary=target_unitary,
         target_name=target.name,
         entangler=entangler,
+        n_entanglers=n_entanglers,
         n_candidates=n_random_candidates,
         top_k=top_k,
         local_labels=haar_labels,
         seed=seed + 40_000,
-        name=f"{target.name} Haar random",
+        name=f"{target.name} Haar {n_entanglers}-entangler random",
         keep_fidelities=keep_fidelities,
     )
     return HamiltonianSynthesisBenchmark(
@@ -742,6 +769,7 @@ def run_hamiltonian_suite_benchmark(
     generated_labels: list[str],
     perturb_scale: float = 0.12,
     entangler: str = "cz",
+    n_entanglers: int = 2,
     n_random_candidates: int = 100_000,
     n_analytic_gates: int = 1024,
     n_haar_gates: int = 1024,
@@ -760,6 +788,7 @@ def run_hamiltonian_suite_benchmark(
             generated_labels=generated_labels,
             perturb_scale=perturb_scale,
             entangler=entangler,
+            n_entanglers=n_entanglers,
             n_random_candidates=n_random_candidates,
             n_analytic_gates=n_analytic_gates,
             n_haar_gates=n_haar_gates,
@@ -780,6 +809,7 @@ def generate_hamiltonian_solution_dataset(
     generated_labels: list[str],
     perturb_scale: float = 0.12,
     entangler: str = "cz",
+    n_entanglers: int = 2,
     n_random_candidates: int = 100_000,
     n_analytic_gates: int = 1024,
     n_haar_gates: int = 1024,
@@ -809,6 +839,7 @@ def generate_hamiltonian_solution_dataset(
         generated_labels=generated_labels,
         perturb_scale=perturb_scale,
         entangler=entangler,
+        n_entanglers=n_entanglers,
         n_random_candidates=n_random_candidates,
         n_analytic_gates=n_analytic_gates,
         n_haar_gates=n_haar_gates,
@@ -852,15 +883,7 @@ def generate_hamiltonian_solution_dataset(
 def _stack_unitary(q_stack: torch.Tensor, entangler: str = "cz") -> torch.Tensor:
     units = quaternion_to_unitary(q_stack)
     entangler_unitary = two_qubit_gate(entangler, device=q_stack.device)
-    return compose_two_entangler_local(
-        units[0],
-        units[1],
-        entangler_unitary,
-        units[2],
-        units[3],
-        units[4],
-        units[5],
-    )
+    return compose_local_entangler_chain_units(units, entangler_unitary)
 
 
 def _stack_fidelity(q_stack: torch.Tensor, target: HamiltonianTarget, entangler: str = "cz") -> float:
@@ -871,6 +894,7 @@ def _candidate_from_stack(
     target: HamiltonianTarget,
     seed_type: str,
     initial_fidelity: float,
+    n_slots: int = 6,
     entangler: str = "cz",
 ) -> SynthesisCandidate:
     return SynthesisCandidate(
@@ -878,8 +902,8 @@ def _candidate_from_stack(
         template=f"hamiltonian-{seed_type}-stack",
         entangler=entangler,
         fidelity=initial_fidelity,
-        slot_indices=(0, 1, 2, 3, 4, 5),
-        slot_labels=(seed_type,) * 6,
+        slot_indices=tuple(range(n_slots)),
+        slot_labels=(seed_type,) * n_slots,
     )
 
 
@@ -899,6 +923,116 @@ def _refinement_movement(
     movement = su2_distance(q_normalize(start_gates), q_normalize(refined_gates)).detach().cpu()
     slot_movements = tuple(float(value) for value in movement.tolist())
     return slot_movements, float(movement.mean().item()), float(movement.max().item())
+
+
+def _validate_solution_stacks(stacks: torch.Tensor, name: str = "dataset.stacks") -> int:
+    if stacks.ndim != 3 or stacks.shape[-1] != 4:
+        raise ValueError(f"{name} must have shape (n, n_slots, 4)")
+    if stacks.shape[1] < 4 or stacks.shape[1] % 2 != 0:
+        raise ValueError(f"{name} must contain an even number of slots, at least 4")
+    return int(stacks.shape[1])
+
+
+def _template_comparison_row(
+    template: str,
+    dataset: HamiltonianSolutionDataset,
+    threshold: float,
+) -> HamiltonianTemplateComparisonRow:
+    n_slots = _validate_solution_stacks(dataset.stacks)
+    steps = []
+    for refinement in dataset.refinements:
+        step = _steps_to_threshold(
+            refinement.initial_fidelity,
+            refinement.fidelity_trace,
+            threshold,
+        )
+        if step < 0:
+            step = len(refinement.fidelity_trace) + 1
+        steps.append(step)
+    step_tensor = torch.tensor(steps, dtype=torch.float32, device=dataset.refined_fidelities.device)
+    return HamiltonianTemplateComparisonRow(
+        template=template,
+        n_entanglers=n_slots // 2 - 1,
+        n_slots=n_slots,
+        n_stacks=len(dataset.targets),
+        proposal_mean=float(dataset.initial_fidelities.mean().item()),
+        refined_mean=float(dataset.refined_fidelities.mean().item()),
+        refinement_success=float((dataset.refined_fidelities >= threshold).float().mean().item()),
+        median_steps=float(step_tensor.median().item()),
+    )
+
+
+def run_hamiltonian_template_comparison(
+    targets: list[HamiltonianTarget],
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    perturb_scale: float = 0.12,
+    entangler: str = "cz",
+    n_random_candidates: int = 100_000,
+    n_analytic_gates: int = 1024,
+    n_haar_gates: int = 1024,
+    top_k: int = 5,
+    seed: int = 0,
+    refinement_steps: int = 50,
+    refinement_lr: float = 0.05,
+    threshold: float = 0.99,
+    fidelity_threshold: float = 0.0,
+    solutions_per_target: int = 1,
+) -> HamiltonianTemplateComparisonResult:
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("threshold must be between 0 and 1")
+
+    two_entangler = generate_hamiltonian_solution_dataset(
+        targets,
+        clifford_gates=clifford_gates,
+        clifford_labels=clifford_labels,
+        generated_gates=generated_gates,
+        generated_labels=generated_labels,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        n_entanglers=2,
+        n_random_candidates=n_random_candidates,
+        n_analytic_gates=n_analytic_gates,
+        n_haar_gates=n_haar_gates,
+        top_k=top_k,
+        seed=seed,
+        refinement_steps=refinement_steps,
+        refinement_lr=refinement_lr,
+        fidelity_threshold=fidelity_threshold,
+        solutions_per_target=solutions_per_target,
+    )
+    three_entangler = generate_hamiltonian_solution_dataset(
+        targets,
+        clifford_gates=clifford_gates,
+        clifford_labels=clifford_labels,
+        generated_gates=generated_gates,
+        generated_labels=generated_labels,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        n_entanglers=3,
+        n_random_candidates=n_random_candidates,
+        n_analytic_gates=n_analytic_gates,
+        n_haar_gates=n_haar_gates,
+        top_k=top_k,
+        seed=seed + 100_000,
+        refinement_steps=refinement_steps,
+        refinement_lr=refinement_lr,
+        fidelity_threshold=fidelity_threshold,
+        solutions_per_target=solutions_per_target,
+    )
+    return HamiltonianTemplateComparisonResult(
+        two_entangler=two_entangler,
+        three_entangler=three_entangler,
+        rows=[
+            _template_comparison_row("2 CZ / 6 local gates", two_entangler, threshold),
+            _template_comparison_row("3 CZ / 8 local gates", three_entangler, threshold),
+        ],
+        threshold=threshold,
+    )
 
 
 def _aligned_stack_mse(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -990,7 +1124,7 @@ def evaluate_hamiltonian_stack_predictor(
     if refine:
         refined_results = []
         for stack, target, fidelity in zip(predicted_stacks, targets, raw_fidelities.tolist()):
-            candidate = _candidate_from_stack(target, "predicted", fidelity, entangler=entangler)
+            candidate = _candidate_from_stack(target, "predicted", fidelity, n_slots=stack.shape[0], entangler=entangler)
             refined_results.append(
                 refine_two_entangler_candidate(
                     stack,
@@ -1117,8 +1251,7 @@ def estimate_hamiltonian_denoise_target_scale(
 ) -> float:
     if not dataset.targets:
         raise ValueError("dataset must contain at least one Hamiltonian target")
-    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
-        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    _validate_solution_stacks(dataset.stacks)
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     if n_batches <= 0:
@@ -1158,8 +1291,7 @@ def train_hamiltonian_conditioned_circuit_diffusion(
 ) -> tuple[TargetConditionedCircuitDenoiser, list[float]]:
     if not dataset.targets:
         raise ValueError("dataset must contain at least one Hamiltonian target")
-    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
-        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    n_slots = _validate_solution_stacks(dataset.stacks)
     if dataset.stacks.shape[0] != len(dataset.targets):
         raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
 
@@ -1174,6 +1306,7 @@ def train_hamiltonian_conditioned_circuit_diffusion(
     torch.manual_seed(train_config.seed)
     model = TargetConditionedCircuitDenoiser(
         T=schedule.T,
+        n_slots=n_slots,
         target_dim=features.shape[1],
         hidden=train_config.hidden,
     ).to(device)
@@ -1232,8 +1365,7 @@ def train_hamiltonian_skeleton_conditioned_circuit_diffusion(
 ) -> tuple[TargetLabelConditionedCircuitDenoiser, list[float]]:
     if not dataset.targets:
         raise ValueError("dataset must contain at least one Hamiltonian target")
-    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
-        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    n_slots = _validate_solution_stacks(dataset.stacks)
     if dataset.stacks.shape[0] != len(dataset.targets):
         raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
 
@@ -1249,6 +1381,7 @@ def train_hamiltonian_skeleton_conditioned_circuit_diffusion(
     torch.manual_seed(train_config.seed)
     model = TargetLabelConditionedCircuitDenoiser(
         T=schedule.T,
+        n_slots=n_slots,
         target_dim=features.shape[1],
         num_labels=len(label_names),
         hidden=train_config.hidden,
@@ -1308,8 +1441,7 @@ def train_hamiltonian_slotwise_circuit_diffusion(
 ) -> tuple[SlotwiseTargetConditionedCircuitDenoiser, list[float]]:
     if not dataset.targets:
         raise ValueError("dataset must contain at least one Hamiltonian target")
-    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
-        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    n_slots = _validate_solution_stacks(dataset.stacks)
     if dataset.stacks.shape[0] != len(dataset.targets):
         raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
 
@@ -1324,6 +1456,7 @@ def train_hamiltonian_slotwise_circuit_diffusion(
     torch.manual_seed(train_config.seed)
     model = SlotwiseTargetConditionedCircuitDenoiser(
         T=schedule.T,
+        n_slots=n_slots,
         target_dim=features.shape[1],
         hidden=train_config.hidden,
     ).to(device)
@@ -1381,8 +1514,7 @@ def train_hamiltonian_token_circuit_diffusion(
 ) -> tuple[TargetConditionedCircuitTokenDenoiser, list[float]]:
     if not dataset.targets:
         raise ValueError("dataset must contain at least one Hamiltonian target")
-    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
-        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    n_slots = _validate_solution_stacks(dataset.stacks)
     if dataset.stacks.shape[0] != len(dataset.targets):
         raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
 
@@ -1397,6 +1529,7 @@ def train_hamiltonian_token_circuit_diffusion(
     torch.manual_seed(train_config.seed)
     model = TargetConditionedCircuitTokenDenoiser(
         T=schedule.T,
+        n_slots=n_slots,
         target_dim=features.shape[1],
         hidden=train_config.hidden,
     ).to(device)
@@ -2205,6 +2338,7 @@ def run_hamiltonian_repeatability_refinement_benchmark(
                     target,
                     "token",
                     token_candidate.fidelity,
+                    n_slots=token_stack.shape[0],
                     entangler=entangler,
                 ),
                 target_unitary=target.unitary,
@@ -2284,8 +2418,7 @@ def evaluate_hamiltonian_conditioned_denoising(
 ) -> list[HamiltonianDenoiseDiagnosticRow]:
     if not dataset.targets:
         raise ValueError("dataset must contain at least one Hamiltonian target")
-    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
-        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    _validate_solution_stacks(dataset.stacks)
     if dataset.stacks.shape[0] != len(dataset.targets):
         raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
 
@@ -2348,8 +2481,7 @@ def evaluate_hamiltonian_skeleton_conditioned_denoising(
 ) -> list[HamiltonianDenoiseDiagnosticRow]:
     if not dataset.targets:
         raise ValueError("dataset must contain at least one Hamiltonian target")
-    if dataset.stacks.ndim != 3 or dataset.stacks.shape[1:] != (6, 4):
-        raise ValueError("dataset.stacks must have shape (n, 6, 4)")
+    _validate_solution_stacks(dataset.stacks)
     if dataset.stacks.shape[0] != len(dataset.targets):
         raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
 
@@ -2922,9 +3054,10 @@ def _slot_label_targets(
 ) -> torch.Tensor:
     label_to_index = {label: i for i, label in enumerate(label_names)}
     rows = []
+    n_slots = _validate_solution_stacks(dataset.stacks)
     for refinement in dataset.refinements:
-        if len(refinement.slot_labels) != 6:
-            raise ValueError("Hamiltonian prior training expects six slot labels per refinement")
+        if len(refinement.slot_labels) != n_slots:
+            raise ValueError(f"Hamiltonian prior training expects {n_slots} slot labels per refinement")
         row = []
         for label in refinement.slot_labels:
             if label not in label_to_index:
@@ -2985,10 +3118,6 @@ def train_hamiltonian_slot_prior(
     )
 
 
-def _batched_local_layer(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("nab,ncd->nacbd", a, b).reshape(a.shape[0], 4, 4)
-
-
 def _indices_by_label(local_labels: list[str], label_names: tuple[str, ...], device: torch.device) -> list[torch.Tensor]:
     pools = []
     for label in label_names:
@@ -3006,13 +3135,14 @@ def _sample_prior_slots(
     n_candidates: int,
     generator: torch.Generator,
 ) -> torch.Tensor:
-    if probabilities.shape != (6, len(label_names)):
-        raise ValueError("probabilities must have shape (6, n_labels)")
+    if probabilities.ndim != 2 or probabilities.shape[1] != len(label_names):
+        raise ValueError("probabilities must have shape (n_slots, n_labels)")
     device = probabilities.device
+    n_slots = probabilities.shape[0]
     pools = _indices_by_label(local_labels, label_names, device=device)
     label_slots = torch.multinomial(probabilities, num_samples=n_candidates, replacement=True, generator=generator).T
-    slots = torch.empty(n_candidates, 6, dtype=torch.long, device=device)
-    for slot in range(6):
+    slots = torch.empty(n_candidates, n_slots, dtype=torch.long, device=device)
+    for slot in range(n_slots):
         for label_index, pool in enumerate(pools):
             mask = label_slots[:, slot] == label_index
             n_items = int(mask.sum().item())
@@ -3069,11 +3199,9 @@ def synthesize_hamiltonian_prior_search_report(
     units = quaternion_to_unitary(local_gates)
     target_unitary = target.unitary.to(device=device, dtype=torch.complex64)
     entangler_unitary = two_qubit_gate(entangler, device=device)
-    first = _batched_local_layer(units[indices[:, 0]], units[indices[:, 1]])
-    middle = _batched_local_layer(units[indices[:, 2]], units[indices[:, 3]])
-    second = _batched_local_layer(units[indices[:, 4]], units[indices[:, 5]])
-    entanglers = entangler_unitary.expand(n_candidates, 4, 4)
-    unitaries = first @ entanglers @ middle @ entanglers @ second
+    n_slots = indices.shape[1]
+    n_entanglers = n_slots // 2 - 1
+    unitaries = compose_local_entangler_chain_units(units[indices], entangler_unitary)
     fidelities = unitary_fidelity_batch(unitaries, target_unitary)
     values, rows = torch.topk(fidelities, k=min(top_k, fidelities.numel()))
 
@@ -3083,7 +3211,7 @@ def synthesize_hamiltonian_prior_search_report(
         candidates.append(
             SynthesisCandidate(
                 target=target.name.lower(),
-                template="hamiltonian-prior-two-entangler-local",
+                template=f"hamiltonian-prior-{n_entanglers}-entangler-local",
                 entangler=entangler,
                 fidelity=value,
                 slot_indices=tuple(slots),
@@ -3285,8 +3413,9 @@ def run_hamiltonian_seed_ablation(
         raise ValueError("targets must contain at least one target")
     if len(targets) != len(generated_suite.benchmarks):
         raise ValueError("targets and generated_suite must have the same length")
-    if predicted_stacks.shape != (len(targets), 6, 4):
-        raise ValueError("predicted_stacks must have shape (n_targets, 6, 4)")
+    n_slots = _validate_solution_stacks(predicted_stacks, name="predicted_stacks")
+    if predicted_stacks.shape[0] != len(targets):
+        raise ValueError(f"predicted_stacks must have shape (n_targets, {n_slots}, 4)")
     if n_haar_seeds <= 0:
         raise ValueError("n_haar_seeds must be positive")
     if refinement_steps <= 0:
@@ -3301,7 +3430,7 @@ def run_hamiltonian_seed_ablation(
 
     def add_seed(target: HamiltonianTarget, seed_type: str, stack: torch.Tensor) -> None:
         initial = _stack_fidelity(stack, target, entangler=entangler)
-        candidate = _candidate_from_stack(target, seed_type, initial, entangler=entangler)
+        candidate = _candidate_from_stack(target, seed_type, initial, n_slots=stack.shape[0], entangler=entangler)
         refinement = refine_two_entangler_candidate(
             stack,
             candidate,
@@ -3330,7 +3459,7 @@ def run_hamiltonian_seed_ablation(
         best_haar_stack = None
         best_haar_fidelity = -1.0
         for _ in range(n_haar_seeds):
-            stack = sample_haar(6, device=device, generator=generator)
+            stack = sample_haar(n_slots, device=device, generator=generator)
             fidelity = _stack_fidelity(stack, target, entangler=entangler)
             if fidelity > best_haar_fidelity:
                 best_haar_stack = stack
@@ -4146,6 +4275,23 @@ def print_hamiltonian_solution_dataset_summary(dataset: HamiltonianSolutionDatas
     )
 
 
+def print_hamiltonian_template_comparison(result: HamiltonianTemplateComparisonResult) -> None:
+    header = "template               CZs   slots   stacks   proposal   refined   >=threshold   median steps"
+    print(header)
+    print("-" * len(header))
+    for row in result.rows:
+        print(
+            f"{row.template:<22} "
+            f"{row.n_entanglers:<5} "
+            f"{row.n_slots:<7} "
+            f"{row.n_stacks:<6} "
+            f"{row.proposal_mean:>8.4f}   "
+            f"{row.refined_mean:>7.4f}   "
+            f"{row.refinement_success:>10.1%}   "
+            f"{row.median_steps:>12.1f}"
+        )
+
+
 def print_hamiltonian_supervised_summary(result: HamiltonianSupervisedResult) -> None:
     raw = result.raw_fidelities
     refined = None
@@ -4912,4 +5058,21 @@ def plot_hamiltonian_solution_dataset(dataset: HamiltonianSolutionDataset) -> No
     plt.ylabel("unitary fidelity")
     plt.title("Hamiltonian solution-stack refinement dataset")
     plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_template_comparison(result: HamiltonianTemplateComparisonResult) -> None:
+    values = [
+        result.two_entangler.initial_fidelities.detach().cpu().tolist(),
+        result.three_entangler.initial_fidelities.detach().cpu().tolist(),
+        result.two_entangler.refined_fidelities.detach().cpu().tolist(),
+        result.three_entangler.refined_fidelities.detach().cpu().tolist(),
+    ]
+    labels = ["2 CZ proposal", "3 CZ proposal", "2 CZ refined", "3 CZ refined"]
+    plt.figure(figsize=(8, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("unitary fidelity")
+    plt.title("Two-qubit template comparison")
+    plt.ylim(0.0, 1.02)
+    plt.xticks(rotation=15, ha="right")
     plt.tight_layout()
