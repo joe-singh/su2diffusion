@@ -14,7 +14,7 @@ from .model import (
     TargetConditionedCircuitTokenDenoiser,
     TargetLabelConditionedCircuitDenoiser,
 )
-from .quaternion import q_exp, q_mul, q_normalize, sample_haar
+from .quaternion import q_exp, q_mul, q_normalize, sample_haar, su2_distance
 from .synthesis import (
     HiddenShallowCircuitAggregate,
     RefinementResult,
@@ -299,6 +299,9 @@ class HamiltonianRepeatabilityRefinementRow:
     initial_fidelity: float
     refined_fidelity: float
     steps_to_threshold: int
+    slot_movements: tuple[float, ...]
+    movement_mean: float
+    movement_max: float
 
 
 @dataclass
@@ -865,6 +868,15 @@ def _steps_to_threshold(initial_fidelity: float, trace: tuple[float, ...], thres
         if value >= threshold:
             return i
     return -1
+
+
+def _refinement_movement(
+    start_gates: torch.Tensor,
+    refined_gates: torch.Tensor,
+) -> tuple[tuple[float, ...], float, float]:
+    movement = su2_distance(q_normalize(start_gates), q_normalize(refined_gates)).detach().cpu()
+    slot_movements = tuple(float(value) for value in movement.tolist())
+    return slot_movements, float(movement.mean().item()), float(movement.max().item())
 
 
 def _aligned_stack_mse(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -2178,6 +2190,10 @@ def run_hamiltonian_repeatability_refinement_benchmark(
                 num_steps=refinement_steps,
                 lr=refinement_lr,
             )
+            token_movements, token_movement_mean, token_movement_max = _refinement_movement(
+                token_stack,
+                token_refinement.refined_gates,
+            )
             rows.append(
                 HamiltonianRepeatabilityRefinementRow(
                     run=run,
@@ -2190,10 +2206,14 @@ def run_hamiltonian_repeatability_refinement_benchmark(
                         token_refinement.fidelity_trace,
                         threshold,
                     ),
+                    slot_movements=token_movements,
+                    movement_mean=token_movement_mean,
+                    movement_max=token_movement_max,
                 )
             )
 
             generated_candidate = benchmark.generated_report.candidates[0]
+            generated_start = q_normalize(generated_gates[list(generated_candidate.slot_indices)])
             generated_refinement = refine_two_entangler_candidate(
                 generated_gates,
                 generated_candidate,
@@ -2201,6 +2221,10 @@ def run_hamiltonian_repeatability_refinement_benchmark(
                 entangler=entangler,
                 num_steps=refinement_steps,
                 lr=refinement_lr,
+            )
+            generated_movements, generated_movement_mean, generated_movement_max = _refinement_movement(
+                generated_start,
+                generated_refinement.refined_gates,
             )
             rows.append(
                 HamiltonianRepeatabilityRefinementRow(
@@ -2214,6 +2238,9 @@ def run_hamiltonian_repeatability_refinement_benchmark(
                         generated_refinement.fidelity_trace,
                         threshold,
                     ),
+                    slot_movements=generated_movements,
+                    movement_mean=generated_movement_mean,
+                    movement_max=generated_movement_max,
                 )
             )
 
@@ -3746,7 +3773,7 @@ def print_hamiltonian_repeatability_refinement(
     result: HamiltonianRepeatabilityRefinementResult,
     max_rows: int | None = 10,
 ) -> None:
-    header = "run   target      source             before   after    steps"
+    header = "run   target      source             before   after    steps   move mean   move max"
     print(header)
     print("-" * len(header))
     rows = result.rows if max_rows is None else result.rows[:max_rows]
@@ -3758,7 +3785,9 @@ def print_hamiltonian_repeatability_refinement(
             f"{row.source:<18} "
             f"{row.initial_fidelity:>6.4f}   "
             f"{row.refined_fidelity:>6.4f}   "
-            f"{steps:>6}"
+            f"{steps:>6}   "
+            f"{row.movement_mean:>9.4f}   "
+            f"{row.movement_max:>8.4f}"
         )
     if max_rows is not None and len(result.rows) > max_rows:
         print(f"... {len(result.rows) - max_rows} more")
@@ -3767,12 +3796,14 @@ def print_hamiltonian_repeatability_refinement(
 def print_hamiltonian_repeatability_refinement_summary(
     result: HamiltonianRepeatabilityRefinementResult,
 ) -> None:
-    header = "source             n   mean before   mean after   >=threshold   median steps"
+    header = "source             n   mean before   mean after   >=threshold   median steps   mean move   max move"
     print(header)
     print("-" * len(header))
     for source, rows in _repeatability_refinement_groups(result).items():
         before = torch.tensor([row.initial_fidelity for row in rows], dtype=torch.float32)
         after = torch.tensor([row.refined_fidelity for row in rows], dtype=torch.float32)
+        mean_moves = torch.tensor([row.movement_mean for row in rows], dtype=torch.float32)
+        max_moves = torch.tensor([row.movement_max for row in rows], dtype=torch.float32)
         reached = after >= result.threshold
         steps = torch.tensor(
             [row.steps_to_threshold for row in rows if row.steps_to_threshold >= 0],
@@ -3784,7 +3815,9 @@ def print_hamiltonian_repeatability_refinement_summary(
             f"{before.mean().item():>11.4f}   "
             f"{after.mean().item():>10.4f}   "
             f"{reached.float().mean().item():>11.1%}   "
-            f"{median_steps:>12.1f}"
+            f"{median_steps:>12.1f}   "
+            f"{mean_moves.mean().item():>9.4f}   "
+            f"{max_moves.max().item():>8.4f}"
         )
 
 
@@ -4436,12 +4469,13 @@ def plot_hamiltonian_repeatability_refinement(
     labels = list(groups)
     before = [[row.initial_fidelity for row in groups[label]] for label in labels]
     after = [[row.refined_fidelity for row in groups[label]] for label in labels]
+    movement = [[row.movement_mean for row in groups[label]] for label in labels]
     steps = []
     for label in labels:
         reached = [row.steps_to_threshold for row in groups[label] if row.steps_to_threshold >= 0]
         steps.append(reached if reached else [float("nan")])
 
-    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11, 4))
+    fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(15, 4))
     positions_before = [i + 1 - 0.15 for i in range(len(labels))]
     positions_after = [i + 1 + 0.15 for i in range(len(labels))]
     ax0.boxplot(before, positions=positions_before, widths=0.25, showmeans=True)
@@ -4462,6 +4496,10 @@ def plot_hamiltonian_repeatability_refinement(
     ax1.boxplot(steps, labels=labels, showmeans=True)
     ax1.set_ylabel(f"steps to F >= {result.threshold:g}")
     ax1.set_title("Refinement speed")
+
+    ax2.boxplot(movement, labels=labels, showmeans=True)
+    ax2.set_ylabel("mean SU(2) movement")
+    ax2.set_title("Proposal movement")
     fig.suptitle("Token vs generated-search refinement basins")
     fig.tight_layout()
 
