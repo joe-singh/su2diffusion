@@ -37,6 +37,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_slotwise_denoise_comparison,
     print_hamiltonian_token_conditioned_diffusion_summary,
     print_hamiltonian_token_denoise_comparison,
+    print_hamiltonian_token_heldout_comparison_summary,
     print_hamiltonian_conditioned_overfit_diagnostic,
     print_hamiltonian_conditioned_overfit_summary,
     print_hamiltonian_mixture_refinement_summary,
@@ -64,6 +65,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_slotwise_denoise_comparison,
     run_hamiltonian_slotwise_denoise_diagnostic,
     run_hamiltonian_token_conditioned_diffusion_benchmark,
+    run_hamiltonian_token_conditioned_overfit_diagnostic,
     run_hamiltonian_token_denoise_comparison,
     run_hamiltonian_token_denoise_diagnostic,
     refine_hamiltonian_prior_mixture,
@@ -83,6 +85,7 @@ from su2diffusion.hamiltonian import (
     summarize_hamiltonian_slotwise_denoise_comparison,
     summarize_hamiltonian_token_conditioned_diffusion,
     summarize_hamiltonian_token_denoise_comparison,
+    summarize_hamiltonian_token_heldout_comparison,
     summarize_hamiltonian_conditioned_diffusion,
     summarize_hamiltonian_conditioned_overfit_diagnostic,
     summarize_hamiltonian_suite,
@@ -903,6 +906,86 @@ def test_hamiltonian_token_denoiser_and_proposal_smoke(capsys):
         assert row.final_relative_mse >= 0.0
         assert -1.0001 <= row.final_cosine <= 1.0001
         assert row.final_pred_target_norm_ratio >= 0.0
+
+
+def test_hamiltonian_token_heldout_benchmark_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    train_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=77,
+    )
+    heldout_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=78,
+    )
+    dataset = generate_hamiltonian_solution_dataset(
+        train_targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        seed=79,
+        solutions_per_target=2,
+    )
+    config = CircuitExperimentConfig(
+        name="test-token-heldout",
+        schedule=DiffusionSchedule(T=4, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=4, num_steps=2, hidden=16, n_terms=4),
+        sample_count=3,
+        eta=0.2,
+    )
+    heldout_suite = run_hamiltonian_suite_benchmark(
+        heldout_targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        keep_fidelities=False,
+        seed=80,
+    )
+    result = run_hamiltonian_token_conditioned_overfit_diagnostic(
+        dataset,
+        heldout_targets=heldout_targets,
+        config=config,
+        device="cpu",
+        show_progress=False,
+        top_k=1,
+    )
+    rows = summarize_hamiltonian_conditioned_overfit_diagnostic(result)
+    comparison = summarize_hamiltonian_token_heldout_comparison(heldout_suite, result)
+    print_hamiltonian_conditioned_overfit_diagnostic(result)
+    print_hamiltonian_conditioned_overfit_summary(result)
+    print_hamiltonian_token_heldout_comparison_summary(heldout_suite, result)
+
+    captured = capsys.readouterr().out
+    assert "heldout targets" in captured
+    assert "Hamiltonian circuit-token heldout" in captured
+    assert isinstance(result, HamiltonianConditionedOverfitDiagnosticResult)
+    assert len(rows) == 2
+    assert len(comparison) == 5
+    assert comparison[-1].mode == "Hamiltonian circuit-token heldout"
+    assert result.train_generated_by_target.shape == (2, 3, 6, 4)
+    assert result.heldout_generated_by_target.shape == (2, 3, 6, 4)
+    assert torch.isfinite(result.heldout_generated_by_target).all()
+    assert torch.allclose(result.heldout_generated_by_target.norm(dim=-1), torch.ones(2, 3, 6), atol=1e-5)
 
 
 def test_hamiltonian_stack_predictor_shapes_and_smoke_training(capsys):
