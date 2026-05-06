@@ -187,3 +187,10 @@ train/test seeds. It reports per-run held-out fidelity, success rates, and the
 advantage over the generated local-gate search baseline, plus mean/std summary
 statistics. This is the first step from exploratory notebook runs toward a
 paper-grade benchmark table.
+
+The refinement-basin follow-up reuses those repeatability runs without
+retraining. For each held-out Hamiltonian it starts the same local `SU(2)^6`
+optimizer from the best circuit-token proposal and from the best generated
+local-gate search proposal, then reports before/after fidelity and steps to a
+target threshold. This asks whether diffusion is merely producing a higher
+initial fidelity, or whether it also places the optimizer in a better basin.
