@@ -167,3 +167,10 @@ solution stacks for one Hamiltonian suite, then reverse-samples proposals for
 fresh held-out Hamiltonians. The held-out report compares token diffusion
 against Clifford, analytic near-Clifford, generated local-gate, and Haar search
 baselines on the same target family.
+
+The current scale-up check repeats that held-out evaluation while increasing
+the number of Hamiltonian training targets. It uses the same circuit-token
+architecture and the same held-out suite for every row, so the resulting curve
+asks a direct question: does more refined Hamiltonian solution data improve
+fresh-target proposal quality, or was the strong train-target result mostly
+memorization?
