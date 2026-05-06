@@ -236,6 +236,35 @@ class HamiltonianTokenDataScaleResult:
 
 
 @dataclass(frozen=True)
+class HamiltonianTokenTrainingBudgetRow:
+    num_steps: int
+    hidden: int
+    batch_size: int
+    n_train_targets: int
+    n_solution_stacks: int
+    final_loss: float
+    train_mean_best: float
+    heldout_mean_best: float
+    generated_mean_best: float
+    heldout_delta_vs_generated: float
+    heldout_median_best: float
+    heldout_min_best: float
+    heldout_max_best: float
+    heldout_success_95: float
+    heldout_success_98: float
+    heldout_success_99: float
+
+
+@dataclass
+class HamiltonianTokenTrainingBudgetResult:
+    train_dataset: HamiltonianSolutionDataset
+    heldout_targets: list[HamiltonianTarget]
+    heldout_baseline: HamiltonianSuiteResult
+    diagnostics: dict[int, HamiltonianConditionedOverfitDiagnosticResult]
+    rows: list[HamiltonianTokenTrainingBudgetRow]
+
+
+@dataclass(frozen=True)
 class HamiltonianSupervisedTrainConfig:
     hidden: int = 256
     num_steps: int = 1000
@@ -1793,6 +1822,148 @@ def run_hamiltonian_token_data_scale_benchmark(
     )
 
 
+def run_hamiltonian_token_training_budget_benchmark(
+    train_target_count: int,
+    train_step_counts: tuple[int, ...] | list[int],
+    heldout_targets: list[HamiltonianTarget],
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    config: CircuitExperimentConfig | str,
+    terms: tuple[str, ...] = ("XI", "IZ", "XX", "ZZ"),
+    coefficient_scale: float = 0.35,
+    time: float = 0.8,
+    train_seed: int = 2607,
+    dataset_seed: int = 2707,
+    heldout_baseline_seed: int = 2807,
+    perturb_scale: float = 0.12,
+    entangler: str = "cz",
+    n_random_candidates: int = 25_000,
+    n_analytic_gates: int = 1024,
+    n_haar_gates: int = 1024,
+    top_k: int = 5,
+    refinement_steps: int = 160,
+    refinement_lr: float = 0.05,
+    fidelity_threshold: float = 0.0,
+    solutions_per_target: int = 2,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> HamiltonianTokenTrainingBudgetResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    if train_target_count <= 0:
+        raise ValueError("train_target_count must be positive")
+    if not train_step_counts:
+        raise ValueError("train_step_counts must contain at least one step count")
+    step_counts = tuple(sorted({int(steps) for steps in train_step_counts}))
+    if step_counts[0] <= 0:
+        raise ValueError("train step counts must be positive")
+    if not heldout_targets:
+        raise ValueError("heldout_targets must contain at least one target")
+
+    device = torch.device(device) if device is not None else generated_gates.device
+    train_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=train_target_count,
+        terms=terms,
+        coefficient_scale=coefficient_scale,
+        time=time,
+        seed=train_seed,
+        device=device,
+    )
+    train_dataset = generate_hamiltonian_solution_dataset(
+        train_targets,
+        clifford_gates=clifford_gates,
+        clifford_labels=clifford_labels,
+        generated_gates=generated_gates,
+        generated_labels=generated_labels,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        n_random_candidates=n_random_candidates,
+        n_analytic_gates=n_analytic_gates,
+        n_haar_gates=n_haar_gates,
+        top_k=max(top_k, solutions_per_target),
+        seed=dataset_seed,
+        refinement_steps=refinement_steps,
+        refinement_lr=refinement_lr,
+        fidelity_threshold=fidelity_threshold,
+        solutions_per_target=solutions_per_target,
+    )
+    heldout_baseline = run_hamiltonian_suite_benchmark(
+        heldout_targets,
+        clifford_gates=clifford_gates,
+        clifford_labels=clifford_labels,
+        generated_gates=generated_gates,
+        generated_labels=generated_labels,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        n_random_candidates=n_random_candidates,
+        n_analytic_gates=n_analytic_gates,
+        n_haar_gates=n_haar_gates,
+        top_k=top_k,
+        seed=heldout_baseline_seed,
+        keep_fidelities=False,
+    )
+    generated_baseline = _aggregate_reports(
+        "generated random",
+        [item.generated_report for item in heldout_baseline.benchmarks],
+    )
+
+    diagnostics: dict[int, HamiltonianConditionedOverfitDiagnosticResult] = {}
+    rows: list[HamiltonianTokenTrainingBudgetRow] = []
+    for steps in step_counts:
+        train_config = replace(config.train, num_steps=steps)
+        budget_config = replace(
+            config,
+            name=f"{config.name}-steps{steps}",
+            train=train_config,
+        )
+        diagnostic = run_hamiltonian_token_conditioned_overfit_diagnostic(
+            train_dataset,
+            heldout_targets=heldout_targets,
+            config=budget_config,
+            device=device,
+            show_progress=show_progress,
+            entangler=entangler,
+            top_k=top_k,
+        )
+        diagnostics[steps] = diagnostic
+
+        train_summary = _aggregate_reports("train targets", diagnostic.train_reports)
+        heldout_summary = _aggregate_reports("heldout targets", diagnostic.heldout_reports)
+        final_loss = float(diagnostic.losses[-1]) if diagnostic.losses else float("nan")
+        rows.append(
+            HamiltonianTokenTrainingBudgetRow(
+                num_steps=steps,
+                hidden=train_config.hidden,
+                batch_size=train_config.batch_size,
+                n_train_targets=len(_unique_hamiltonian_targets(train_dataset.targets)),
+                n_solution_stacks=int(train_dataset.stacks.shape[0]),
+                final_loss=final_loss,
+                train_mean_best=train_summary.mean_best,
+                heldout_mean_best=heldout_summary.mean_best,
+                generated_mean_best=generated_baseline.mean_best,
+                heldout_delta_vs_generated=heldout_summary.mean_best - generated_baseline.mean_best,
+                heldout_median_best=heldout_summary.median_best,
+                heldout_min_best=heldout_summary.min_best,
+                heldout_max_best=heldout_summary.max_best,
+                heldout_success_95=heldout_summary.success_95,
+                heldout_success_98=heldout_summary.success_98,
+                heldout_success_99=heldout_summary.success_99,
+            )
+        )
+
+    return HamiltonianTokenTrainingBudgetResult(
+        train_dataset=train_dataset,
+        heldout_targets=heldout_targets,
+        heldout_baseline=heldout_baseline,
+        diagnostics=diagnostics,
+        rows=rows,
+    )
+
+
 def evaluate_hamiltonian_conditioned_denoising(
     model: TargetConditionedCircuitDenoiser,
     dataset: HamiltonianSolutionDataset,
@@ -2966,6 +3137,12 @@ def summarize_hamiltonian_token_data_scale(
     return result.rows
 
 
+def summarize_hamiltonian_token_training_budget(
+    result: HamiltonianTokenTrainingBudgetResult,
+) -> list[HamiltonianTokenTrainingBudgetRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_conditioned_overfit_diagnostic(
     result: HamiltonianConditionedOverfitDiagnosticResult,
 ) -> list[HiddenShallowCircuitAggregate]:
@@ -3216,6 +3393,23 @@ def print_hamiltonian_token_data_scale_summary(result: HamiltonianTokenDataScale
         print(
             f"{row.n_train_targets:<9} "
             f"{row.n_solution_stacks:<6} "
+            f"{row.final_loss:>10.6f}   "
+            f"{row.train_mean_best:>10.4f}   "
+            f"{row.heldout_mean_best:>12.4f}   "
+            f"{row.generated_mean_best:>8.4f}   "
+            f"{row.heldout_delta_vs_generated:>+9.4f}   "
+            f"{row.heldout_success_95:>6.1%}   {row.heldout_success_98:>6.1%}   {row.heldout_success_99:>6.1%}"
+        )
+
+
+def print_hamiltonian_token_training_budget_summary(result: HamiltonianTokenTrainingBudgetResult) -> None:
+    header = "steps    hidden   final loss   train mean   heldout mean   gen mean   token-gen   >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for row in summarize_hamiltonian_token_training_budget(result):
+        print(
+            f"{row.num_steps:<8} "
+            f"{row.hidden:<8} "
             f"{row.final_loss:>10.6f}   "
             f"{row.train_mean_best:>10.4f}   "
             f"{row.heldout_mean_best:>12.4f}   "
@@ -3781,6 +3975,48 @@ def plot_hamiltonian_token_data_scale(result: HamiltonianTokenDataScaleResult) -
         ax0.set_xscale("log", base=2)
         ax1.set_xscale("log", base=2)
     fig.suptitle("Hamiltonian circuit-token data scale-up")
+    fig.tight_layout()
+
+
+def plot_hamiltonian_token_training_budget(result: HamiltonianTokenTrainingBudgetResult) -> None:
+    rows = summarize_hamiltonian_token_training_budget(result)
+    if not rows:
+        raise ValueError("result must contain at least one training-budget row")
+    steps = [row.num_steps for row in rows]
+    train = [row.train_mean_best for row in rows]
+    heldout = [row.heldout_mean_best for row in rows]
+    generated = [row.generated_mean_best for row in rows]
+    losses = [row.final_loss for row in rows]
+    success_95 = [row.heldout_success_95 for row in rows]
+    success_98 = [row.heldout_success_98 for row in rows]
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    axes[0].plot(steps, losses, marker="o")
+    axes[0].set_xlabel("training steps")
+    axes[0].set_ylabel("final denoising loss")
+    axes[0].set_title("Optimization")
+
+    axes[1].plot(steps, train, marker="o", label="train targets")
+    axes[1].plot(steps, heldout, marker="o", label="heldout targets")
+    axes[1].plot(steps, generated, linestyle="--", color="tab:gray", label="generated-search baseline")
+    axes[1].set_xlabel("training steps")
+    axes[1].set_ylabel("mean best unitary fidelity")
+    axes[1].set_ylim(0.0, 1.02)
+    axes[1].set_title("Proposal quality")
+    axes[1].legend()
+
+    axes[2].plot(steps, success_95, marker="o", label="heldout >= 0.95")
+    axes[2].plot(steps, success_98, marker="o", label="heldout >= 0.98")
+    axes[2].set_xlabel("training steps")
+    axes[2].set_ylabel("heldout success fraction")
+    axes[2].set_ylim(0.0, 1.02)
+    axes[2].set_title("Held-out success")
+    axes[2].legend()
+
+    if len(steps) > 1:
+        for ax in axes:
+            ax.set_xscale("log", base=2)
+    fig.suptitle("Hamiltonian circuit-token training budget")
     fig.tight_layout()
 
 
