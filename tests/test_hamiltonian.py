@@ -1185,6 +1185,8 @@ def test_hamiltonian_token_stack_data_scale_smoke(capsys):
         top_k=1,
         refinement_steps=1,
         refinement_lr=0.02,
+        solution_selection="min_local_rotation",
+        selection_pool_size=2,
         train_steps=1,
         device="cpu",
         show_progress=False,
@@ -1199,6 +1201,7 @@ def test_hamiltonian_token_stack_data_scale_smoke(capsys):
     assert set(result.diagnostics) == {(1, 1), (2, 1)}
     assert len(result.heldout_baseline.benchmarks) == 1
     assert [row.n_slots for row in rows] == [8, 8]
+    assert all(next(diagnostic.model.parameters()).device.type == "cpu" for diagnostic in result.diagnostics.values())
     for row in rows:
         assert row.n_entanglers == 3
         assert row.solutions_per_target == 1

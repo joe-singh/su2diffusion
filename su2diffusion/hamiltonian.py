@@ -1,4 +1,5 @@
 from dataclasses import dataclass, replace
+import gc
 import re
 
 import matplotlib.pyplot as plt
@@ -14,7 +15,7 @@ from .model import (
     TargetConditionedCircuitTokenDenoiser,
     TargetLabelConditionedCircuitDenoiser,
 )
-from .quaternion import q_exp, q_mul, q_normalize, sample_haar, su2_distance
+from .quaternion import q_exp, q_log, q_mul, q_normalize, sample_haar, su2_distance
 from .synthesis import (
     HiddenShallowCircuitAggregate,
     RefinementResult,
@@ -831,9 +832,20 @@ def run_hamiltonian_suite_benchmark(
     top_k: int = 5,
     seed: int = 0,
     keep_fidelities: bool = False,
+    show_progress: bool = False,
 ) -> HamiltonianSuiteResult:
     if not targets:
         raise ValueError("targets must contain at least one Hamiltonian target")
+    iterator = enumerate(targets)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(
+            iterator,
+            total=len(targets),
+            desc=f"Searching {n_entanglers}-CZ Hamiltonian targets",
+            dynamic_ncols=True,
+        )
     benchmarks = [
         run_hamiltonian_two_entangler_benchmark(
             target,
@@ -851,9 +863,71 @@ def run_hamiltonian_suite_benchmark(
             seed=seed + i,
             keep_fidelities=keep_fidelities,
         )
-        for i, target in enumerate(targets)
+        for i, target in iterator
     ]
     return HamiltonianSuiteResult(benchmarks=benchmarks)
+
+
+def _local_rotation_energy(q_stack: torch.Tensor) -> float:
+    q_stack = q_normalize(q_stack)
+    q_stack = torch.where(q_stack[..., :1] < 0.0, -q_stack, q_stack)
+    logs = q_log(q_stack)
+    return float(logs.square().sum().detach().cpu())
+
+
+def _select_refined_solutions(
+    refinements: list[RefinementResult],
+    solutions_per_target: int,
+    fidelity_threshold: float,
+    solution_selection: str,
+) -> list[RefinementResult]:
+    eligible = [item for item in refinements if item.refined_fidelity >= fidelity_threshold]
+    if solution_selection == "top":
+        return eligible[:solutions_per_target]
+    if solution_selection in {"min_local_rotation", "min-local-rotation"}:
+        return sorted(
+            eligible,
+            key=lambda item: (_local_rotation_energy(item.refined_gates), -item.refined_fidelity),
+        )[:solutions_per_target]
+    if solution_selection in {"best_fidelity", "best-fidelity"}:
+        return sorted(
+            eligible,
+            key=lambda item: (-item.refined_fidelity, _local_rotation_energy(item.refined_gates)),
+        )[:solutions_per_target]
+    raise ValueError(
+        "solution_selection must be 'top', 'best_fidelity', or 'min_local_rotation'"
+    )
+
+
+def _clear_cuda_cache_for_device(device: torch.device | str | None) -> None:
+    device = torch.device(device) if device is not None else torch.device("cpu")
+    if device.type == "cuda" and torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _refinement_to_cpu(refinement: RefinementResult) -> RefinementResult:
+    return replace(refinement, refined_gates=refinement.refined_gates.detach().cpu())
+
+
+def _solution_dataset_to_cpu(dataset: HamiltonianSolutionDataset) -> HamiltonianSolutionDataset:
+    return replace(
+        dataset,
+        refinements=[_refinement_to_cpu(refinement) for refinement in dataset.refinements],
+        stacks=dataset.stacks.detach().cpu(),
+        initial_fidelities=dataset.initial_fidelities.detach().cpu(),
+        refined_fidelities=dataset.refined_fidelities.detach().cpu(),
+    )
+
+
+def _overfit_diagnostic_to_cpu(
+    diagnostic: HamiltonianConditionedOverfitDiagnosticResult,
+) -> HamiltonianConditionedOverfitDiagnosticResult:
+    diagnostic.model.to("cpu")
+    diagnostic.train_dataset = _solution_dataset_to_cpu(diagnostic.train_dataset)
+    diagnostic.train_generated_by_target = diagnostic.train_generated_by_target.detach().cpu()
+    diagnostic.heldout_generated_by_target = diagnostic.heldout_generated_by_target.detach().cpu()
+    return diagnostic
 
 
 def generate_hamiltonian_solution_dataset(
@@ -874,6 +948,9 @@ def generate_hamiltonian_solution_dataset(
     refinement_lr: float = 0.05,
     fidelity_threshold: float = 0.0,
     solutions_per_target: int = 1,
+    solution_selection: str = "top",
+    selection_pool_size: int | None = None,
+    show_progress: bool = False,
 ) -> HamiltonianSolutionDataset:
     if not targets:
         raise ValueError("targets must contain at least one Hamiltonian target")
@@ -885,6 +962,9 @@ def generate_hamiltonian_solution_dataset(
         raise ValueError("fidelity_threshold must be between 0 and 1")
     if solutions_per_target <= 0:
         raise ValueError("solutions_per_target must be positive")
+    if selection_pool_size is not None and selection_pool_size <= 0:
+        raise ValueError("selection_pool_size must be positive when provided")
+    pool_size = selection_pool_size or solutions_per_target
 
     suite = run_hamiltonian_suite_benchmark(
         targets,
@@ -898,16 +978,26 @@ def generate_hamiltonian_solution_dataset(
         n_random_candidates=n_random_candidates,
         n_analytic_gates=n_analytic_gates,
         n_haar_gates=n_haar_gates,
-        top_k=max(top_k, solutions_per_target),
+        top_k=max(top_k, pool_size, solutions_per_target),
         seed=seed,
         keep_fidelities=False,
+        show_progress=show_progress,
     )
 
     kept_targets = []
     kept_benchmarks = []
     refinements = []
-    for benchmark in suite.benchmarks:
-        for candidate in benchmark.generated_report.candidates[:solutions_per_target]:
+    iterator = suite.benchmarks
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(iterator, desc="Refining Hamiltonian solution stacks", dynamic_ncols=True)
+    for benchmark in iterator:
+        target_refinements = []
+        candidate_pool = benchmark.generated_report.candidates[:pool_size]
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(target=benchmark.target.name, candidates=len(candidate_pool))
+        for candidate in candidate_pool:
             refinement = refine_two_entangler_candidate(
                 generated_gates,
                 candidate,
@@ -916,10 +1006,16 @@ def generate_hamiltonian_solution_dataset(
                 num_steps=refinement_steps,
                 lr=refinement_lr,
             )
-            if refinement.refined_fidelity >= fidelity_threshold:
-                kept_targets.append(benchmark.target)
-                kept_benchmarks.append(benchmark)
-                refinements.append(refinement)
+            target_refinements.append(refinement)
+        for refinement in _select_refined_solutions(
+            target_refinements,
+            solutions_per_target=solutions_per_target,
+            fidelity_threshold=fidelity_threshold,
+            solution_selection=solution_selection,
+        ):
+            kept_targets.append(benchmark.target)
+            kept_benchmarks.append(benchmark)
+            refinements.append(refinement)
 
     if not refinements:
         raise RuntimeError("No Hamiltonian solution stacks met the fidelity threshold")
@@ -2050,6 +2146,7 @@ def run_hamiltonian_token_data_scale_benchmark(
             refinement_lr=refinement_lr,
             fidelity_threshold=fidelity_threshold,
             solutions_per_target=solutions_per_target,
+            show_progress=show_progress,
         )
         diagnostic = run_hamiltonian_token_conditioned_overfit_diagnostic(
             dataset,
@@ -2115,7 +2212,11 @@ def run_hamiltonian_token_stack_data_scale_benchmark(
     refinement_steps: int = 160,
     refinement_lr: float = 0.05,
     fidelity_threshold: float = 0.0,
+    solution_selection: str = "top",
+    selection_pool_size: int | None = None,
     train_steps: int | None = None,
+    keep_models: bool = False,
+    clear_cuda_cache: bool = True,
     device: torch.device | str | None = None,
     show_progress: bool = True,
 ) -> HamiltonianTokenStackDataScaleResult:
@@ -2161,6 +2262,7 @@ def run_hamiltonian_token_stack_data_scale_benchmark(
         top_k=top_k,
         seed=heldout_baseline_seed,
         keep_fidelities=False,
+        show_progress=show_progress,
     )
     generated_baseline = _aggregate_reports(
         "generated random",
@@ -2170,7 +2272,19 @@ def run_hamiltonian_token_stack_data_scale_benchmark(
     base_train_config = replace(config.train, num_steps=train_steps) if train_steps is not None else config.train
     diagnostics: dict[tuple[int, int], HamiltonianConditionedOverfitDiagnosticResult] = {}
     rows: list[HamiltonianTokenStackDataScaleRow] = []
-    for i, (count, solutions_per_target) in enumerate(parsed_settings):
+    iterator = enumerate(parsed_settings)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(
+            iterator,
+            total=len(parsed_settings),
+            desc=f"Hamiltonian token data-scale rows ({n_entanglers} CZ)",
+            dynamic_ncols=True,
+        )
+    for i, (count, solutions_per_target) in iterator:
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(targets=count, solutions=solutions_per_target)
         train_targets = train_pool[:count]
         dataset = generate_hamiltonian_solution_dataset(
             train_targets,
@@ -2190,6 +2304,9 @@ def run_hamiltonian_token_stack_data_scale_benchmark(
             refinement_lr=refinement_lr,
             fidelity_threshold=fidelity_threshold,
             solutions_per_target=solutions_per_target,
+            solution_selection=solution_selection,
+            selection_pool_size=selection_pool_size,
+            show_progress=show_progress,
         )
         n_slots = _validate_solution_stacks(dataset.stacks)
         diagnostic = run_hamiltonian_token_conditioned_overfit_diagnostic(
@@ -2205,6 +2322,8 @@ def run_hamiltonian_token_stack_data_scale_benchmark(
             entangler=entangler,
             top_k=top_k,
         )
+        if not keep_models:
+            diagnostic = _overfit_diagnostic_to_cpu(diagnostic)
         diagnostics[(count, solutions_per_target)] = diagnostic
 
         train_summary = _aggregate_reports("train targets", diagnostic.train_reports)
@@ -2231,6 +2350,8 @@ def run_hamiltonian_token_stack_data_scale_benchmark(
                 heldout_success_99=heldout_summary.success_99,
             )
         )
+        if clear_cuda_cache:
+            _clear_cuda_cache_for_device(device)
 
     return HamiltonianTokenStackDataScaleResult(
         heldout_targets=heldout_targets,
@@ -2310,6 +2431,7 @@ def run_hamiltonian_token_training_budget_benchmark(
         refinement_lr=refinement_lr,
         fidelity_threshold=fidelity_threshold,
         solutions_per_target=solutions_per_target,
+        show_progress=show_progress,
     )
     heldout_baseline = run_hamiltonian_suite_benchmark(
         heldout_targets,
