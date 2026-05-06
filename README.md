@@ -194,3 +194,6 @@ optimizer from the best circuit-token proposal and from the best generated
 local-gate search proposal, then reports before/after fidelity and steps to a
 target threshold. This asks whether diffusion is merely producing a higher
 initial fidelity, or whether it also places the optimizer in a better basin.
+It also reports mean and max per-slot `SU(2)` movement during refinement, which
+checks whether the optimizer is only polishing the proposal or moving far enough
+to effectively replace it.

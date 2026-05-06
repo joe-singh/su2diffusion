@@ -1228,6 +1228,7 @@ def test_hamiltonian_repeatability_refinement_smoke(capsys):
     captured = capsys.readouterr().out
     assert "token" in captured
     assert "generated-search" in captured
+    assert "move mean" in captured
     assert isinstance(result, HamiltonianRepeatabilityRefinementResult)
     assert len(rows) == 4
     assert {row.source for row in rows} == {"token", "generated-search"}
@@ -1237,6 +1238,10 @@ def test_hamiltonian_repeatability_refinement_smoke(capsys):
         assert 0.0 <= row.initial_fidelity <= 1.0001
         assert 0.0 <= row.refined_fidelity <= 1.0001
         assert row.steps_to_threshold >= -1
+        assert len(row.slot_movements) == 6
+        assert row.movement_mean >= 0.0
+        assert row.movement_max >= row.movement_mean
+        assert all(value >= 0.0 for value in row.slot_movements)
 
 
 def test_hamiltonian_stack_predictor_shapes_and_smoke_training(capsys):
