@@ -94,6 +94,18 @@ def test_circuit_denoiser_output_shape():
     assert eps.shape == (3, 6, 3)
 
 
+def test_circuit_token_denoiser_supports_eight_slots():
+    model = TargetConditionedCircuitTokenDenoiser(T=8, n_slots=8, hidden=16, target_dim=10, num_layers=1, num_heads=4)
+    q_stack = torch.randn(3, 8, 4)
+    q_stack = q_stack / q_stack.norm(dim=-1, keepdim=True)
+    t_idx = torch.tensor([1, 2, 3], dtype=torch.long)
+    features = torch.randn(3, 10)
+
+    eps = model(q_stack, t_idx, features)
+
+    assert eps.shape == (3, 8, 3)
+
+
 def test_target_conditioned_circuit_denoiser_output_shape():
     model = TargetConditionedCircuitDenoiser(T=8, hidden=16)
     q_stack = torch.randn(3, 6, 4)

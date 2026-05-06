@@ -163,13 +163,30 @@ def compose_two_entangler_local(
     second_a: torch.Tensor,
     second_b: torch.Tensor,
 ) -> torch.Tensor:
-    return (
-        local_layer(first_a, first_b)
-        @ entangler
-        @ local_layer(middle_a, middle_b)
-        @ entangler
-        @ local_layer(second_a, second_b)
+    return compose_local_entangler_chain_units(
+        torch.stack([first_a, first_b, middle_a, middle_b, second_a, second_b], dim=0),
+        entangler,
     )
+
+
+def compose_local_entangler_chain_units(
+    units: torch.Tensor,
+    entangler: torch.Tensor,
+) -> torch.Tensor:
+    if units.ndim < 3 or units.shape[-2:] != (2, 2):
+        raise ValueError("units must have shape (..., n_slots, 2, 2)")
+    n_slots = units.shape[-3]
+    if n_slots < 4 or n_slots % 2 != 0:
+        raise ValueError("units must contain an even number of slots, at least 4")
+
+    a = units[..., 0::2, :, :]
+    b = units[..., 1::2, :, :]
+    local_layers = torch.einsum("...ab,...cd->...acbd", a, b).reshape(*a.shape[:-2], 4, 4)
+
+    result = local_layers[..., 0, :, :]
+    for layer in range(1, local_layers.shape[-3]):
+        result = result @ entangler @ local_layers[..., layer, :, :]
+    return result
 
 
 def unitary_fidelity(candidate: torch.Tensor, target: torch.Tensor) -> float:
@@ -469,6 +486,7 @@ def synthesize_unitary_two_entangler_random_report(
     target_unitary: torch.Tensor,
     target_name: str = "target",
     entangler: str = "cz",
+    n_entanglers: int = 2,
     n_candidates: int = 100_000,
     top_k: int = 5,
     local_labels: list[str | None] | None = None,
@@ -478,6 +496,8 @@ def synthesize_unitary_two_entangler_random_report(
 ) -> SynthesisReport:
     if local_gates.shape[0] == 0:
         raise ValueError("synthesize_unitary_two_entangler_random_report needs at least one local gate")
+    if n_entanglers <= 0:
+        raise ValueError("n_entanglers must be positive")
     if n_candidates <= 0:
         raise ValueError("n_candidates must be positive")
     if top_k <= 0:
@@ -492,33 +512,30 @@ def synthesize_unitary_two_entangler_random_report(
 
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
+    n_slots = 2 * (n_entanglers + 1)
     indices = torch.randint(
         low=0,
         high=local_gates.shape[0],
-        size=(n_candidates, 6),
+        size=(n_candidates, n_slots),
         device=device,
         generator=generator,
     )
 
-    first = _batched_local_layer(units[indices[:, 0]], units[indices[:, 1]])
-    middle = _batched_local_layer(units[indices[:, 2]], units[indices[:, 3]])
-    second = _batched_local_layer(units[indices[:, 4]], units[indices[:, 5]])
-    entanglers = entangler_unitary.expand(n_candidates, 4, 4)
-    unitaries = first @ entanglers @ middle @ entanglers @ second
+    unitaries = compose_local_entangler_chain_units(units[indices], entangler_unitary)
     fidelities = unitary_fidelity_batch(unitaries, target_unitary)
     candidates = _top_candidates_from_slots(
         fidelities=fidelities,
         slot_indices=indices,
         target=target_name,
         entangler=entangler,
-        template="two-entangler-local",
+        template=f"{n_entanglers}-entangler-local",
         top_k=top_k,
         local_labels=local_labels,
     )
     return make_synthesis_report(
         candidates,
-        name=name or f"{target_name} two-entangler random search",
-        mode="two-entangler-random",
+        name=name or f"{target_name} {n_entanglers}-entangler random search",
+        mode=f"{n_entanglers}-entangler-random",
         fidelities=fidelities.tolist() if keep_fidelities else None,
     )
 
@@ -1374,8 +1391,8 @@ def refine_two_entangler_candidate(
     num_steps: int = 200,
     lr: float = 0.05,
 ) -> RefinementResult:
-    if len(candidate.slot_indices) != 6:
-        raise ValueError("refine_two_entangler_candidate expects a six-slot two-entangler candidate")
+    if len(candidate.slot_indices) < 4 or len(candidate.slot_indices) % 2 != 0:
+        raise ValueError("refine_two_entangler_candidate expects an even local-slot chain with at least four slots")
     if num_steps <= 0:
         raise ValueError("num_steps must be positive")
     if lr <= 0:
@@ -1386,7 +1403,7 @@ def refine_two_entangler_candidate(
     target_unitary = target_unitary.to(device=device, dtype=torch.complex64)
     entangler_unitary = two_qubit_gate(entangler, device=device)
 
-    delta = torch.zeros(6, 3, device=device, dtype=base_gates.dtype, requires_grad=True)
+    delta = torch.zeros(base_gates.shape[0], 3, device=device, dtype=base_gates.dtype, requires_grad=True)
     optimizer = torch.optim.Adam([delta], lr=lr)
     trace = []
     best_delta = delta.detach().clone()
@@ -1705,15 +1722,7 @@ def _compose_two_entangler_from_quaternions(
     entangler_unitary: torch.Tensor,
 ) -> torch.Tensor:
     units = quaternion_to_unitary(gates)
-    return compose_two_entangler_local(
-        units[0],
-        units[1],
-        entangler_unitary,
-        units[2],
-        units[3],
-        units[4],
-        units[5],
-    )
+    return compose_local_entangler_chain_units(units, entangler_unitary)
 
 
 def _differentiable_unitary_fidelity(candidate: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

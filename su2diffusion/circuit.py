@@ -23,6 +23,7 @@ from .synthesis import (
     RefinementResult,
     SynthesisCandidate,
     SynthesisReport,
+    compose_local_entangler_chain_units,
     compose_two_entangler_local,
     make_near_clifford_two_entangler_circuit_targets,
     quaternion_to_unitary,
@@ -305,8 +306,10 @@ def train_circuit_heat_kernel_model_on_stacks(
     device: torch.device | str | None = None,
     show_progress: bool = True,
 ) -> tuple[CircuitDenoiser, list[float]]:
-    if solution_stacks.ndim != 3 or solution_stacks.shape[1:] != (6, 4):
-        raise ValueError("solution_stacks must have shape (n, 6, 4)")
+    if solution_stacks.ndim != 3 or solution_stacks.shape[-1] != 4:
+        raise ValueError("solution_stacks must have shape (n, n_slots, 4)")
+    if solution_stacks.shape[1] < 4 or solution_stacks.shape[1] % 2 != 0:
+        raise ValueError("solution_stacks must contain an even number of slots, at least 4")
     if solution_stacks.shape[0] == 0:
         raise ValueError("solution_stacks must contain at least one stack")
 
@@ -316,7 +319,7 @@ def train_circuit_heat_kernel_model_on_stacks(
     solution_stacks = q_normalize(solution_stacks.to(device=device))
 
     torch.manual_seed(train_config.seed)
-    model = CircuitDenoiser(T=schedule.T, hidden=train_config.hidden).to(device)
+    model = CircuitDenoiser(T=schedule.T, n_slots=solution_stacks.shape[1], hidden=train_config.hidden).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
     losses: list[float] = []
 
@@ -365,8 +368,10 @@ def train_target_conditioned_circuit_heat_kernel_model(
     device: torch.device | str | None = None,
     show_progress: bool = True,
 ) -> tuple[TargetConditionedCircuitDenoiser, list[float]]:
-    if solution_stacks.ndim != 3 or solution_stacks.shape[1:] != (6, 4):
-        raise ValueError("solution_stacks must have shape (n, 6, 4)")
+    if solution_stacks.ndim != 3 or solution_stacks.shape[-1] != 4:
+        raise ValueError("solution_stacks must have shape (n, n_slots, 4)")
+    if solution_stacks.shape[1] < 4 or solution_stacks.shape[1] % 2 != 0:
+        raise ValueError("solution_stacks must contain an even number of slots, at least 4")
     if target_unitaries.ndim != 3 or target_unitaries.shape[1:] != (4, 4):
         raise ValueError("target_unitaries must have shape (n, 4, 4)")
     if solution_stacks.shape[0] == 0:
@@ -381,7 +386,11 @@ def train_target_conditioned_circuit_heat_kernel_model(
     target_features = target_unitary_features(target_unitaries.to(device=device))
 
     torch.manual_seed(train_config.seed)
-    model = TargetConditionedCircuitDenoiser(T=schedule.T, hidden=train_config.hidden).to(device)
+    model = TargetConditionedCircuitDenoiser(
+        T=schedule.T,
+        n_slots=solution_stacks.shape[1],
+        hidden=train_config.hidden,
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
     losses: list[float] = []
 
@@ -953,8 +962,6 @@ def sample_target_label_conditioned_circuit_reverse(
 ) -> torch.Tensor:
     if target_unitaries.ndim != 3 or target_unitaries.shape[1:] != (4, 4):
         raise ValueError("target_unitaries must have shape (n_targets, 4, 4)")
-    if slot_labels.ndim != 2 or slot_labels.shape != (target_unitaries.shape[0], 6):
-        raise ValueError("slot_labels must have shape (n_targets, 6)")
     if n_samples_per_target <= 0:
         raise ValueError("n_samples_per_target must be positive")
 
@@ -963,6 +970,8 @@ def sample_target_label_conditioned_circuit_reverse(
     slot_labels = slot_labels.to(device=device, dtype=torch.long)
     n_targets = target_unitaries.shape[0]
     n_slots = getattr(model, "n_slots", 6)
+    if slot_labels.ndim != 2 or slot_labels.shape != (n_targets, n_slots):
+        raise ValueError(f"slot_labels must have shape (n_targets, {n_slots})")
     n_total = n_targets * n_samples_per_target
     features = target_unitary_features(target_unitaries)
     features = features[:, None, :].expand(n_targets, n_samples_per_target, features.shape[-1])
@@ -1005,8 +1014,6 @@ def sample_target_label_conditioned_circuit_reverse_from_skeleton(
 ) -> torch.Tensor:
     if target_unitaries.ndim != 3 or target_unitaries.shape[1:] != (4, 4):
         raise ValueError("target_unitaries must have shape (n_targets, 4, 4)")
-    if slot_labels.ndim != 2 or slot_labels.shape != (target_unitaries.shape[0], 6):
-        raise ValueError("slot_labels must have shape (n_targets, 6)")
     if centers.ndim != 2 or centers.shape[1] != 4:
         raise ValueError("centers must have shape (n_centers, 4)")
     if n_samples_per_target <= 0:
@@ -1018,11 +1025,13 @@ def sample_target_label_conditioned_circuit_reverse_from_skeleton(
     target_unitaries = target_unitaries.to(device=device)
     slot_labels = slot_labels.to(device=device, dtype=torch.long)
     centers = centers.to(device=device)
+    n_targets = target_unitaries.shape[0]
+    n_slots = getattr(model, "n_slots", 6)
+    if slot_labels.ndim != 2 or slot_labels.shape != (n_targets, n_slots):
+        raise ValueError(f"slot_labels must have shape (n_targets, {n_slots})")
     if int(slot_labels.max().item()) >= centers.shape[0] or int(slot_labels.min().item()) < 0:
         raise ValueError("slot_labels must index into centers")
 
-    n_targets = target_unitaries.shape[0]
-    n_slots = getattr(model, "n_slots", 6)
     n_total = n_targets * n_samples_per_target
     features = target_unitary_features(target_unitaries)
     features = features[:, None, :].expand(n_targets, n_samples_per_target, features.shape[-1])
@@ -1314,13 +1323,17 @@ def synthesize_unitary_from_circuit_stack_report(
     name: str | None = None,
     keep_fidelities: bool = True,
 ) -> SynthesisReport:
-    if circuit_stacks.ndim != 3 or circuit_stacks.shape[1:] != (6, 4):
-        raise ValueError("circuit_stacks must have shape (n, 6, 4)")
+    if circuit_stacks.ndim != 3 or circuit_stacks.shape[-1] != 4:
+        raise ValueError("circuit_stacks must have shape (n, n_slots, 4)")
+    if circuit_stacks.shape[1] < 4 or circuit_stacks.shape[1] % 2 != 0:
+        raise ValueError("circuit_stacks must contain an even number of slots, at least 4")
     if top_k <= 0:
         raise ValueError("top_k must be positive")
 
     target_name = target_name.lower()
     device = circuit_stacks.device
+    n_slots = circuit_stacks.shape[1]
+    n_entanglers = n_slots // 2 - 1
     units = quaternion_to_unitary(circuit_stacks)
     entangler_unitary = two_qubit_gate(entangler, device=device)
     target_unitary = target_unitary.to(device=device, dtype=torch.complex64)
@@ -1335,14 +1348,14 @@ def synthesize_unitary_from_circuit_stack_report(
             template="joint-circuit-stack",
             entangler=entangler,
             fidelity=float(value),
-            slot_indices=(int(row),) * 6,
-            slot_labels=("joint", "joint", "joint", "joint", "joint", "joint"),
+            slot_indices=(int(row),) * n_slots,
+            slot_labels=("joint",) * n_slots,
         )
         for value, row in zip(values.tolist(), rows.tolist())
     ]
     return SynthesisReport(
         name=name or f"{target_name} joint circuit diffusion",
-        mode="joint-circuit",
+        mode=f"{n_entanglers}-entangler-joint-circuit",
         target=target_name,
         entangler=entangler,
         candidates=candidates,
@@ -1380,8 +1393,13 @@ def run_target_conditioned_circuit_proposal_benchmark(
 ) -> list[SynthesisReport]:
     if not benchmarks:
         raise ValueError("run_target_conditioned_circuit_proposal_benchmark needs at least one benchmark")
-    if circuit_stacks_by_target.ndim != 4 or circuit_stacks_by_target.shape[2:] != (6, 4):
-        raise ValueError("circuit_stacks_by_target must have shape (n_targets, n_samples, 6, 4)")
+    if (
+        circuit_stacks_by_target.ndim != 4
+        or circuit_stacks_by_target.shape[-1] != 4
+        or circuit_stacks_by_target.shape[2] < 4
+        or circuit_stacks_by_target.shape[2] % 2 != 0
+    ):
+        raise ValueError("circuit_stacks_by_target must have shape (n_targets, n_samples, n_slots, 4)")
     if circuit_stacks_by_target.shape[0] != len(benchmarks):
         raise ValueError("circuit_stacks_by_target must have one batch per benchmark")
 
@@ -1781,11 +1799,7 @@ def _compose_two_entangler_stack_units(
     units: torch.Tensor,
     entangler_unitary: torch.Tensor,
 ) -> torch.Tensor:
-    first = _batched_local_layer(units[:, 0], units[:, 1])
-    middle = _batched_local_layer(units[:, 2], units[:, 3])
-    second = _batched_local_layer(units[:, 4], units[:, 5])
-    entanglers = entangler_unitary.expand(units.shape[0], 4, 4)
-    return first @ entanglers @ middle @ entanglers @ second
+    return compose_local_entangler_chain_units(units, entangler_unitary)
 
 
 def _best_analytic_stack_for_target(

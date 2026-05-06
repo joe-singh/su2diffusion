@@ -202,3 +202,16 @@ The final Level 1 headline table condenses that workflow into one compact
 result: proposal quality, repeatability run standard deviation, refined
 fidelity, refinement success, median optimizer steps, and movement for token
 diffusion versus generated local-gate search.
+
+Level 2A starts the universal two-qubit template progression by comparing the
+current two-CZ ansatz against
+
+```text
+(A tensor B) CZ (C tensor D) CZ (E tensor F) CZ (G tensor H)
+```
+
+The same generated-gate search and local `SU(2)` refinement now support any
+even local-gate chain, so the notebook can build solution stacks on `SU(2)^8`.
+This branch uses that to check whether adding the third CZ improves proposal
+and refinement geometry before training the circuit-token diffusion model on
+eight-slot solution stacks.
