@@ -161,3 +161,9 @@ denoise on `SU(2)^6`; the diagnostic asks whether a model that explicitly lets
 the six local gates communicate can fit the tangent targets before we either
 scale architecture further or freeze direct Hamiltonian-conditioned diffusion as
 a negative result.
+
+The next generalization check trains that circuit-token denoiser on refined
+solution stacks for one Hamiltonian suite, then reverse-samples proposals for
+fresh held-out Hamiltonians. The held-out report compares token diffusion
+against Clifford, analytic near-Clifford, generated local-gate, and Haar search
+baselines on the same target family.

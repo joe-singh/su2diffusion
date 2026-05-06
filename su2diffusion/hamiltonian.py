@@ -1569,6 +1569,75 @@ def run_hamiltonian_conditioned_overfit_diagnostic(
     )
 
 
+def run_hamiltonian_token_conditioned_overfit_diagnostic(
+    train_dataset: HamiltonianSolutionDataset,
+    heldout_targets: list[HamiltonianTarget],
+    config: CircuitExperimentConfig | str,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    entangler: str = "cz",
+    top_k: int = 5,
+) -> HamiltonianConditionedOverfitDiagnosticResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    if not heldout_targets:
+        raise ValueError("heldout_targets must contain at least one target")
+    device = torch.device(device) if device is not None else train_dataset.stacks.device
+    train_targets = _unique_hamiltonian_targets(train_dataset.targets)
+
+    model, losses = train_hamiltonian_token_circuit_diffusion(
+        train_dataset,
+        train_config=config.train,
+        schedule=config.schedule,
+        device=device,
+        show_progress=show_progress,
+    )
+    train_generated = sample_hamiltonian_conditioned_circuit_reverse(
+        model,
+        config.schedule,
+        train_targets,
+        n_samples_per_target=config.sample_count,
+        eta=config.eta,
+        device=device,
+    )
+    heldout_generated = sample_hamiltonian_conditioned_circuit_reverse(
+        model,
+        config.schedule,
+        heldout_targets,
+        n_samples_per_target=config.sample_count,
+        eta=config.eta,
+        device=device,
+    )
+    train_reports = _hamiltonian_conditioned_reports_from_batches(
+        train_generated,
+        train_targets,
+        prefix="train token",
+        entangler=entangler,
+        top_k=top_k,
+    )
+    heldout_reports = _hamiltonian_conditioned_reports_from_batches(
+        heldout_generated,
+        heldout_targets,
+        prefix="heldout token",
+        entangler=entangler,
+        top_k=top_k,
+    )
+    return HamiltonianConditionedOverfitDiagnosticResult(
+        config=replace(config, name=f"{config.name}-token-overfit"),
+        model=model,
+        losses=losses,
+        train_dataset=train_dataset,
+        train_targets=train_targets,
+        heldout_targets=heldout_targets,
+        train_generated_by_target=train_generated,
+        heldout_generated_by_target=heldout_generated,
+        train_reports=train_reports,
+        heldout_reports=heldout_reports,
+    )
+
+
 def evaluate_hamiltonian_conditioned_denoising(
     model: TargetConditionedCircuitDenoiser,
     dataset: HamiltonianSolutionDataset,
@@ -2724,6 +2793,18 @@ def summarize_hamiltonian_token_conditioned_diffusion(
     ]
 
 
+def summarize_hamiltonian_token_heldout_comparison(
+    heldout_baseline: HamiltonianSuiteResult,
+    token_diagnostic: HamiltonianConditionedOverfitDiagnosticResult,
+) -> list[HiddenShallowCircuitAggregate]:
+    if len(heldout_baseline.benchmarks) != len(token_diagnostic.heldout_reports):
+        raise ValueError("heldout baseline and token diagnostic must cover the same number of targets")
+    return [
+        *summarize_hamiltonian_suite(heldout_baseline),
+        _aggregate_reports("Hamiltonian circuit-token heldout", token_diagnostic.heldout_reports),
+    ]
+
+
 def summarize_hamiltonian_conditioned_overfit_diagnostic(
     result: HamiltonianConditionedOverfitDiagnosticResult,
 ) -> list[HiddenShallowCircuitAggregate]:
@@ -2942,6 +3023,22 @@ def print_hamiltonian_token_conditioned_diffusion_summary(
     print(header)
     print("-" * len(header))
     for item in summarize_hamiltonian_token_conditioned_diffusion(baseline, conditioned):
+        print(
+            f"{item.mode:<41} {item.n_targets:<3} "
+            f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
+            f"{item.min_best:>6.4f}   {item.max_best:>6.4f}   "
+            f"{item.success_95:>6.1%}   {item.success_98:>6.1%}   {item.success_99:>6.1%}"
+        )
+
+
+def print_hamiltonian_token_heldout_comparison_summary(
+    heldout_baseline: HamiltonianSuiteResult,
+    token_diagnostic: HamiltonianConditionedOverfitDiagnosticResult,
+) -> None:
+    header = "mode                                      n   mean best   median   min      max      >=0.95   >=0.98   >=0.99"
+    print(header)
+    print("-" * len(header))
+    for item in summarize_hamiltonian_token_heldout_comparison(heldout_baseline, token_diagnostic):
         print(
             f"{item.mode:<41} {item.n_targets:<3} "
             f"{item.mean_best:>9.4f}   {item.median_best:>6.4f}   "
@@ -3447,6 +3544,30 @@ def plot_hamiltonian_token_conditioned_diffusion(
     plt.boxplot(values, labels=labels, showmeans=True)
     plt.ylabel("best unitary fidelity")
     plt.title("Hamiltonian circuit-token SU(2)^6 diffusion proposals")
+    plt.ylim(0.0, 1.02)
+    plt.tight_layout()
+
+
+def plot_hamiltonian_token_heldout_comparison(
+    heldout_baseline: HamiltonianSuiteResult,
+    token_diagnostic: HamiltonianConditionedOverfitDiagnosticResult,
+) -> None:
+    if not heldout_baseline.benchmarks:
+        raise ValueError("heldout_baseline must contain at least one benchmark")
+    if len(heldout_baseline.benchmarks) != len(token_diagnostic.heldout_reports):
+        raise ValueError("heldout baseline and token diagnostic must cover the same number of targets")
+    values = [
+        [_best(item.clifford_report) for item in heldout_baseline.benchmarks],
+        [_best(item.analytic_report) for item in heldout_baseline.benchmarks],
+        [_best(item.generated_report) for item in heldout_baseline.benchmarks],
+        [_best(item.haar_report) for item in heldout_baseline.benchmarks],
+        [_best(report) for report in token_diagnostic.heldout_reports],
+    ]
+    labels = ["Clifford", "analytic", "generated", "Haar", "token heldout"]
+    plt.figure(figsize=(10, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Held-out Hamiltonian circuit-token proposals")
     plt.ylim(0.0, 1.02)
     plt.tight_layout()
 
