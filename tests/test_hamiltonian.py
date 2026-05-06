@@ -12,6 +12,7 @@ from su2diffusion.hamiltonian import (
     HamiltonianSlotwiseDenoiseComparisonResult,
     HamiltonianTokenDenoiseComparisonResult,
     HamiltonianTokenDataScaleResult,
+    HamiltonianTokenStackDataScaleResult,
     HamiltonianTokenTemplateComparisonResult,
     HamiltonianTokenTrainingBudgetResult,
     HamiltonianTokenRepeatabilityResult,
@@ -47,6 +48,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_token_denoise_comparison,
     print_hamiltonian_token_heldout_comparison_summary,
     print_hamiltonian_token_repeatability_summary,
+    print_hamiltonian_token_stack_data_scale_summary,
     print_hamiltonian_token_template_comparison,
     print_hamiltonian_token_training_budget_summary,
     print_hamiltonian_repeatability_refinement,
@@ -85,6 +87,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_token_denoise_comparison,
     run_hamiltonian_token_denoise_diagnostic,
     run_hamiltonian_token_repeatability_benchmark,
+    run_hamiltonian_token_stack_data_scale_benchmark,
     run_hamiltonian_token_template_comparison,
     run_hamiltonian_token_training_budget_benchmark,
     run_hamiltonian_repeatability_refinement_benchmark,
@@ -109,6 +112,7 @@ from su2diffusion.hamiltonian import (
     summarize_hamiltonian_token_denoise_comparison,
     summarize_hamiltonian_token_heldout_comparison,
     summarize_hamiltonian_token_repeatability,
+    summarize_hamiltonian_token_stack_data_scale,
     summarize_hamiltonian_token_template_comparison,
     summarize_hamiltonian_token_training_budget,
     summarize_hamiltonian_repeatability_refinement,
@@ -1140,6 +1144,67 @@ def test_hamiltonian_token_data_scale_smoke(capsys):
         assert row.final_loss >= 0.0
         assert 0.0 <= row.heldout_mean_best <= 1.0001
         assert 0.0 <= row.heldout_success_95 <= 1.0
+
+
+def test_hamiltonian_token_stack_data_scale_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    heldout_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=1,
+        terms=("XI", "IZ", "XX", "ZZ"),
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=841,
+    )
+    config = CircuitExperimentConfig(
+        name="test-token-stack-scale",
+        schedule=DiffusionSchedule(T=3, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=2, num_steps=1, hidden=16, n_terms=4),
+        sample_count=2,
+        eta=0.0,
+    )
+
+    result = run_hamiltonian_token_stack_data_scale_benchmark(
+        settings=((1, 1), (2, 1)),
+        heldout_targets=heldout_targets,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        config=config,
+        coefficient_scale=0.15,
+        time=0.4,
+        train_seed=842,
+        dataset_seed=843,
+        heldout_baseline_seed=844,
+        n_entanglers=3,
+        n_random_candidates=8,
+        n_analytic_gates=4,
+        n_haar_gates=4,
+        top_k=1,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        train_steps=1,
+        device="cpu",
+        show_progress=False,
+    )
+    rows = summarize_hamiltonian_token_stack_data_scale(result)
+    print_hamiltonian_token_stack_data_scale_summary(result)
+
+    captured = capsys.readouterr().out
+    assert "sol/target" in captured
+    assert isinstance(result, HamiltonianTokenStackDataScaleResult)
+    assert len(rows) == 2
+    assert set(result.diagnostics) == {(1, 1), (2, 1)}
+    assert len(result.heldout_baseline.benchmarks) == 1
+    assert [row.n_slots for row in rows] == [8, 8]
+    for row in rows:
+        assert row.n_entanglers == 3
+        assert row.solutions_per_target == 1
+        assert row.n_solution_stacks == row.n_train_targets
+        assert row.final_loss >= 0.0
+        assert 0.0 <= row.heldout_mean_best <= 1.0001
 
 
 def test_hamiltonian_token_training_budget_smoke(capsys):
