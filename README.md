@@ -180,3 +180,10 @@ instead varies the number of token-denoiser optimization steps. This separates a
 data effect from an undertraining effect: if held-out proposal quality recovers
 as the step budget grows, the next scale-up should increase data and training
 budget together before changing model architecture.
+
+The Level 1 repeatability check then fixes the chosen budget and repeats the
+Hamiltonian-to-`SU(2)^6` token-diffusion experiment across independent
+train/test seeds. It reports per-run held-out fidelity, success rates, and the
+advantage over the generated local-gate search baseline, plus mean/std summary
+statistics. This is the first step from exploratory notebook runs toward a
+paper-grade benchmark table.

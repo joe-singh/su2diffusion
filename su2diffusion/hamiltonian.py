@@ -265,6 +265,33 @@ class HamiltonianTokenTrainingBudgetResult:
 
 
 @dataclass(frozen=True)
+class HamiltonianTokenRepeatabilityRow:
+    run: int
+    train_seed: int
+    heldout_seed: int
+    dataset_seed: int
+    baseline_seed: int
+    num_steps: int
+    n_train_targets: int
+    n_heldout_targets: int
+    n_solution_stacks: int
+    final_loss: float
+    train_mean_best: float
+    heldout_mean_best: float
+    generated_mean_best: float
+    heldout_delta_vs_generated: float
+    heldout_success_95: float
+    heldout_success_98: float
+    heldout_success_99: float
+
+
+@dataclass
+class HamiltonianTokenRepeatabilityResult:
+    budget_results: list[HamiltonianTokenTrainingBudgetResult]
+    rows: list[HamiltonianTokenRepeatabilityRow]
+
+
+@dataclass(frozen=True)
 class HamiltonianSupervisedTrainConfig:
     hidden: int = 256
     num_steps: int = 1000
@@ -1964,6 +1991,124 @@ def run_hamiltonian_token_training_budget_benchmark(
     )
 
 
+def run_hamiltonian_token_repeatability_benchmark(
+    n_runs: int,
+    train_target_count: int,
+    heldout_target_count: int,
+    train_steps: int,
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    config: CircuitExperimentConfig | str,
+    terms: tuple[str, ...] = ("XI", "IZ", "XX", "ZZ"),
+    coefficient_scale: float = 0.35,
+    time: float = 0.8,
+    seed: int = 3007,
+    train_seed_stride: int = 101,
+    heldout_seed_stride: int = 103,
+    dataset_seed_stride: int = 107,
+    baseline_seed_stride: int = 109,
+    perturb_scale: float = 0.12,
+    entangler: str = "cz",
+    n_random_candidates: int = 25_000,
+    n_analytic_gates: int = 1024,
+    n_haar_gates: int = 1024,
+    top_k: int = 5,
+    refinement_steps: int = 160,
+    refinement_lr: float = 0.05,
+    fidelity_threshold: float = 0.0,
+    solutions_per_target: int = 2,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> HamiltonianTokenRepeatabilityResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    if n_runs <= 0:
+        raise ValueError("n_runs must be positive")
+    if train_target_count <= 0:
+        raise ValueError("train_target_count must be positive")
+    if heldout_target_count <= 0:
+        raise ValueError("heldout_target_count must be positive")
+    if train_steps <= 0:
+        raise ValueError("train_steps must be positive")
+
+    device = torch.device(device) if device is not None else generated_gates.device
+    budget_results: list[HamiltonianTokenTrainingBudgetResult] = []
+    rows: list[HamiltonianTokenRepeatabilityRow] = []
+    for run in range(n_runs):
+        train_seed = seed + run * train_seed_stride
+        heldout_seed = seed + 10_000 + run * heldout_seed_stride
+        dataset_seed = seed + 20_000 + run * dataset_seed_stride
+        baseline_seed = seed + 30_000 + run * baseline_seed_stride
+        heldout_targets = make_random_pauli_hamiltonian_targets(
+            n_targets=heldout_target_count,
+            terms=terms,
+            coefficient_scale=coefficient_scale,
+            time=time,
+            seed=heldout_seed,
+            device=device,
+        )
+        budget_result = run_hamiltonian_token_training_budget_benchmark(
+            train_target_count=train_target_count,
+            train_step_counts=(train_steps,),
+            heldout_targets=heldout_targets,
+            clifford_gates=clifford_gates,
+            clifford_labels=clifford_labels,
+            generated_gates=generated_gates,
+            generated_labels=generated_labels,
+            config=replace(config, name=f"{config.name}-repeat{run:02d}"),
+            terms=terms,
+            coefficient_scale=coefficient_scale,
+            time=time,
+            train_seed=train_seed,
+            dataset_seed=dataset_seed,
+            heldout_baseline_seed=baseline_seed,
+            perturb_scale=perturb_scale,
+            entangler=entangler,
+            n_random_candidates=n_random_candidates,
+            n_analytic_gates=n_analytic_gates,
+            n_haar_gates=n_haar_gates,
+            top_k=top_k,
+            refinement_steps=refinement_steps,
+            refinement_lr=refinement_lr,
+            fidelity_threshold=fidelity_threshold,
+            solutions_per_target=solutions_per_target,
+            device=device,
+            show_progress=show_progress,
+        )
+        budget_results.append(budget_result)
+        budget_row = budget_result.rows[0]
+        rows.append(
+            HamiltonianTokenRepeatabilityRow(
+                run=run,
+                train_seed=train_seed,
+                heldout_seed=heldout_seed,
+                dataset_seed=dataset_seed,
+                baseline_seed=baseline_seed,
+                num_steps=budget_row.num_steps,
+                n_train_targets=budget_row.n_train_targets,
+                n_heldout_targets=heldout_target_count,
+                n_solution_stacks=budget_row.n_solution_stacks,
+                final_loss=budget_row.final_loss,
+                train_mean_best=budget_row.train_mean_best,
+                heldout_mean_best=budget_row.heldout_mean_best,
+                generated_mean_best=budget_row.generated_mean_best,
+                heldout_delta_vs_generated=budget_row.heldout_delta_vs_generated,
+                heldout_success_95=budget_row.heldout_success_95,
+                heldout_success_98=budget_row.heldout_success_98,
+                heldout_success_99=budget_row.heldout_success_99,
+            )
+        )
+
+    return HamiltonianTokenRepeatabilityResult(
+        budget_results=budget_results,
+        rows=rows,
+    )
+
+
 def evaluate_hamiltonian_conditioned_denoising(
     model: TargetConditionedCircuitDenoiser,
     dataset: HamiltonianSolutionDataset,
@@ -3143,6 +3288,12 @@ def summarize_hamiltonian_token_training_budget(
     return result.rows
 
 
+def summarize_hamiltonian_token_repeatability(
+    result: HamiltonianTokenRepeatabilityResult,
+) -> list[HamiltonianTokenRepeatabilityRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_conditioned_overfit_diagnostic(
     result: HamiltonianConditionedOverfitDiagnosticResult,
 ) -> list[HiddenShallowCircuitAggregate]:
@@ -3417,6 +3568,48 @@ def print_hamiltonian_token_training_budget_summary(result: HamiltonianTokenTrai
             f"{row.heldout_delta_vs_generated:>+9.4f}   "
             f"{row.heldout_success_95:>6.1%}   {row.heldout_success_98:>6.1%}   {row.heldout_success_99:>6.1%}"
         )
+
+
+def _mean_std(values: list[float]) -> tuple[float, float]:
+    tensor = torch.tensor(values, dtype=torch.float32)
+    std = tensor.std(unbiased=False) if tensor.numel() > 1 else torch.tensor(0.0)
+    return float(tensor.mean().item()), float(std.item())
+
+
+def print_hamiltonian_token_repeatability_summary(result: HamiltonianTokenRepeatabilityResult) -> None:
+    rows = summarize_hamiltonian_token_repeatability(result)
+    header = "run   steps   train   heldout   stacks   loss      train mean   heldout mean   gen mean   token-gen   >=0.95   >=0.98"
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        print(
+            f"{row.run:<5} "
+            f"{row.num_steps:<7} "
+            f"{row.n_train_targets:<7} "
+            f"{row.n_heldout_targets:<8} "
+            f"{row.n_solution_stacks:<7} "
+            f"{row.final_loss:>8.5f}   "
+            f"{row.train_mean_best:>10.4f}   "
+            f"{row.heldout_mean_best:>12.4f}   "
+            f"{row.generated_mean_best:>8.4f}   "
+            f"{row.heldout_delta_vs_generated:>+9.4f}   "
+            f"{row.heldout_success_95:>6.1%}   {row.heldout_success_98:>6.1%}"
+        )
+
+    print()
+    summary_header = "metric                    mean      std"
+    print(summary_header)
+    print("-" * len(summary_header))
+    for label, values in [
+        ("heldout mean", [row.heldout_mean_best for row in rows]),
+        ("generated mean", [row.generated_mean_best for row in rows]),
+        ("token-gen", [row.heldout_delta_vs_generated for row in rows]),
+        (">=0.95", [row.heldout_success_95 for row in rows]),
+        (">=0.98", [row.heldout_success_98 for row in rows]),
+        ("final loss", [row.final_loss for row in rows]),
+    ]:
+        mean, std = _mean_std(values)
+        print(f"{label:<24} {mean:>7.4f}   {std:>6.4f}")
 
 
 def print_hamiltonian_denoise_diagnostic(result: HamiltonianDenoiseDiagnosticResult) -> None:
@@ -4017,6 +4210,44 @@ def plot_hamiltonian_token_training_budget(result: HamiltonianTokenTrainingBudge
         for ax in axes:
             ax.set_xscale("log", base=2)
     fig.suptitle("Hamiltonian circuit-token training budget")
+    fig.tight_layout()
+
+
+def plot_hamiltonian_token_repeatability(result: HamiltonianTokenRepeatabilityResult) -> None:
+    rows = summarize_hamiltonian_token_repeatability(result)
+    if not rows:
+        raise ValueError("result must contain at least one repeatability row")
+    runs = [row.run for row in rows]
+    heldout = [row.heldout_mean_best for row in rows]
+    generated = [row.generated_mean_best for row in rows]
+    delta = [row.heldout_delta_vs_generated for row in rows]
+    success_95 = [row.heldout_success_95 for row in rows]
+    success_98 = [row.heldout_success_98 for row in rows]
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    axes[0].plot(runs, heldout, marker="o", label="token heldout")
+    axes[0].plot(runs, generated, marker="o", label="generated-search baseline")
+    axes[0].set_xlabel("repeatability run")
+    axes[0].set_ylabel("mean best unitary fidelity")
+    axes[0].set_ylim(0.0, 1.02)
+    axes[0].set_title("Held-out proposal quality")
+    axes[0].legend()
+
+    axes[1].axhline(0.0, linestyle="--", color="tab:gray")
+    axes[1].bar(runs, delta)
+    axes[1].set_xlabel("repeatability run")
+    axes[1].set_ylabel("token - generated baseline")
+    axes[1].set_title("Baseline advantage")
+
+    axes[2].plot(runs, success_95, marker="o", label="heldout >= 0.95")
+    axes[2].plot(runs, success_98, marker="o", label="heldout >= 0.98")
+    axes[2].set_xlabel("repeatability run")
+    axes[2].set_ylabel("success fraction")
+    axes[2].set_ylim(0.0, 1.02)
+    axes[2].set_title("Held-out success")
+    axes[2].legend()
+
+    fig.suptitle("Hamiltonian circuit-token repeatability")
     fig.tight_layout()
 
 
