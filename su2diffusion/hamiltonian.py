@@ -354,6 +354,32 @@ class HamiltonianTemplateComparisonResult:
 
 
 @dataclass(frozen=True)
+class HamiltonianTokenTemplateComparisonRow:
+    template: str
+    n_entanglers: int
+    n_slots: int
+    n_train_targets: int
+    n_heldout_targets: int
+    n_solution_stacks: int
+    num_steps: int
+    final_loss: float
+    train_mean_best: float
+    heldout_mean_best: float
+    generated_mean_best: float
+    heldout_delta_vs_generated: float
+    heldout_success_95: float
+    heldout_success_98: float
+    heldout_success_99: float
+
+
+@dataclass
+class HamiltonianTokenTemplateComparisonResult:
+    two_entangler: "HamiltonianTokenTrainingBudgetResult"
+    three_entangler: "HamiltonianTokenTrainingBudgetResult"
+    rows: list[HamiltonianTokenTemplateComparisonRow]
+
+
+@dataclass(frozen=True)
 class HamiltonianSupervisedTrainConfig:
     hidden: int = 256
     num_steps: int = 1000
@@ -1919,6 +1945,7 @@ def run_hamiltonian_token_data_scale_benchmark(
     heldout_baseline_seed: int = 2807,
     perturb_scale: float = 0.12,
     entangler: str = "cz",
+    n_entanglers: int = 2,
     n_random_candidates: int = 25_000,
     n_analytic_gates: int = 1024,
     n_haar_gates: int = 1024,
@@ -1959,6 +1986,7 @@ def run_hamiltonian_token_data_scale_benchmark(
         generated_labels=generated_labels,
         perturb_scale=perturb_scale,
         entangler=entangler,
+        n_entanglers=n_entanglers,
         n_random_candidates=n_random_candidates,
         n_analytic_gates=n_analytic_gates,
         n_haar_gates=n_haar_gates,
@@ -1983,6 +2011,7 @@ def run_hamiltonian_token_data_scale_benchmark(
             generated_labels=generated_labels,
             perturb_scale=perturb_scale,
             entangler=entangler,
+            n_entanglers=n_entanglers,
             n_random_candidates=n_random_candidates,
             n_analytic_gates=n_analytic_gates,
             n_haar_gates=n_haar_gates,
@@ -2050,6 +2079,7 @@ def run_hamiltonian_token_training_budget_benchmark(
     heldout_baseline_seed: int = 2807,
     perturb_scale: float = 0.12,
     entangler: str = "cz",
+    n_entanglers: int = 2,
     n_random_candidates: int = 25_000,
     n_analytic_gates: int = 1024,
     n_haar_gates: int = 1024,
@@ -2092,6 +2122,7 @@ def run_hamiltonian_token_training_budget_benchmark(
         generated_labels=generated_labels,
         perturb_scale=perturb_scale,
         entangler=entangler,
+        n_entanglers=n_entanglers,
         n_random_candidates=n_random_candidates,
         n_analytic_gates=n_analytic_gates,
         n_haar_gates=n_haar_gates,
@@ -2110,6 +2141,7 @@ def run_hamiltonian_token_training_budget_benchmark(
         generated_labels=generated_labels,
         perturb_scale=perturb_scale,
         entangler=entangler,
+        n_entanglers=n_entanglers,
         n_random_candidates=n_random_candidates,
         n_analytic_gates=n_analytic_gates,
         n_haar_gates=n_haar_gates,
@@ -2175,6 +2207,143 @@ def run_hamiltonian_token_training_budget_benchmark(
     )
 
 
+def _token_template_comparison_row(
+    template: str,
+    n_entanglers: int,
+    result: HamiltonianTokenTrainingBudgetResult,
+) -> HamiltonianTokenTemplateComparisonRow:
+    if not result.rows:
+        raise ValueError("training budget result must contain at least one row")
+    budget_row = result.rows[-1]
+    n_slots = _validate_solution_stacks(result.train_dataset.stacks)
+    return HamiltonianTokenTemplateComparisonRow(
+        template=template,
+        n_entanglers=n_entanglers,
+        n_slots=n_slots,
+        n_train_targets=budget_row.n_train_targets,
+        n_heldout_targets=len(result.heldout_targets),
+        n_solution_stacks=budget_row.n_solution_stacks,
+        num_steps=budget_row.num_steps,
+        final_loss=budget_row.final_loss,
+        train_mean_best=budget_row.train_mean_best,
+        heldout_mean_best=budget_row.heldout_mean_best,
+        generated_mean_best=budget_row.generated_mean_best,
+        heldout_delta_vs_generated=budget_row.heldout_delta_vs_generated,
+        heldout_success_95=budget_row.heldout_success_95,
+        heldout_success_98=budget_row.heldout_success_98,
+        heldout_success_99=budget_row.heldout_success_99,
+    )
+
+
+def run_hamiltonian_token_template_comparison(
+    train_target_count: int,
+    train_steps: int,
+    heldout_targets: list[HamiltonianTarget],
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    config: CircuitExperimentConfig | str,
+    terms: tuple[str, ...] = ("XI", "IZ", "XX", "ZZ"),
+    coefficient_scale: float = 0.35,
+    time: float = 0.8,
+    train_seed: int = 2607,
+    two_dataset_seed: int = 2707,
+    three_dataset_seed: int = 3707,
+    two_baseline_seed: int = 2807,
+    three_baseline_seed: int = 3807,
+    perturb_scale: float = 0.12,
+    entangler: str = "cz",
+    n_random_candidates: int = 25_000,
+    n_analytic_gates: int = 1024,
+    n_haar_gates: int = 1024,
+    top_k: int = 5,
+    refinement_steps: int = 160,
+    refinement_lr: float = 0.05,
+    fidelity_threshold: float = 0.0,
+    solutions_per_target: int = 2,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> HamiltonianTokenTemplateComparisonResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    if train_target_count <= 0:
+        raise ValueError("train_target_count must be positive")
+    if train_steps <= 0:
+        raise ValueError("train_steps must be positive")
+    if not heldout_targets:
+        raise ValueError("heldout_targets must contain at least one target")
+
+    two_entangler = run_hamiltonian_token_training_budget_benchmark(
+        train_target_count=train_target_count,
+        train_step_counts=(train_steps,),
+        heldout_targets=heldout_targets,
+        clifford_gates=clifford_gates,
+        clifford_labels=clifford_labels,
+        generated_gates=generated_gates,
+        generated_labels=generated_labels,
+        config=replace(config, name=f"{config.name}-2cz"),
+        terms=terms,
+        coefficient_scale=coefficient_scale,
+        time=time,
+        train_seed=train_seed,
+        dataset_seed=two_dataset_seed,
+        heldout_baseline_seed=two_baseline_seed,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        n_entanglers=2,
+        n_random_candidates=n_random_candidates,
+        n_analytic_gates=n_analytic_gates,
+        n_haar_gates=n_haar_gates,
+        top_k=top_k,
+        refinement_steps=refinement_steps,
+        refinement_lr=refinement_lr,
+        fidelity_threshold=fidelity_threshold,
+        solutions_per_target=solutions_per_target,
+        device=device,
+        show_progress=show_progress,
+    )
+    three_entangler = run_hamiltonian_token_training_budget_benchmark(
+        train_target_count=train_target_count,
+        train_step_counts=(train_steps,),
+        heldout_targets=heldout_targets,
+        clifford_gates=clifford_gates,
+        clifford_labels=clifford_labels,
+        generated_gates=generated_gates,
+        generated_labels=generated_labels,
+        config=replace(config, name=f"{config.name}-3cz"),
+        terms=terms,
+        coefficient_scale=coefficient_scale,
+        time=time,
+        train_seed=train_seed,
+        dataset_seed=three_dataset_seed,
+        heldout_baseline_seed=three_baseline_seed,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        n_entanglers=3,
+        n_random_candidates=n_random_candidates,
+        n_analytic_gates=n_analytic_gates,
+        n_haar_gates=n_haar_gates,
+        top_k=top_k,
+        refinement_steps=refinement_steps,
+        refinement_lr=refinement_lr,
+        fidelity_threshold=fidelity_threshold,
+        solutions_per_target=solutions_per_target,
+        device=device,
+        show_progress=show_progress,
+    )
+    return HamiltonianTokenTemplateComparisonResult(
+        two_entangler=two_entangler,
+        three_entangler=three_entangler,
+        rows=[
+            _token_template_comparison_row("2 CZ / SU(2)^6 token", 2, two_entangler),
+            _token_template_comparison_row("3 CZ / SU(2)^8 token", 3, three_entangler),
+        ],
+    )
+
+
 def run_hamiltonian_token_repeatability_benchmark(
     n_runs: int,
     train_target_count: int,
@@ -2195,6 +2364,7 @@ def run_hamiltonian_token_repeatability_benchmark(
     baseline_seed_stride: int = 109,
     perturb_scale: float = 0.12,
     entangler: str = "cz",
+    n_entanglers: int = 2,
     n_random_candidates: int = 25_000,
     n_analytic_gates: int = 1024,
     n_haar_gates: int = 1024,
@@ -2252,6 +2422,7 @@ def run_hamiltonian_token_repeatability_benchmark(
             heldout_baseline_seed=baseline_seed,
             perturb_scale=perturb_scale,
             entangler=entangler,
+            n_entanglers=n_entanglers,
             n_random_candidates=n_random_candidates,
             n_analytic_gates=n_analytic_gates,
             n_haar_gates=n_haar_gates,
@@ -3581,6 +3752,12 @@ def summarize_hamiltonian_token_training_budget(
     return result.rows
 
 
+def summarize_hamiltonian_token_template_comparison(
+    result: HamiltonianTokenTemplateComparisonResult,
+) -> list[HamiltonianTokenTemplateComparisonRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_token_repeatability(
     result: HamiltonianTokenRepeatabilityResult,
 ) -> list[HamiltonianTokenRepeatabilityRow]:
@@ -3915,6 +4092,31 @@ def print_hamiltonian_token_training_budget_summary(result: HamiltonianTokenTrai
             f"{row.generated_mean_best:>8.4f}   "
             f"{row.heldout_delta_vs_generated:>+9.4f}   "
             f"{row.heldout_success_95:>6.1%}   {row.heldout_success_98:>6.1%}   {row.heldout_success_99:>6.1%}"
+        )
+
+
+def print_hamiltonian_token_template_comparison(result: HamiltonianTokenTemplateComparisonResult) -> None:
+    header = (
+        "template                 CZs   slots   train   heldout   stacks   loss      "
+        "heldout mean   gen mean   token-gen   >=0.95   >=0.98   >=0.99"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in summarize_hamiltonian_token_template_comparison(result):
+        print(
+            f"{row.template:<24} "
+            f"{row.n_entanglers:<5} "
+            f"{row.n_slots:<7} "
+            f"{row.n_train_targets:<7} "
+            f"{row.n_heldout_targets:<8} "
+            f"{row.n_solution_stacks:<7} "
+            f"{row.final_loss:>8.5f}   "
+            f"{row.heldout_mean_best:>12.4f}   "
+            f"{row.generated_mean_best:>8.4f}   "
+            f"{row.heldout_delta_vs_generated:>+9.4f}   "
+            f"{row.heldout_success_95:>6.1%}   "
+            f"{row.heldout_success_98:>6.1%}   "
+            f"{row.heldout_success_99:>6.1%}"
         )
 
 
@@ -4665,6 +4867,34 @@ def plot_hamiltonian_token_training_budget(result: HamiltonianTokenTrainingBudge
             ax.set_xscale("log", base=2)
     fig.suptitle("Hamiltonian circuit-token training budget")
     fig.tight_layout()
+
+
+def _latest_token_diagnostic(
+    result: HamiltonianTokenTrainingBudgetResult,
+) -> HamiltonianConditionedOverfitDiagnosticResult:
+    if not result.diagnostics:
+        raise ValueError("training-budget result must contain at least one diagnostic")
+    return result.diagnostics[max(result.diagnostics)]
+
+
+def plot_hamiltonian_token_template_comparison(result: HamiltonianTokenTemplateComparisonResult) -> None:
+    two_diagnostic = _latest_token_diagnostic(result.two_entangler)
+    three_diagnostic = _latest_token_diagnostic(result.three_entangler)
+    values = [
+        [_best(item.generated_report) for item in result.two_entangler.heldout_baseline.benchmarks],
+        [_best(report) for report in two_diagnostic.heldout_reports],
+        [_best(item.generated_report) for item in result.three_entangler.heldout_baseline.benchmarks],
+        [_best(report) for report in three_diagnostic.heldout_reports],
+    ]
+    labels = ["2 CZ generated", "2 CZ token", "3 CZ generated", "3 CZ token"]
+
+    plt.figure(figsize=(8, 4))
+    plt.boxplot(values, labels=labels, showmeans=True)
+    plt.ylabel("best unitary fidelity")
+    plt.title("Hamiltonian token diffusion: 2 CZ vs 3 CZ")
+    plt.ylim(0.0, 1.02)
+    plt.xticks(rotation=15, ha="right")
+    plt.tight_layout()
 
 
 def plot_hamiltonian_token_repeatability(result: HamiltonianTokenRepeatabilityResult) -> None:
