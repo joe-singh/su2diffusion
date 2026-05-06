@@ -312,6 +312,28 @@ class HamiltonianRepeatabilityRefinementResult:
 
 
 @dataclass(frozen=True)
+class HamiltonianLevel1HeadlineRow:
+    source: str
+    n_targets: int
+    proposal_mean: float
+    proposal_run_std: float
+    refined_mean: float
+    refinement_success: float
+    median_steps: float
+    mean_movement: float
+    max_movement: float
+
+
+@dataclass(frozen=True)
+class HamiltonianLevel1HeadlineResult:
+    rows: list[HamiltonianLevel1HeadlineRow]
+    n_runs: int
+    threshold: float
+    proposal_advantage_mean: float
+    proposal_advantage_std: float
+
+
+@dataclass(frozen=True)
 class HamiltonianSupervisedTrainConfig:
     hidden: int = 256
     num_steps: int = 1000
@@ -3442,6 +3464,55 @@ def summarize_hamiltonian_repeatability_refinement(
     return result.rows
 
 
+def summarize_hamiltonian_level1_headline(
+    result: HamiltonianRepeatabilityRefinementResult,
+) -> HamiltonianLevel1HeadlineResult:
+    repeatability_rows = summarize_hamiltonian_token_repeatability(result.repeatability)
+    refinement_groups = _repeatability_refinement_groups(result)
+    if not repeatability_rows:
+        raise ValueError("repeatability result must contain at least one row")
+    if "token" not in refinement_groups or "generated-search" not in refinement_groups:
+        raise ValueError("refinement result must contain token and generated-search rows")
+
+    def source_row(
+        source: str,
+        proposal_values: list[float],
+    ) -> HamiltonianLevel1HeadlineRow:
+        rows = refinement_groups[source]
+        after = torch.tensor([row.refined_fidelity for row in rows], dtype=torch.float32)
+        reached = after >= result.threshold
+        steps = torch.tensor(
+            [row.steps_to_threshold for row in rows if row.steps_to_threshold >= 0],
+            dtype=torch.float32,
+        )
+        mean_moves = torch.tensor([row.movement_mean for row in rows], dtype=torch.float32)
+        max_moves = torch.tensor([row.movement_max for row in rows], dtype=torch.float32)
+        proposal_mean, proposal_run_std = _mean_std(proposal_values)
+        return HamiltonianLevel1HeadlineRow(
+            source=source,
+            n_targets=len(rows),
+            proposal_mean=proposal_mean,
+            proposal_run_std=proposal_run_std,
+            refined_mean=float(after.mean().item()),
+            refinement_success=float(reached.float().mean().item()),
+            median_steps=float(steps.median().item()) if steps.numel() else float("nan"),
+            mean_movement=float(mean_moves.mean().item()),
+            max_movement=float(max_moves.max().item()),
+        )
+
+    advantage_mean, advantage_std = _mean_std([row.heldout_delta_vs_generated for row in repeatability_rows])
+    return HamiltonianLevel1HeadlineResult(
+        rows=[
+            source_row("token", [row.heldout_mean_best for row in repeatability_rows]),
+            source_row("generated-search", [row.generated_mean_best for row in repeatability_rows]),
+        ],
+        n_runs=len(repeatability_rows),
+        threshold=result.threshold,
+        proposal_advantage_mean=advantage_mean,
+        proposal_advantage_std=advantage_std,
+    )
+
+
 def summarize_hamiltonian_conditioned_overfit_diagnostic(
     result: HamiltonianConditionedOverfitDiagnosticResult,
 ) -> list[HiddenShallowCircuitAggregate]:
@@ -3819,6 +3890,34 @@ def print_hamiltonian_repeatability_refinement_summary(
             f"{mean_moves.mean().item():>9.4f}   "
             f"{max_moves.max().item():>8.4f}"
         )
+
+
+def print_hamiltonian_level1_headline_table(result: HamiltonianRepeatabilityRefinementResult) -> None:
+    headline = summarize_hamiltonian_level1_headline(result)
+    threshold_label = f">={headline.threshold:g}"
+    header = (
+        "source             n   proposal mean   run std   refined mean   "
+        f"{threshold_label:<8}   median steps   mean move   max move"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in headline.rows:
+        print(
+            f"{row.source:<18} {row.n_targets:<3} "
+            f"{row.proposal_mean:>13.4f}   "
+            f"{row.proposal_run_std:>7.4f}   "
+            f"{row.refined_mean:>12.4f}   "
+            f"{row.refinement_success:>8.1%}   "
+            f"{row.median_steps:>12.1f}   "
+            f"{row.mean_movement:>9.4f}   "
+            f"{row.max_movement:>8.4f}"
+        )
+    print()
+    print(
+        "token - generated-search proposal advantage: "
+        f"{headline.proposal_advantage_mean:+.4f} +/- {headline.proposal_advantage_std:.4f} "
+        f"over {headline.n_runs} runs"
+    )
 
 
 def print_hamiltonian_denoise_diagnostic(result: HamiltonianDenoiseDiagnosticResult) -> None:
