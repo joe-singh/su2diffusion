@@ -235,5 +235,6 @@ Level 2D adds a short-term canonicalization rule for the `SU(2)^8` solution
 data. For each Hamiltonian, the dataset builder can refine a small pool of
 candidate stacks, filter for high fidelity, and keep the solution with minimum
 total local rotation `sum_i ||log(q_i)||^2`. The scale-sweep helper also shows
-progress during search/refinement and moves completed diagnostic models to CPU
-by default so Colab does not retain every row's CUDA memory.
+progress during search/refinement, chunks reverse sampling into smaller batches,
+and moves completed diagnostic models to CPU by default so Colab does not retain
+every row's CUDA memory.

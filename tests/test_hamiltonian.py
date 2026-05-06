@@ -422,6 +422,7 @@ def test_hamiltonian_conditioned_circuit_diffusion_smoke(capsys):
         n_samples_per_target=2,
         eta=0.0,
         device="cpu",
+        max_batch_size=1,
     )
     assert len(losses) == 2
     assert samples.shape == (2, 2, 6, 4)

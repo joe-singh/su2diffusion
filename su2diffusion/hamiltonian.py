@@ -1736,41 +1736,67 @@ def sample_hamiltonian_conditioned_circuit_reverse(
     n_samples_per_target: int = 1000,
     eta: float = 1.0,
     device: torch.device | str | None = None,
+    max_batch_size: int | None = 8192,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
 ) -> torch.Tensor:
     if not targets:
         raise ValueError("targets must contain at least one Hamiltonian target")
     if n_samples_per_target <= 0:
         raise ValueError("n_samples_per_target must be positive")
+    if max_batch_size is not None and max_batch_size <= 0:
+        raise ValueError("max_batch_size must be positive when provided")
 
     device = torch.device(device) if device is not None else next(model.parameters()).device
     n_targets = len(targets)
     n_slots = getattr(model, "n_slots", 6)
     n_total = n_targets * n_samples_per_target
-    features = hamiltonian_target_features(targets).to(device=device)
-    if features.shape[1] != model.target_dim:
-        raise ValueError(f"Model expects {model.target_dim} Hamiltonian features, got {features.shape[1]}")
-    features = features[:, None, :].expand(n_targets, n_samples_per_target, features.shape[-1])
-    features = features.reshape(n_total, features.shape[-1])
+    target_features = hamiltonian_target_features(targets).to(device=device)
+    if target_features.shape[1] != model.target_dim:
+        raise ValueError(f"Model expects {model.target_dim} Hamiltonian features, got {target_features.shape[1]}")
 
     betas, _, sigmas = schedule.tensors(device)
-    q_stack = sample_haar(n_total * n_slots, device=device).reshape(n_total, n_slots, 4)
 
-    for s in reversed(range(schedule.T)):
-        t_idx = torch.full((n_total,), s + 1, device=device, dtype=torch.long)
-        eps_pred = _predict_hamiltonian_eps(model, q_stack, t_idx, features)
+    def sample_chunk(features: torch.Tensor) -> torch.Tensor:
+        n_chunk = features.shape[0]
+        q_stack = sample_haar(n_chunk * n_slots, device=device).reshape(n_chunk, n_slots, 4)
+        for s in reversed(range(schedule.T)):
+            t_idx = torch.full((n_chunk,), s + 1, device=device, dtype=torch.long)
+            eps_pred = _predict_hamiltonian_eps(model, q_stack, t_idx, features)
 
-        beta = betas[s]
-        sigma = sigmas[s]
-        drift = -(beta / sigma.clamp_min(1e-8)) * eps_pred
+            beta = betas[s]
+            sigma = sigmas[s]
+            drift = -(beta / sigma.clamp_min(1e-8)) * eps_pred
 
-        if s > 0 and eta > 0:
-            noise = eta * torch.sqrt(beta) * torch.randn(n_total, n_slots, 3, device=device)
-        else:
-            noise = torch.zeros_like(drift)
+            if s > 0 and eta > 0:
+                noise = eta * torch.sqrt(beta) * torch.randn(n_chunk, n_slots, 3, device=device)
+            else:
+                noise = torch.zeros_like(drift)
 
-        q_stack = q_mul(q_stack, q_exp(drift + noise))
-        q_stack = q_normalize(q_stack)
+            q_stack = q_mul(q_stack, q_exp(drift + noise))
+            q_stack = q_normalize(q_stack)
+        return q_stack
 
+    chunk_size = n_total if max_batch_size is None else min(max_batch_size, n_total)
+    chunks = range(0, n_total, chunk_size)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        chunks = tqdm(
+            chunks,
+            total=(n_total + chunk_size - 1) // chunk_size,
+            desc=progress_desc or "Sampling Hamiltonian-conditioned circuits",
+            dynamic_ncols=True,
+        )
+
+    sampled_chunks = []
+    for start in chunks:
+        end = min(start + chunk_size, n_total)
+        flat_ids = torch.arange(start, end, device=device)
+        target_ids = torch.div(flat_ids, n_samples_per_target, rounding_mode="floor")
+        sampled_chunks.append(sample_chunk(target_features[target_ids]))
+
+    q_stack = torch.cat(sampled_chunks, dim=0)
     return q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
 
 
@@ -1805,6 +1831,8 @@ def run_hamiltonian_conditioned_diffusion_benchmark(
         n_samples_per_target=config.sample_count,
         eta=config.eta,
         device=device,
+        show_progress=show_progress,
+        progress_desc="Sampling Hamiltonian-conditioned proposals",
     )
     reports = [
         synthesize_unitary_from_circuit_stack_report(
@@ -1860,6 +1888,8 @@ def run_hamiltonian_token_conditioned_diffusion_benchmark(
         n_samples_per_target=config.sample_count,
         eta=config.eta,
         device=device,
+        show_progress=show_progress,
+        progress_desc="Sampling Hamiltonian circuit-token proposals",
     )
     reports = [
         synthesize_unitary_from_circuit_stack_report(
@@ -1948,6 +1978,8 @@ def run_hamiltonian_conditioned_overfit_diagnostic(
         n_samples_per_target=config.sample_count,
         eta=config.eta,
         device=device,
+        show_progress=show_progress,
+        progress_desc="Sampling train Hamiltonian proposals",
     )
     heldout_generated = sample_hamiltonian_conditioned_circuit_reverse(
         model,
@@ -1956,6 +1988,8 @@ def run_hamiltonian_conditioned_overfit_diagnostic(
         n_samples_per_target=config.sample_count,
         eta=config.eta,
         device=device,
+        show_progress=show_progress,
+        progress_desc="Sampling heldout Hamiltonian proposals",
     )
     train_reports = _hamiltonian_conditioned_reports_from_batches(
         train_generated,
@@ -2017,6 +2051,8 @@ def run_hamiltonian_token_conditioned_overfit_diagnostic(
         n_samples_per_target=config.sample_count,
         eta=config.eta,
         device=device,
+        show_progress=show_progress,
+        progress_desc="Sampling train Hamiltonian token proposals",
     )
     heldout_generated = sample_hamiltonian_conditioned_circuit_reverse(
         model,
@@ -2025,6 +2061,8 @@ def run_hamiltonian_token_conditioned_overfit_diagnostic(
         n_samples_per_target=config.sample_count,
         eta=config.eta,
         device=device,
+        show_progress=show_progress,
+        progress_desc="Sampling heldout Hamiltonian token proposals",
     )
     train_reports = _hamiltonian_conditioned_reports_from_batches(
         train_generated,
