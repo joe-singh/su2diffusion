@@ -15,6 +15,7 @@ from su2diffusion.hamiltonian import (
     HamiltonianTokenTrainingBudgetResult,
     HamiltonianTokenRepeatabilityResult,
     HamiltonianRepeatabilityRefinementResult,
+    HamiltonianLevel1HeadlineResult,
     HamiltonianConditionedOverfitDiagnosticResult,
     HamiltonianStackPredictor,
     HamiltonianPriorTrainConfig,
@@ -47,6 +48,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_token_training_budget_summary,
     print_hamiltonian_repeatability_refinement,
     print_hamiltonian_repeatability_refinement_summary,
+    print_hamiltonian_level1_headline_table,
     print_hamiltonian_conditioned_overfit_diagnostic,
     print_hamiltonian_conditioned_overfit_summary,
     print_hamiltonian_mixture_refinement_summary,
@@ -103,6 +105,7 @@ from su2diffusion.hamiltonian import (
     summarize_hamiltonian_token_repeatability,
     summarize_hamiltonian_token_training_budget,
     summarize_hamiltonian_repeatability_refinement,
+    summarize_hamiltonian_level1_headline,
     summarize_hamiltonian_conditioned_diffusion,
     summarize_hamiltonian_conditioned_overfit_diagnostic,
     summarize_hamiltonian_suite,
@@ -1222,16 +1225,24 @@ def test_hamiltonian_repeatability_refinement_smoke(capsys):
         threshold=0.5,
     )
     rows = summarize_hamiltonian_repeatability_refinement(result)
+    headline = summarize_hamiltonian_level1_headline(result)
     print_hamiltonian_repeatability_refinement(result)
     print_hamiltonian_repeatability_refinement_summary(result)
+    print_hamiltonian_level1_headline_table(result)
 
     captured = capsys.readouterr().out
     assert "token" in captured
     assert "generated-search" in captured
     assert "move mean" in captured
+    assert "proposal advantage" in captured
     assert isinstance(result, HamiltonianRepeatabilityRefinementResult)
+    assert isinstance(headline, HamiltonianLevel1HeadlineResult)
     assert len(rows) == 4
+    assert len(headline.rows) == 2
+    assert headline.n_runs == 1
+    assert headline.threshold == 0.5
     assert {row.source for row in rows} == {"token", "generated-search"}
+    assert {row.source for row in headline.rows} == {"token", "generated-search"}
     for row in rows:
         assert row.run == 0
         assert row.target.startswith("pauli-")
@@ -1242,6 +1253,12 @@ def test_hamiltonian_repeatability_refinement_smoke(capsys):
         assert row.movement_mean >= 0.0
         assert row.movement_max >= row.movement_mean
         assert all(value >= 0.0 for value in row.slot_movements)
+    for row in headline.rows:
+        assert row.n_targets == 2
+        assert 0.0 <= row.proposal_mean <= 1.0001
+        assert 0.0 <= row.refined_mean <= 1.0001
+        assert 0.0 <= row.refinement_success <= 1.0
+        assert row.mean_movement >= 0.0
 
 
 def test_hamiltonian_stack_predictor_shapes_and_smoke_training(capsys):

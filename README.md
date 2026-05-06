@@ -197,3 +197,8 @@ initial fidelity, or whether it also places the optimizer in a better basin.
 It also reports mean and max per-slot `SU(2)` movement during refinement, which
 checks whether the optimizer is only polishing the proposal or moving far enough
 to effectively replace it.
+
+The final Level 1 headline table condenses that workflow into one compact
+result: proposal quality, repeatability run standard deviation, refined
+fidelity, refinement success, median optimizer steps, and movement for token
+diffusion versus generated local-gate search.
