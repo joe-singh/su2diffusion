@@ -215,3 +215,11 @@ even local-gate chain, so the notebook can build solution stacks on `SU(2)^8`.
 This branch uses that to check whether adding the third CZ improves proposal
 and refinement geometry before training the circuit-token diffusion model on
 eight-slot solution stacks.
+
+Level 2B upgrades the Hamiltonian circuit-token diffusion comparison itself:
+it trains the same token denoiser workflow on both the two-CZ `SU(2)^6`
+solution stacks and the universal three-CZ `SU(2)^8` stacks, then evaluates
+held-out Hamiltonian proposal quality against the generated local-gate search
+baseline for each template. This is the first direct check of whether the
+diffusion model benefits from the larger universal two-qubit circuit ansatz,
+not just whether the local optimizer can use it.
