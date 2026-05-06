@@ -14,6 +14,7 @@ from su2diffusion.hamiltonian import (
     HamiltonianTokenDataScaleResult,
     HamiltonianTokenTrainingBudgetResult,
     HamiltonianTokenRepeatabilityResult,
+    HamiltonianRepeatabilityRefinementResult,
     HamiltonianConditionedOverfitDiagnosticResult,
     HamiltonianStackPredictor,
     HamiltonianPriorTrainConfig,
@@ -44,6 +45,8 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_token_heldout_comparison_summary,
     print_hamiltonian_token_repeatability_summary,
     print_hamiltonian_token_training_budget_summary,
+    print_hamiltonian_repeatability_refinement,
+    print_hamiltonian_repeatability_refinement_summary,
     print_hamiltonian_conditioned_overfit_diagnostic,
     print_hamiltonian_conditioned_overfit_summary,
     print_hamiltonian_mixture_refinement_summary,
@@ -77,6 +80,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_token_denoise_diagnostic,
     run_hamiltonian_token_repeatability_benchmark,
     run_hamiltonian_token_training_budget_benchmark,
+    run_hamiltonian_repeatability_refinement_benchmark,
     refine_hamiltonian_prior_mixture,
     refine_hamiltonian_prior_mixture_budget_sweep,
     run_hamiltonian_prior_mixture_sweep,
@@ -98,6 +102,7 @@ from su2diffusion.hamiltonian import (
     summarize_hamiltonian_token_heldout_comparison,
     summarize_hamiltonian_token_repeatability,
     summarize_hamiltonian_token_training_budget,
+    summarize_hamiltonian_repeatability_refinement,
     summarize_hamiltonian_conditioned_diffusion,
     summarize_hamiltonian_conditioned_overfit_diagnostic,
     summarize_hamiltonian_suite,
@@ -1172,6 +1177,66 @@ def test_hamiltonian_token_repeatability_smoke(capsys):
         assert row.final_loss >= 0.0
         assert 0.0 <= row.heldout_mean_best <= 1.0001
         assert 0.0 <= row.heldout_success_95 <= 1.0
+
+
+def test_hamiltonian_repeatability_refinement_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    config = CircuitExperimentConfig(
+        name="test-repeat-refine",
+        schedule=DiffusionSchedule(T=4, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=4, num_steps=2, hidden=16, n_terms=4),
+        sample_count=3,
+        eta=0.2,
+    )
+
+    repeatability = run_hamiltonian_token_repeatability_benchmark(
+        n_runs=1,
+        train_target_count=2,
+        heldout_target_count=2,
+        train_steps=2,
+        clifford_gates=centers,
+        clifford_labels=labels,
+        generated_gates=centers,
+        generated_labels=labels,
+        config=config,
+        coefficient_scale=0.15,
+        time=0.4,
+        seed=90,
+        n_random_candidates=16,
+        n_analytic_gates=8,
+        n_haar_gates=8,
+        top_k=1,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        solutions_per_target=2,
+        device="cpu",
+        show_progress=False,
+    )
+    result = run_hamiltonian_repeatability_refinement_benchmark(
+        repeatability,
+        generated_gates=centers,
+        refinement_steps=2,
+        refinement_lr=0.02,
+        threshold=0.5,
+    )
+    rows = summarize_hamiltonian_repeatability_refinement(result)
+    print_hamiltonian_repeatability_refinement(result)
+    print_hamiltonian_repeatability_refinement_summary(result)
+
+    captured = capsys.readouterr().out
+    assert "token" in captured
+    assert "generated-search" in captured
+    assert isinstance(result, HamiltonianRepeatabilityRefinementResult)
+    assert len(rows) == 4
+    assert {row.source for row in rows} == {"token", "generated-search"}
+    for row in rows:
+        assert row.run == 0
+        assert row.target.startswith("pauli-")
+        assert 0.0 <= row.initial_fidelity <= 1.0001
+        assert 0.0 <= row.refined_fidelity <= 1.0001
+        assert row.steps_to_threshold >= -1
 
 
 def test_hamiltonian_stack_predictor_shapes_and_smoke_training(capsys):

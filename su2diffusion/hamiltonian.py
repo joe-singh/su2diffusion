@@ -292,6 +292,23 @@ class HamiltonianTokenRepeatabilityResult:
 
 
 @dataclass(frozen=True)
+class HamiltonianRepeatabilityRefinementRow:
+    run: int
+    target: str
+    source: str
+    initial_fidelity: float
+    refined_fidelity: float
+    steps_to_threshold: int
+
+
+@dataclass
+class HamiltonianRepeatabilityRefinementResult:
+    repeatability: HamiltonianTokenRepeatabilityResult
+    rows: list[HamiltonianRepeatabilityRefinementRow]
+    threshold: float
+
+
+@dataclass(frozen=True)
 class HamiltonianSupervisedTrainConfig:
     hidden: int = 256
     num_steps: int = 1000
@@ -2109,6 +2126,104 @@ def run_hamiltonian_token_repeatability_benchmark(
     )
 
 
+def run_hamiltonian_repeatability_refinement_benchmark(
+    repeatability: HamiltonianTokenRepeatabilityResult,
+    generated_gates: torch.Tensor,
+    entangler: str = "cz",
+    refinement_steps: int = 50,
+    refinement_lr: float = 0.05,
+    threshold: float = 0.99,
+) -> HamiltonianRepeatabilityRefinementResult:
+    if not repeatability.budget_results:
+        raise ValueError("repeatability result must contain at least one budget result")
+    if generated_gates.shape[0] == 0:
+        raise ValueError("generated_gates must contain at least one gate")
+    if refinement_steps <= 0:
+        raise ValueError("refinement_steps must be positive")
+    if refinement_lr <= 0:
+        raise ValueError("refinement_lr must be positive")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("threshold must be between 0 and 1")
+
+    rows: list[HamiltonianRepeatabilityRefinementRow] = []
+    for run, budget_result in enumerate(repeatability.budget_results):
+        if not budget_result.diagnostics:
+            raise ValueError("each budget result must contain at least one diagnostic")
+        diagnostic = next(iter(budget_result.diagnostics.values()))
+        if len(budget_result.heldout_targets) != len(diagnostic.heldout_reports):
+            raise ValueError("heldout targets and token reports must have matching lengths")
+        if len(budget_result.heldout_targets) != len(budget_result.heldout_baseline.benchmarks):
+            raise ValueError("heldout targets and baseline benchmarks must have matching lengths")
+
+        for i, (target, token_report, benchmark) in enumerate(
+            zip(
+                budget_result.heldout_targets,
+                diagnostic.heldout_reports,
+                budget_result.heldout_baseline.benchmarks,
+            )
+        ):
+            token_candidate = token_report.candidates[0]
+            token_stack_index = token_candidate.slot_indices[0]
+            token_stack = diagnostic.heldout_generated_by_target[i, token_stack_index]
+            token_refinement = refine_two_entangler_candidate(
+                token_stack,
+                _candidate_from_stack(
+                    target,
+                    "token",
+                    token_candidate.fidelity,
+                    entangler=entangler,
+                ),
+                target_unitary=target.unitary,
+                entangler=entangler,
+                num_steps=refinement_steps,
+                lr=refinement_lr,
+            )
+            rows.append(
+                HamiltonianRepeatabilityRefinementRow(
+                    run=run,
+                    target=target.name,
+                    source="token",
+                    initial_fidelity=token_refinement.initial_fidelity,
+                    refined_fidelity=token_refinement.refined_fidelity,
+                    steps_to_threshold=_steps_to_threshold(
+                        token_refinement.initial_fidelity,
+                        token_refinement.fidelity_trace,
+                        threshold,
+                    ),
+                )
+            )
+
+            generated_candidate = benchmark.generated_report.candidates[0]
+            generated_refinement = refine_two_entangler_candidate(
+                generated_gates,
+                generated_candidate,
+                target_unitary=target.unitary,
+                entangler=entangler,
+                num_steps=refinement_steps,
+                lr=refinement_lr,
+            )
+            rows.append(
+                HamiltonianRepeatabilityRefinementRow(
+                    run=run,
+                    target=target.name,
+                    source="generated-search",
+                    initial_fidelity=generated_refinement.initial_fidelity,
+                    refined_fidelity=generated_refinement.refined_fidelity,
+                    steps_to_threshold=_steps_to_threshold(
+                        generated_refinement.initial_fidelity,
+                        generated_refinement.fidelity_trace,
+                        threshold,
+                    ),
+                )
+            )
+
+    return HamiltonianRepeatabilityRefinementResult(
+        repeatability=repeatability,
+        rows=rows,
+        threshold=threshold,
+    )
+
+
 def evaluate_hamiltonian_conditioned_denoising(
     model: TargetConditionedCircuitDenoiser,
     dataset: HamiltonianSolutionDataset,
@@ -3294,6 +3409,12 @@ def summarize_hamiltonian_token_repeatability(
     return result.rows
 
 
+def summarize_hamiltonian_repeatability_refinement(
+    result: HamiltonianRepeatabilityRefinementResult,
+) -> list[HamiltonianRepeatabilityRefinementRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_conditioned_overfit_diagnostic(
     result: HamiltonianConditionedOverfitDiagnosticResult,
 ) -> list[HiddenShallowCircuitAggregate]:
@@ -3610,6 +3731,61 @@ def print_hamiltonian_token_repeatability_summary(result: HamiltonianTokenRepeat
     ]:
         mean, std = _mean_std(values)
         print(f"{label:<24} {mean:>7.4f}   {std:>6.4f}")
+
+
+def _repeatability_refinement_groups(
+    result: HamiltonianRepeatabilityRefinementResult,
+) -> dict[str, list[HamiltonianRepeatabilityRefinementRow]]:
+    groups: dict[str, list[HamiltonianRepeatabilityRefinementRow]] = {}
+    for row in result.rows:
+        groups.setdefault(row.source, []).append(row)
+    return groups
+
+
+def print_hamiltonian_repeatability_refinement(
+    result: HamiltonianRepeatabilityRefinementResult,
+    max_rows: int | None = 10,
+) -> None:
+    header = "run   target      source             before   after    steps"
+    print(header)
+    print("-" * len(header))
+    rows = result.rows if max_rows is None else result.rows[:max_rows]
+    for row in rows:
+        steps = str(row.steps_to_threshold) if row.steps_to_threshold >= 0 else "miss"
+        print(
+            f"{row.run:<5} "
+            f"{row.target:<11} "
+            f"{row.source:<18} "
+            f"{row.initial_fidelity:>6.4f}   "
+            f"{row.refined_fidelity:>6.4f}   "
+            f"{steps:>6}"
+        )
+    if max_rows is not None and len(result.rows) > max_rows:
+        print(f"... {len(result.rows) - max_rows} more")
+
+
+def print_hamiltonian_repeatability_refinement_summary(
+    result: HamiltonianRepeatabilityRefinementResult,
+) -> None:
+    header = "source             n   mean before   mean after   >=threshold   median steps"
+    print(header)
+    print("-" * len(header))
+    for source, rows in _repeatability_refinement_groups(result).items():
+        before = torch.tensor([row.initial_fidelity for row in rows], dtype=torch.float32)
+        after = torch.tensor([row.refined_fidelity for row in rows], dtype=torch.float32)
+        reached = after >= result.threshold
+        steps = torch.tensor(
+            [row.steps_to_threshold for row in rows if row.steps_to_threshold >= 0],
+            dtype=torch.float32,
+        )
+        median_steps = steps.median().item() if steps.numel() else float("nan")
+        print(
+            f"{source:<18} {len(rows):<3} "
+            f"{before.mean().item():>11.4f}   "
+            f"{after.mean().item():>10.4f}   "
+            f"{reached.float().mean().item():>11.1%}   "
+            f"{median_steps:>12.1f}"
+        )
 
 
 def print_hamiltonian_denoise_diagnostic(result: HamiltonianDenoiseDiagnosticResult) -> None:
@@ -4248,6 +4424,45 @@ def plot_hamiltonian_token_repeatability(result: HamiltonianTokenRepeatabilityRe
     axes[2].legend()
 
     fig.suptitle("Hamiltonian circuit-token repeatability")
+    fig.tight_layout()
+
+
+def plot_hamiltonian_repeatability_refinement(
+    result: HamiltonianRepeatabilityRefinementResult,
+) -> None:
+    groups = _repeatability_refinement_groups(result)
+    if not groups:
+        raise ValueError("result must contain at least one refinement row")
+    labels = list(groups)
+    before = [[row.initial_fidelity for row in groups[label]] for label in labels]
+    after = [[row.refined_fidelity for row in groups[label]] for label in labels]
+    steps = []
+    for label in labels:
+        reached = [row.steps_to_threshold for row in groups[label] if row.steps_to_threshold >= 0]
+        steps.append(reached if reached else [float("nan")])
+
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11, 4))
+    positions_before = [i + 1 - 0.15 for i in range(len(labels))]
+    positions_after = [i + 1 + 0.15 for i in range(len(labels))]
+    ax0.boxplot(before, positions=positions_before, widths=0.25, showmeans=True)
+    ax0.boxplot(after, positions=positions_after, widths=0.25, showmeans=True)
+    ax0.set_xticks(range(1, len(labels) + 1), labels)
+    ax0.set_ylabel("unitary fidelity")
+    ax0.set_ylim(0.0, 1.02)
+    ax0.set_title("Before vs after refinement")
+    ax0.legend(
+        [
+            plt.Line2D([0], [0], color="tab:blue"),
+            plt.Line2D([0], [0], color="tab:orange"),
+        ],
+        ["before", "after"],
+        loc="lower right",
+    )
+
+    ax1.boxplot(steps, labels=labels, showmeans=True)
+    ax1.set_ylabel(f"steps to F >= {result.threshold:g}")
+    ax1.set_title("Refinement speed")
+    fig.suptitle("Token vs generated-search refinement basins")
     fig.tight_layout()
 
 
