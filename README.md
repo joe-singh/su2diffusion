@@ -223,3 +223,10 @@ held-out Hamiltonian proposal quality against the generated local-gate search
 baseline for each template. This is the first direct check of whether the
 diffusion model benefits from the larger universal two-qubit circuit ansatz,
 not just whether the local optimizer can use it.
+
+Level 2C keeps the three-CZ `SU(2)^8` token architecture fixed and scales the
+solution-stack dataset. It compares settings like `64x2`, `128x2`, `256x2`,
+and `128x4`, where the first number is the number of Hamiltonian training
+targets and the second is refined solution stacks kept per target. This asks
+whether the weaker eight-slot proposal quality is mainly a data coverage issue
+before increasing model size.
