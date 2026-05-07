@@ -265,6 +265,15 @@ class HamiltonianTokenStackDataScaleResult:
     rows: list[HamiltonianTokenStackDataScaleRow]
 
 
+@dataclass
+class HamiltonianTokenStackTrainingBudgetResult:
+    train_dataset: HamiltonianSolutionDataset
+    heldout_targets: list[HamiltonianTarget]
+    heldout_baseline: HamiltonianSuiteResult
+    diagnostics: dict[tuple[int, int], HamiltonianConditionedOverfitDiagnosticResult]
+    rows: list["HamiltonianTokenTrainingBudgetRow"]
+
+
 @dataclass(frozen=True)
 class HamiltonianTokenTrainingBudgetRow:
     num_steps: int
@@ -917,6 +926,42 @@ def _solution_dataset_to_cpu(dataset: HamiltonianSolutionDataset) -> Hamiltonian
         stacks=dataset.stacks.detach().cpu(),
         initial_fidelities=dataset.initial_fidelities.detach().cpu(),
         refined_fidelities=dataset.refined_fidelities.detach().cpu(),
+    )
+
+
+def _solution_dataset_prefix(
+    dataset: HamiltonianSolutionDataset,
+    n_unique_targets: int,
+) -> HamiltonianSolutionDataset:
+    if n_unique_targets <= 0:
+        raise ValueError("n_unique_targets must be positive")
+
+    seen: set[str] = set()
+    target_names: list[str] = []
+    for target in dataset.targets:
+        if target.name not in seen:
+            seen.add(target.name)
+            target_names.append(target.name)
+        if len(target_names) == n_unique_targets:
+            break
+    if len(target_names) < n_unique_targets:
+        raise ValueError(
+            f"dataset has only {len(target_names)} unique targets, cannot take {n_unique_targets}"
+        )
+
+    keep_names = set(target_names)
+    indices = [i for i, target in enumerate(dataset.targets) if target.name in keep_names]
+    if not indices:
+        raise ValueError("dataset prefix selected no solution stacks")
+    index_tensor = torch.tensor(indices, dtype=torch.long, device=dataset.stacks.device)
+    return replace(
+        dataset,
+        targets=[dataset.targets[i] for i in indices],
+        benchmarks=[dataset.benchmarks[i] for i in indices],
+        refinements=[dataset.refinements[i] for i in indices],
+        stacks=dataset.stacks.index_select(0, index_tensor),
+        initial_fidelities=dataset.initial_fidelities.index_select(0, index_tensor),
+        refined_fidelities=dataset.refined_fidelities.index_select(0, index_tensor),
     )
 
 
@@ -2392,6 +2437,182 @@ def run_hamiltonian_token_stack_data_scale_benchmark(
             _clear_cuda_cache_for_device(device)
 
     return HamiltonianTokenStackDataScaleResult(
+        heldout_targets=heldout_targets,
+        heldout_baseline=heldout_baseline,
+        diagnostics=diagnostics,
+        rows=rows,
+    )
+
+
+def run_hamiltonian_token_stack_training_budget_benchmark(
+    train_target_counts: tuple[int, ...] | list[int],
+    train_step_counts: tuple[int, ...] | list[int],
+    heldout_targets: list[HamiltonianTarget],
+    clifford_gates: torch.Tensor,
+    clifford_labels: list[str],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    config: CircuitExperimentConfig | str,
+    terms: tuple[str, ...] = ("XI", "IZ", "XX", "ZZ"),
+    coefficient_scale: float = 0.35,
+    time: float = 0.8,
+    train_seed: int = 2607,
+    dataset_seed: int = 2707,
+    heldout_baseline_seed: int = 2807,
+    perturb_scale: float = 0.12,
+    entangler: str = "cz",
+    n_entanglers: int = 3,
+    n_random_candidates: int = 25_000,
+    n_analytic_gates: int = 1024,
+    n_haar_gates: int = 1024,
+    top_k: int = 5,
+    refinement_steps: int = 160,
+    refinement_lr: float = 0.05,
+    fidelity_threshold: float = 0.0,
+    solutions_per_target: int = 1,
+    solution_selection: str = "top",
+    selection_pool_size: int | None = None,
+    keep_models: bool = False,
+    clear_cuda_cache: bool = True,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> HamiltonianTokenStackTrainingBudgetResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    if not train_target_counts:
+        raise ValueError("train_target_counts must contain at least one count")
+    if not train_step_counts:
+        raise ValueError("train_step_counts must contain at least one step count")
+    counts = tuple(sorted({int(count) for count in train_target_counts}))
+    steps = tuple(sorted({int(step) for step in train_step_counts}))
+    if counts[0] <= 0:
+        raise ValueError("train target counts must be positive")
+    if steps[0] <= 0:
+        raise ValueError("train step counts must be positive")
+    if not heldout_targets:
+        raise ValueError("heldout_targets must contain at least one target")
+
+    device = torch.device(device) if device is not None else generated_gates.device
+    max_count = counts[-1]
+    train_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=max_count,
+        terms=terms,
+        coefficient_scale=coefficient_scale,
+        time=time,
+        seed=train_seed,
+        device=device,
+    )
+    train_dataset = generate_hamiltonian_solution_dataset(
+        train_targets,
+        clifford_gates=clifford_gates,
+        clifford_labels=clifford_labels,
+        generated_gates=generated_gates,
+        generated_labels=generated_labels,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        n_entanglers=n_entanglers,
+        n_random_candidates=n_random_candidates,
+        n_analytic_gates=n_analytic_gates,
+        n_haar_gates=n_haar_gates,
+        top_k=max(top_k, selection_pool_size or solutions_per_target),
+        seed=dataset_seed,
+        refinement_steps=refinement_steps,
+        refinement_lr=refinement_lr,
+        fidelity_threshold=fidelity_threshold,
+        solutions_per_target=solutions_per_target,
+        solution_selection=solution_selection,
+        selection_pool_size=selection_pool_size,
+        show_progress=show_progress,
+    )
+    heldout_baseline = run_hamiltonian_suite_benchmark(
+        heldout_targets,
+        clifford_gates=clifford_gates,
+        clifford_labels=clifford_labels,
+        generated_gates=generated_gates,
+        generated_labels=generated_labels,
+        perturb_scale=perturb_scale,
+        entangler=entangler,
+        n_entanglers=n_entanglers,
+        n_random_candidates=n_random_candidates,
+        n_analytic_gates=n_analytic_gates,
+        n_haar_gates=n_haar_gates,
+        top_k=top_k,
+        seed=heldout_baseline_seed,
+        keep_fidelities=False,
+        show_progress=show_progress,
+    )
+    generated_baseline = _aggregate_reports(
+        "generated random",
+        [item.generated_report for item in heldout_baseline.benchmarks],
+    )
+
+    diagnostics: dict[tuple[int, int], HamiltonianConditionedOverfitDiagnosticResult] = {}
+    rows: list[HamiltonianTokenTrainingBudgetRow] = []
+    budget_pairs = [(count, step) for count in counts for step in steps]
+    iterator = budget_pairs
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(
+            iterator,
+            desc=f"Hamiltonian token budget rows ({n_entanglers} CZ)",
+            dynamic_ncols=True,
+        )
+    for count, step in iterator:
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(targets=count, steps=step)
+        dataset = _solution_dataset_prefix(train_dataset, count)
+        train_config = replace(config.train, num_steps=step)
+        budget_config = replace(
+            config,
+            name=f"{config.name}-n{count}-steps{step}",
+            train=train_config,
+        )
+        if clear_cuda_cache:
+            _clear_cuda_cache_for_device(device)
+        diagnostic = run_hamiltonian_token_conditioned_overfit_diagnostic(
+            dataset,
+            heldout_targets=heldout_targets,
+            config=budget_config,
+            device=device,
+            show_progress=show_progress,
+            entangler=entangler,
+            top_k=top_k,
+        )
+        if not keep_models:
+            diagnostic = _overfit_diagnostic_to_cpu(diagnostic)
+        diagnostics[(count, step)] = diagnostic
+
+        train_summary = _aggregate_reports("train targets", diagnostic.train_reports)
+        heldout_summary = _aggregate_reports("heldout targets", diagnostic.heldout_reports)
+        final_loss = float(diagnostic.losses[-1]) if diagnostic.losses else float("nan")
+        rows.append(
+            HamiltonianTokenTrainingBudgetRow(
+                num_steps=step,
+                hidden=train_config.hidden,
+                batch_size=train_config.batch_size,
+                n_train_targets=len(_unique_hamiltonian_targets(dataset.targets)),
+                n_solution_stacks=int(dataset.stacks.shape[0]),
+                final_loss=final_loss,
+                train_mean_best=train_summary.mean_best,
+                heldout_mean_best=heldout_summary.mean_best,
+                generated_mean_best=generated_baseline.mean_best,
+                heldout_delta_vs_generated=heldout_summary.mean_best - generated_baseline.mean_best,
+                heldout_median_best=heldout_summary.median_best,
+                heldout_min_best=heldout_summary.min_best,
+                heldout_max_best=heldout_summary.max_best,
+                heldout_success_95=heldout_summary.success_95,
+                heldout_success_98=heldout_summary.success_98,
+                heldout_success_99=heldout_summary.success_99,
+            )
+        )
+        if clear_cuda_cache:
+            _clear_cuda_cache_for_device(device)
+
+    return HamiltonianTokenStackTrainingBudgetResult(
+        train_dataset=train_dataset,
         heldout_targets=heldout_targets,
         heldout_baseline=heldout_baseline,
         diagnostics=diagnostics,
@@ -4090,6 +4311,12 @@ def summarize_hamiltonian_token_stack_data_scale(
     return result.rows
 
 
+def summarize_hamiltonian_token_stack_training_budget(
+    result: HamiltonianTokenStackTrainingBudgetResult,
+) -> list[HamiltonianTokenTrainingBudgetRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_token_training_budget(
     result: HamiltonianTokenTrainingBudgetResult,
 ) -> list[HamiltonianTokenTrainingBudgetRow]:
@@ -4437,6 +4664,32 @@ def print_hamiltonian_token_stack_data_scale_summary(result: HamiltonianTokenSta
             f"{row.solutions_per_target:<12} "
             f"{row.n_solution_stacks:<7} "
             f"{row.num_steps:<7} "
+            f"{row.final_loss:>8.5f}   "
+            f"{row.train_mean_best:>10.4f}   "
+            f"{row.heldout_mean_best:>12.4f}   "
+            f"{row.generated_mean_best:>8.4f}   "
+            f"{row.heldout_delta_vs_generated:>+9.4f}   "
+            f"{row.heldout_success_95:>6.1%}   "
+            f"{row.heldout_success_98:>6.1%}   "
+            f"{row.heldout_success_99:>6.1%}"
+        )
+
+
+def print_hamiltonian_token_stack_training_budget_summary(
+    result: HamiltonianTokenStackTrainingBudgetResult,
+) -> None:
+    header = (
+        "n train   stacks   steps   hidden   loss      train mean   heldout mean   "
+        "gen mean   token-gen   >=0.95   >=0.98   >=0.99"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in summarize_hamiltonian_token_stack_training_budget(result):
+        print(
+            f"{row.n_train_targets:<9} "
+            f"{row.n_solution_stacks:<8} "
+            f"{row.num_steps:<7} "
+            f"{row.hidden:<8} "
             f"{row.final_loss:>8.5f}   "
             f"{row.train_mean_best:>10.4f}   "
             f"{row.heldout_mean_best:>12.4f}   "
@@ -5235,6 +5488,55 @@ def plot_hamiltonian_token_stack_data_scale(result: HamiltonianTokenStackDataSca
     n_entanglers = rows[0].n_entanglers
     n_slots = rows[0].n_slots
     fig.suptitle(f"Hamiltonian token data scale on SU(2)^{n_slots} ({n_entanglers} CZ)")
+    fig.tight_layout()
+
+
+def plot_hamiltonian_token_stack_training_budget(
+    result: HamiltonianTokenStackTrainingBudgetResult,
+) -> None:
+    rows = summarize_hamiltonian_token_stack_training_budget(result)
+    if not rows:
+        raise ValueError("result must contain at least one stack training-budget row")
+    counts = sorted({row.n_train_targets for row in rows})
+    generated = rows[0].generated_mean_best
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    for count in counts:
+        group = [row for row in rows if row.n_train_targets == count]
+        steps = [row.num_steps for row in group]
+        losses = [row.final_loss for row in group]
+        heldout = [row.heldout_mean_best for row in group]
+        success_95 = [row.heldout_success_95 for row in group]
+        success_98 = [row.heldout_success_98 for row in group]
+        label = f"{count} targets"
+
+        axes[0].plot(steps, losses, marker="o", label=label)
+        axes[1].plot(steps, heldout, marker="o", label=label)
+        axes[2].plot(steps, success_95, marker="o", label=f"{label} >=0.95")
+        axes[2].plot(steps, success_98, marker="s", linestyle="--", label=f"{label} >=0.98")
+
+    axes[0].set_xlabel("training steps")
+    axes[0].set_ylabel("final denoising loss")
+    axes[0].set_title("Optimization")
+    axes[0].legend()
+
+    axes[1].axhline(generated, linestyle="--", color="tab:gray", label="generated-search baseline")
+    axes[1].set_xlabel("training steps")
+    axes[1].set_ylabel("heldout mean best fidelity")
+    axes[1].set_ylim(0.0, 1.02)
+    axes[1].set_title("Proposal quality")
+    axes[1].legend()
+
+    axes[2].set_xlabel("training steps")
+    axes[2].set_ylabel("heldout success fraction")
+    axes[2].set_ylim(0.0, 1.02)
+    axes[2].set_title("Held-out success")
+    axes[2].legend()
+
+    if len({row.num_steps for row in rows}) > 1:
+        for ax in axes:
+            ax.set_xscale("log", base=2)
+    fig.suptitle("Hamiltonian token budget on canonical SU(2)^8 data")
     fig.tight_layout()
 
 
