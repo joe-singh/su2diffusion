@@ -360,6 +360,18 @@ class ThreeQubitTokenRefinementResult:
 
 
 @dataclass(frozen=True)
+class ThreeQubitTokenRefinementSummaryRow:
+    source: str
+    n_targets: int
+    proposal_mean: float
+    refined_mean: float
+    refinement_success: float
+    median_steps: float
+    mean_movement: float
+    max_movement: float
+
+
+@dataclass(frozen=True)
 class HamiltonianLevel1HeadlineRow:
     source: str
     n_targets: int
@@ -5295,6 +5307,35 @@ def summarize_three_qubit_token_refinement(
     return result.rows
 
 
+def summarize_three_qubit_token_refinement_headline(
+    result: ThreeQubitTokenRefinementResult,
+) -> list[ThreeQubitTokenRefinementSummaryRow]:
+    rows = []
+    for source, group in _repeatability_refinement_groups(result).items():
+        proposal = torch.tensor([row.initial_fidelity for row in group], dtype=torch.float32)
+        refined = torch.tensor([row.refined_fidelity for row in group], dtype=torch.float32)
+        movement = torch.tensor([row.movement_mean for row in group], dtype=torch.float32)
+        max_movement = torch.tensor([row.movement_max for row in group], dtype=torch.float32)
+        reached = refined >= result.threshold
+        reached_steps = torch.tensor(
+            [row.steps_to_threshold for row in group if row.steps_to_threshold >= 0],
+            dtype=torch.float32,
+        )
+        rows.append(
+            ThreeQubitTokenRefinementSummaryRow(
+                source=source,
+                n_targets=len(group),
+                proposal_mean=float(proposal.mean().item()),
+                refined_mean=float(refined.mean().item()),
+                refinement_success=float(reached.float().mean().item()),
+                median_steps=float(reached_steps.median().item()) if reached_steps.numel() else float("nan"),
+                mean_movement=float(movement.mean().item()),
+                max_movement=float(max_movement.max().item()),
+            )
+        )
+    return rows
+
+
 def summarize_hamiltonian_token_training_budget(
     result: HamiltonianTokenTrainingBudgetResult,
 ) -> list[HamiltonianTokenTrainingBudgetRow]:
@@ -5835,6 +5876,24 @@ def print_three_qubit_token_refinement_summary(
     result: ThreeQubitTokenRefinementResult,
 ) -> None:
     print_hamiltonian_repeatability_refinement_summary(result)
+
+
+def print_three_qubit_token_refinement_headline(
+    result: ThreeQubitTokenRefinementResult,
+) -> None:
+    header = "source             n   proposal   refined   >=threshold   median steps   mean move   max move"
+    print(header)
+    print("-" * len(header))
+    for row in summarize_three_qubit_token_refinement_headline(result):
+        print(
+            f"{row.source:<18} {row.n_targets:<3} "
+            f"{row.proposal_mean:>8.4f}   "
+            f"{row.refined_mean:>7.4f}   "
+            f"{row.refinement_success:>11.1%}   "
+            f"{row.median_steps:>12.1f}   "
+            f"{row.mean_movement:>9.4f}   "
+            f"{row.max_movement:>8.4f}"
+        )
 
 
 def print_hamiltonian_level1_headline_table(result: HamiltonianRepeatabilityRefinementResult) -> None:

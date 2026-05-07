@@ -80,6 +80,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_two_entangler_summary,
     print_three_qubit_template_summary,
     print_three_qubit_token_refinement_summary,
+    print_three_qubit_token_refinement_headline,
     run_hamiltonian_conditioned_diffusion_benchmark,
     run_hamiltonian_conditioned_denoise_diagnostic,
     run_hamiltonian_conditioned_overfit_diagnostic,
@@ -127,6 +128,7 @@ from su2diffusion.hamiltonian import (
     summarize_hamiltonian_token_repeatability,
     summarize_hamiltonian_token_stack_data_scale,
     summarize_hamiltonian_token_stack_training_budget,
+    summarize_three_qubit_token_refinement_headline,
     summarize_hamiltonian_token_template_comparison,
     summarize_hamiltonian_token_training_budget,
     summarize_hamiltonian_repeatability_refinement,
@@ -420,14 +422,19 @@ def test_three_qubit_hamiltonian_token_training_budget_smoke(capsys):
         include_haar=True,
         show_progress=False,
     )
+    headline = summarize_three_qubit_token_refinement_headline(refinement)
+    print_three_qubit_token_refinement_headline(refinement)
     print_three_qubit_token_refinement_summary(refinement)
 
     captured = capsys.readouterr().out
+    assert "proposal" in captured
     assert "generated-search" in captured
     assert isinstance(refinement, ThreeQubitTokenRefinementResult)
     assert refinement.template.name == "line-4cz"
+    assert len(headline) == 3
     assert len(refinement.rows) == 3
     assert {row.source for row in refinement.rows} == {"token", "generated-search", "haar"}
+    assert {row.source for row in headline} == {"token", "generated-search", "haar"}
     assert all(0.0 <= row.refined_fidelity <= 1.0001 for row in refinement.rows)
 
 
