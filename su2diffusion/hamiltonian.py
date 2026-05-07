@@ -1,5 +1,6 @@
 from dataclasses import dataclass, replace
 import gc
+import math
 import re
 
 import matplotlib.pyplot as plt
@@ -5821,6 +5822,65 @@ def _demo_slot_name(template: ThreeQubitCZTemplate, slot: int) -> str:
     return f"L{layer} q{qubit}"
 
 
+def _demo_gate_name(slot: int) -> str:
+    return f"G{slot:02d}"
+
+
+def su2_axis_angle(q: torch.Tensor) -> tuple[float, tuple[float, float, float]]:
+    """Return a compact projective axis-angle description of one SU(2) gate."""
+    q_cpu = q_normalize(q.detach().to(device="cpu", dtype=torch.float32))
+    if q_cpu.shape != (4,):
+        raise ValueError("su2_axis_angle expects a single quaternion with shape (4,)")
+    if float(q_cpu[0].item()) < 0.0:
+        q_cpu = -q_cpu
+
+    w = max(-1.0, min(1.0, float(q_cpu[0].item())))
+    xyz = q_cpu[1:]
+    sin_theta = float(xyz.norm().item())
+    if sin_theta < 1e-8:
+        return 0.0, (1.0, 0.0, 0.0)
+
+    angle = 2.0 * math.atan2(sin_theta, w)
+    axis = xyz / sin_theta
+    return angle, tuple(float(item) for item in axis.tolist())
+
+
+def _format_axis(axis: tuple[float, float, float], precision: int = 2) -> str:
+    names = ("X", "Y", "Z")
+    parts = []
+    for value, name in zip(axis, names):
+        if abs(value) >= 10 ** (-(precision + 1)):
+            parts.append(f"{value:+.{precision}f}{name}")
+    return " ".join(parts) if parts else "+1.00X"
+
+
+def format_su2_axis_angle(q: torch.Tensor, precision: int = 3) -> str:
+    """Format one SU(2) gate as an axis-angle local rotation."""
+    angle, axis = su2_axis_angle(q)
+    if abs(angle) < 10 ** (-(precision + 1)):
+        return "I"
+    return f"R({_format_axis(axis)}, {angle:.{precision}f} rad)"
+
+
+def format_hamiltonian_demo_circuit(result: HamiltonianDemoResult) -> str:
+    """Return a readable local-layer/CZ circuit description for a demo result."""
+    n_layers = len(result.template.edges) + 1
+    lines = [f"{result.template.name}: " + " - ".join(
+        f"L{layer}" if layer == n_layers - 1 else f"L{layer} - CZ{a}{b}"
+        for layer, (a, b) in enumerate((*result.template.edges, (-1, -1)))
+    )]
+    for layer in range(n_layers):
+        entries = []
+        for qubit in range(result.template.n_qubits):
+            slot = layer * result.template.n_qubits + qubit
+            entries.append(f"q{qubit}={_demo_gate_name(slot)}")
+        lines.append(f"  L{layer}: " + "; ".join(entries))
+        if layer < len(result.template.edges):
+            a, b = result.template.edges[layer]
+            lines.append(f"       CZ q{a}-q{b}")
+    return "\n".join(lines)
+
+
 def print_hamiltonian_demo(result: HamiltonianDemoResult, max_slots: int | None = None) -> None:
     print_hamiltonian_target(result.target)
     print()
@@ -5837,15 +5897,24 @@ def print_hamiltonian_demo(result: HamiltonianDemoResult, max_slots: int | None 
     print(f"  mean SU(2): {result.movement_mean:.4f}")
     print(f"  max  SU(2): {result.movement_max:.4f}")
     print()
+    print("synthesized circuit after refinement:")
+    print(format_hamiltonian_demo_circuit(result))
+    print()
 
-    header = "slot    label                movement"
+    header = "gate  slot    source label         refined local gate                  movement"
     print(header)
     print("-" * len(header))
     labels = result.candidate.slot_labels
+    refined = q_normalize(result.refinement.refined_gates.detach())
     n_slots = len(result.slot_movements) if max_slots is None else min(max_slots, len(result.slot_movements))
     for slot in range(n_slots):
         label = labels[slot] if slot < len(labels) and labels[slot] is not None else "continuous"
-        print(f"{_demo_slot_name(result.template, slot):<7} {str(label):<18} {result.slot_movements[slot]:>8.4f}")
+        gate = format_su2_axis_angle(refined[slot])
+        print(
+            f"{_demo_gate_name(slot):<5} "
+            f"{_demo_slot_name(result.template, slot):<7} "
+            f"{str(label):<18} {gate:<35} {result.slot_movements[slot]:>8.4f}"
+        )
     if max_slots is not None and len(result.slot_movements) > max_slots:
         print(f"... {len(result.slot_movements) - max_slots} more")
 
@@ -7588,20 +7657,60 @@ def plot_hamiltonian_demo(result: HamiltonianDemoResult) -> None:
     steps = list(range(len(trace)))
     slot_labels = [_demo_slot_name(result.template, slot) for slot in range(len(result.slot_movements))]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
     axes[0].plot(steps, trace, marker="o")
     axes[0].axhline(result.threshold, linestyle="--", color="tab:gray", label=f"F >= {result.threshold:g}")
     axes[0].set_xlabel("refinement step")
     axes[0].set_ylabel("unitary fidelity")
     axes[0].set_ylim(0.0, 1.02)
-    axes[0].set_title("Hamiltonian demo refinement")
+    axes[0].set_title("Refinement trace")
     axes[0].legend()
 
-    axes[1].bar(slot_labels, result.slot_movements)
-    axes[1].set_xlabel("local slot")
-    axes[1].set_ylabel("SU(2) movement")
-    axes[1].set_title("Per-slot proposal movement")
-    axes[1].tick_params(axis="x", rotation=60)
+    _plot_three_qubit_demo_circuit(axes[1], result.template)
+
+    axes[2].bar(slot_labels, result.slot_movements)
+    axes[2].set_xlabel("local slot")
+    axes[2].set_ylabel("SU(2) movement")
+    axes[2].set_title("Proposal movement")
+    axes[2].tick_params(axis="x", rotation=60)
 
     fig.suptitle(f"{result.target.name}: {result.source} on {result.template.name}")
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
+
+
+def _plot_three_qubit_demo_circuit(ax, template: ThreeQubitCZTemplate) -> None:
+    n_layers = len(template.edges) + 1
+    layer_x = [2.0 * layer for layer in range(n_layers)]
+    y_by_qubit = {qubit: template.n_qubits - 1 - qubit for qubit in range(template.n_qubits)}
+
+    for qubit, y in y_by_qubit.items():
+        ax.hlines(y, -0.6, layer_x[-1] + 0.6, color="black", linewidth=1)
+        ax.text(-0.85, y, f"q{qubit}", ha="right", va="center")
+
+    for layer, x in enumerate(layer_x):
+        for qubit, y in y_by_qubit.items():
+            ax.text(
+                x,
+                y,
+                f"L{layer}q{qubit}",
+                ha="center",
+                va="center",
+                fontsize=8,
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "tab:blue"},
+            )
+
+    for layer, (a, b) in enumerate(template.edges):
+        x = layer_x[layer] + 1.0
+        ya = y_by_qubit[a]
+        yb = y_by_qubit[b]
+        ax.plot([x, x], [ya, yb], color="tab:orange", linewidth=2)
+        ax.scatter([x, x], [ya, yb], s=70, color="tab:orange", zorder=3)
+        ax.text(x, min(ya, yb) - 0.32, f"CZ{a}{b}", ha="center", va="top", fontsize=8)
+
+    ax.set_xlim(-1.0, layer_x[-1] + 0.8)
+    ax.set_ylim(-0.7, template.n_qubits - 0.3)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title("Circuit skeleton")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
