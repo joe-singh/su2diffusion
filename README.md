@@ -243,3 +243,11 @@ Level 2E reuses that canonical `SU(2)^8` setup for a focused training-budget
 check. It builds the largest canonical dataset once, trains on prefixes such as
 `128x1` and `256x1`, and compares multiple denoising step budgets against the
 same held-out Hamiltonians and generated-search baseline.
+
+Level 3A starts the move from two to three qubits. It does not train a new
+diffusion model yet; instead it benchmarks fixed 3-qubit CZ templates such as
+`CZ01-CZ12-CZ01`, `CZ12-CZ01-CZ12`, a four-CZ line, and an all-pairs three-CZ
+pattern. For each 3-qubit Hamiltonian target it searches local `SU(2)` gates,
+refines them on the product manifold, and reports which entangler layout gives
+the best proposal/refinement geometry. The winning template becomes the first
+candidate for a later `SU(2)^n` circuit-token diffusion model.
