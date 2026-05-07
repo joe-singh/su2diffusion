@@ -351,6 +351,14 @@ class HamiltonianRepeatabilityRefinementResult:
     threshold: float
 
 
+@dataclass
+class ThreeQubitTokenRefinementResult:
+    token_budget: HamiltonianTokenStackTrainingBudgetResult
+    rows: list[HamiltonianRepeatabilityRefinementRow]
+    threshold: float
+    template: "ThreeQubitCZTemplate"
+
+
 @dataclass(frozen=True)
 class HamiltonianLevel1HeadlineRow:
     source: str
@@ -3905,6 +3913,196 @@ def run_hamiltonian_repeatability_refinement_benchmark(
     )
 
 
+def _refine_three_qubit_stack_seed(
+    target: HamiltonianTarget,
+    source: str,
+    start_stack: torch.Tensor,
+    initial_fidelity: float,
+    template: ThreeQubitCZTemplate,
+    run: int,
+    refinement_steps: int,
+    refinement_lr: float,
+    threshold: float,
+) -> HamiltonianRepeatabilityRefinementRow:
+    candidate = _candidate_from_stack(
+        target,
+        source,
+        initial_fidelity,
+        n_slots=template.n_slots,
+        entangler=template.name,
+    )
+    refinement = refine_three_qubit_template_candidate(
+        start_stack,
+        candidate,
+        target_unitary=target.unitary,
+        template=template,
+        num_steps=refinement_steps,
+        lr=refinement_lr,
+    )
+    movements, movement_mean, movement_max = _refinement_movement(
+        start_stack,
+        refinement.refined_gates,
+    )
+    return HamiltonianRepeatabilityRefinementRow(
+        run=run,
+        target=target.name,
+        source=source,
+        initial_fidelity=refinement.initial_fidelity,
+        refined_fidelity=refinement.refined_fidelity,
+        steps_to_threshold=_steps_to_threshold(
+            refinement.initial_fidelity,
+            refinement.fidelity_trace,
+            threshold,
+        ),
+        slot_movements=movements,
+        movement_mean=movement_mean,
+        movement_max=movement_max,
+    )
+
+
+def run_three_qubit_hamiltonian_token_refinement_benchmark(
+    token_budget: HamiltonianTokenStackTrainingBudgetResult,
+    generated_gates: torch.Tensor,
+    template: str | ThreeQubitCZTemplate = "line-4cz",
+    refinement_steps: int = 80,
+    refinement_lr: float = 0.05,
+    threshold: float = 0.99,
+    include_haar: bool = True,
+    haar_seed: int = 9707,
+    show_progress: bool = True,
+) -> ThreeQubitTokenRefinementResult:
+    template = _coerce_three_qubit_template(template)
+    if not token_budget.diagnostics:
+        raise ValueError("token_budget must contain at least one diagnostic")
+    if len(token_budget.heldout_targets) != len(token_budget.heldout_baseline.benchmarks):
+        raise ValueError("heldout targets and baseline benchmarks must have matching lengths")
+    if generated_gates.shape[0] == 0:
+        raise ValueError("generated_gates must contain at least one gate")
+    if refinement_steps <= 0:
+        raise ValueError("refinement_steps must be positive")
+    if refinement_lr <= 0:
+        raise ValueError("refinement_lr must be positive")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("threshold must be between 0 and 1")
+
+    diagnostic_key = sorted(token_budget.diagnostics)[-1]
+    diagnostic = token_budget.diagnostics[diagnostic_key]
+    if len(token_budget.heldout_targets) != len(diagnostic.heldout_reports):
+        raise ValueError("heldout targets and token reports must have matching lengths")
+    if diagnostic.heldout_generated_by_target.shape[-2] != template.n_slots:
+        raise ValueError(f"token diagnostic must contain {template.n_slots} local slots")
+
+    rows: list[HamiltonianRepeatabilityRefinementRow] = []
+    work_items = list(
+        enumerate(
+            zip(
+                token_budget.heldout_targets,
+                diagnostic.heldout_reports,
+                token_budget.heldout_baseline.benchmarks,
+            )
+        )
+    )
+    iterator = work_items
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(
+            iterator,
+            desc=f"Refining {template.name} token/generated basins",
+            dynamic_ncols=True,
+        )
+
+    generated_gates = q_normalize(generated_gates)
+    for i, (target, token_report, benchmark) in iterator:
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(target=target.name)
+
+        token_candidate = token_report.candidates[0]
+        token_stack_index = token_candidate.slot_indices[0]
+        token_stack = diagnostic.heldout_generated_by_target[i, token_stack_index]
+        rows.append(
+            _refine_three_qubit_stack_seed(
+                target,
+                "token",
+                token_stack,
+                token_candidate.fidelity,
+                template,
+                run=0,
+                refinement_steps=refinement_steps,
+                refinement_lr=refinement_lr,
+                threshold=threshold,
+            )
+        )
+
+        generated_candidate = benchmark.generated_report.candidates[0]
+        generated_start = q_normalize(generated_gates[list(generated_candidate.slot_indices)])
+        generated_refinement = refine_three_qubit_template_candidate(
+            generated_gates,
+            generated_candidate,
+            target_unitary=target.unitary,
+            template=template,
+            num_steps=refinement_steps,
+            lr=refinement_lr,
+        )
+        generated_movements, generated_movement_mean, generated_movement_max = _refinement_movement(
+            generated_start,
+            generated_refinement.refined_gates,
+        )
+        rows.append(
+            HamiltonianRepeatabilityRefinementRow(
+                run=0,
+                target=target.name,
+                source="generated-search",
+                initial_fidelity=generated_refinement.initial_fidelity,
+                refined_fidelity=generated_refinement.refined_fidelity,
+                steps_to_threshold=_steps_to_threshold(
+                    generated_refinement.initial_fidelity,
+                    generated_refinement.fidelity_trace,
+                    threshold,
+                ),
+                slot_movements=generated_movements,
+                movement_mean=generated_movement_mean,
+                movement_max=generated_movement_max,
+            )
+        )
+
+        if include_haar:
+            device = generated_gates.device
+            generator_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
+            generator = torch.Generator(device=generator_device)
+            generator.manual_seed(haar_seed + i)
+            haar_start = sample_haar(
+                template.n_slots,
+                device=generator_device,
+                generator=generator,
+            ).to(device=device)
+            haar_unitary = compose_three_qubit_template_units(
+                quaternion_to_unitary(haar_start),
+                template,
+            )
+            haar_fidelity = unitary_fidelity(haar_unitary, target.unitary.to(device=device))
+            rows.append(
+                _refine_three_qubit_stack_seed(
+                    target,
+                    "haar",
+                    haar_start,
+                    haar_fidelity,
+                    template,
+                    run=0,
+                    refinement_steps=refinement_steps,
+                    refinement_lr=refinement_lr,
+                    threshold=threshold,
+                )
+            )
+
+    return ThreeQubitTokenRefinementResult(
+        token_budget=token_budget,
+        rows=rows,
+        threshold=threshold,
+        template=template,
+    )
+
+
 def evaluate_hamiltonian_conditioned_denoising(
     model: TargetConditionedCircuitDenoiser,
     dataset: HamiltonianSolutionDataset,
@@ -5091,6 +5289,12 @@ def summarize_three_qubit_template_benchmark(
     return result.rows
 
 
+def summarize_three_qubit_token_refinement(
+    result: ThreeQubitTokenRefinementResult,
+) -> list[HamiltonianRepeatabilityRefinementRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_token_training_budget(
     result: HamiltonianTokenTrainingBudgetResult,
 ) -> list[HamiltonianTokenTrainingBudgetRow]:
@@ -5618,6 +5822,19 @@ def print_hamiltonian_repeatability_refinement_summary(
             f"{mean_moves.mean().item():>9.4f}   "
             f"{max_moves.max().item():>8.4f}"
         )
+
+
+def print_three_qubit_token_refinement(
+    result: ThreeQubitTokenRefinementResult,
+    max_rows: int | None = 10,
+) -> None:
+    print_hamiltonian_repeatability_refinement(result, max_rows=max_rows)
+
+
+def print_three_qubit_token_refinement_summary(
+    result: ThreeQubitTokenRefinementResult,
+) -> None:
+    print_hamiltonian_repeatability_refinement_summary(result)
 
 
 def print_hamiltonian_level1_headline_table(result: HamiltonianRepeatabilityRefinementResult) -> None:
@@ -6487,6 +6704,13 @@ def plot_hamiltonian_repeatability_refinement(
     ax2.set_ylabel("mean SU(2) movement")
     ax2.set_title("Proposal movement")
     fig.suptitle("Token vs generated-search refinement basins")
+    fig.tight_layout()
+
+
+def plot_three_qubit_token_refinement(result: ThreeQubitTokenRefinementResult) -> None:
+    plot_hamiltonian_repeatability_refinement(result)
+    fig = plt.gcf()
+    fig.suptitle(f"Three-qubit {result.template.name} refinement basins")
     fig.tight_layout()
 
 

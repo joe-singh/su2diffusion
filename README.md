@@ -263,3 +263,10 @@ where each `Lk` is a layer of three local `SU(2)` gates. One sample therefore
 lives on `SU(2)^15`. The benchmark builds refined Hamiltonian solution stacks,
 trains a Hamiltonian-conditioned token denoiser, and compares held-out proposal
 quality against the generated local-gate search baseline.
+
+Level 3C reuses the Level 3B model and runs the same local `SU(2)^15`
+optimizer from three starting points: the best token-diffusion proposal, the
+best generated local-gate search proposal, and a Haar-random local stack. It
+reports before/after fidelity, steps to the target threshold, and per-slot
+movement. This checks whether the 3-qubit diffusion model gives a better
+refinement basin even when its raw proposal fidelity is still modest.

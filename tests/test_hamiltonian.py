@@ -14,6 +14,7 @@ from su2diffusion.hamiltonian import (
     HamiltonianTokenDataScaleResult,
     HamiltonianTokenStackDataScaleResult,
     HamiltonianTokenStackTrainingBudgetResult,
+    ThreeQubitTokenRefinementResult,
     HamiltonianTokenTemplateComparisonResult,
     HamiltonianTokenTrainingBudgetResult,
     HamiltonianTokenRepeatabilityResult,
@@ -78,6 +79,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_two_entangler_benchmark,
     print_hamiltonian_two_entangler_summary,
     print_three_qubit_template_summary,
+    print_three_qubit_token_refinement_summary,
     run_hamiltonian_conditioned_diffusion_benchmark,
     run_hamiltonian_conditioned_denoise_diagnostic,
     run_hamiltonian_conditioned_overfit_diagnostic,
@@ -98,6 +100,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_token_template_comparison,
     run_hamiltonian_token_training_budget_benchmark,
     run_three_qubit_hamiltonian_token_training_budget_benchmark,
+    run_three_qubit_hamiltonian_token_refinement_benchmark,
     run_hamiltonian_repeatability_refinement_benchmark,
     refine_hamiltonian_prior_mixture,
     refine_hamiltonian_prior_mixture_budget_sweep,
@@ -407,6 +410,25 @@ def test_three_qubit_hamiltonian_token_training_budget_smoke(capsys):
     assert len(rows) == 1
     assert rows[0].n_solution_stacks == 1
     assert 0.0 <= rows[0].heldout_mean_best <= 1.0001
+
+    refinement = run_three_qubit_hamiltonian_token_refinement_benchmark(
+        result,
+        generated_gates=centers,
+        template="line-4cz",
+        refinement_steps=1,
+        refinement_lr=0.02,
+        include_haar=True,
+        show_progress=False,
+    )
+    print_three_qubit_token_refinement_summary(refinement)
+
+    captured = capsys.readouterr().out
+    assert "generated-search" in captured
+    assert isinstance(refinement, ThreeQubitTokenRefinementResult)
+    assert refinement.template.name == "line-4cz"
+    assert len(refinement.rows) == 3
+    assert {row.source for row in refinement.rows} == {"token", "generated-search", "haar"}
+    assert all(0.0 <= row.refined_fidelity <= 1.0001 for row in refinement.rows)
 
 
 def test_hamiltonian_solution_dataset_smoke(capsys):
