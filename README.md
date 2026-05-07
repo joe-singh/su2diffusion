@@ -282,3 +282,10 @@ Level 3D is the paper-grade repeatability version of Level 3C. It reruns the
 and aggregates the per-run proposal, refined-fidelity, success-rate, optimizer
 step, and movement metrics. The notebook keeps this cell off by default because
 it intentionally repeats the long 3-qubit run several times.
+
+Level 3E turns the statistical workflow into a single-target demo report. Given
+one Hamiltonian target, it prints the `line-4cz` template, proposal/refined
+fidelity, steps to threshold, and per-slot `SU(2)` movement, then plots the
+refinement trace and local-gate movement. If the Level 3B token model has been
+run, this demo uses a token-diffusion proposal; otherwise it falls back to
+generated local-gate search.

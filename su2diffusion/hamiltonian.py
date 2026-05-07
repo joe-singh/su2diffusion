@@ -392,6 +392,22 @@ class ThreeQubitTokenRepeatabilityResult:
     template: "ThreeQubitCZTemplate"
 
 
+@dataclass
+class HamiltonianDemoResult:
+    target: HamiltonianTarget
+    template: "ThreeQubitCZTemplate"
+    source: str
+    report: SynthesisReport
+    candidate: SynthesisCandidate
+    start_stack: torch.Tensor
+    refinement: RefinementResult
+    slot_movements: tuple[float, ...]
+    movement_mean: float
+    movement_max: float
+    steps_to_threshold: int
+    threshold: float
+
+
 @dataclass(frozen=True)
 class HamiltonianLevel1HeadlineRow:
     source: str
@@ -1172,6 +1188,123 @@ def refine_three_qubit_template_candidate(
         slot_indices=candidate.slot_indices,
         slot_labels=candidate.slot_labels,
         refined_gates=refined_gates.detach(),
+    )
+
+
+def run_three_qubit_hamiltonian_demo(
+    target: HamiltonianTarget,
+    generated_gates: torch.Tensor | None = None,
+    generated_labels: list[str | None] | None = None,
+    token_stacks: torch.Tensor | None = None,
+    template: str | ThreeQubitCZTemplate = "line-4cz",
+    source: str | None = None,
+    n_random_candidates: int = 10_000,
+    top_k: int = 5,
+    seed: int = 0,
+    refinement_steps: int = 80,
+    refinement_lr: float = 0.05,
+    threshold: float = 0.99,
+) -> HamiltonianDemoResult:
+    template = _coerce_three_qubit_template(template)
+    if target.unitary.shape != (2**template.n_qubits, 2**template.n_qubits):
+        raise ValueError(f"target must be a {template.n_qubits}-qubit Hamiltonian target")
+    if token_stacks is None and generated_gates is None:
+        raise ValueError("Provide token_stacks or generated_gates")
+    if refinement_steps <= 0:
+        raise ValueError("refinement_steps must be positive")
+    if refinement_lr <= 0:
+        raise ValueError("refinement_lr must be positive")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("threshold must be between 0 and 1")
+
+    if token_stacks is not None:
+        if token_stacks.ndim != 3 or token_stacks.shape[-1] != 4:
+            raise ValueError("token_stacks must have shape (n_samples, n_slots, 4)")
+        if token_stacks.shape[1] != template.n_slots:
+            raise ValueError(f"Template {template.name!r} expects {template.n_slots} token stack slots")
+        demo_source = source or "token"
+        stacks = q_normalize(token_stacks)
+        report = synthesize_three_qubit_template_stack_report(
+            stacks,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            template=template,
+            top_k=top_k,
+            name=f"{target.name} {template.name} {demo_source} demo",
+            keep_fidelities=False,
+        )
+        candidate = report.candidates[0]
+        stack_index = candidate.slot_indices[0]
+        start_stack = q_normalize(stacks[stack_index])
+        refinement_candidate = _candidate_from_stack(
+            target,
+            demo_source,
+            candidate.fidelity,
+            n_slots=template.n_slots,
+            entangler=template.name,
+        )
+        refinement = refine_three_qubit_template_candidate(
+            start_stack,
+            refinement_candidate,
+            target_unitary=target.unitary,
+            template=template,
+            num_steps=refinement_steps,
+            lr=refinement_lr,
+        )
+    else:
+        if generated_gates is None:
+            raise ValueError("generated_gates must be provided for generated-search demos")
+        if generated_gates.shape[0] == 0:
+            raise ValueError("generated_gates must contain at least one gate")
+        if generated_labels is not None and len(generated_labels) != generated_gates.shape[0]:
+            raise ValueError("generated_labels must have one entry per generated gate")
+        demo_source = source or "generated-search"
+        gates = q_normalize(generated_gates)
+        report = synthesize_three_qubit_template_random_report(
+            gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            template=template,
+            n_candidates=n_random_candidates,
+            top_k=top_k,
+            local_labels=generated_labels,
+            seed=seed,
+            name=f"{target.name} {template.name} {demo_source} demo",
+            mode=demo_source,
+            keep_fidelities=False,
+        )
+        candidate = report.candidates[0]
+        start_stack = q_normalize(gates[list(candidate.slot_indices)])
+        refinement = refine_three_qubit_template_candidate(
+            gates,
+            candidate,
+            target_unitary=target.unitary,
+            template=template,
+            num_steps=refinement_steps,
+            lr=refinement_lr,
+        )
+
+    movements, movement_mean, movement_max = _refinement_movement(
+        start_stack,
+        refinement.refined_gates,
+    )
+    return HamiltonianDemoResult(
+        target=target,
+        template=template,
+        source=demo_source,
+        report=report,
+        candidate=candidate,
+        start_stack=start_stack.detach(),
+        refinement=refinement,
+        slot_movements=movements,
+        movement_mean=movement_mean,
+        movement_max=movement_max,
+        steps_to_threshold=_steps_to_threshold(
+            refinement.initial_fidelity,
+            refinement.fidelity_trace,
+            threshold,
+        ),
+        threshold=threshold,
     )
 
 
@@ -5682,6 +5815,41 @@ def print_hamiltonian_target(target: HamiltonianTarget) -> None:
         print(f"  {term.coefficient:+.4f} {term.pauli}")
 
 
+def _demo_slot_name(template: ThreeQubitCZTemplate, slot: int) -> str:
+    layer = slot // template.n_qubits
+    qubit = slot % template.n_qubits
+    return f"L{layer} q{qubit}"
+
+
+def print_hamiltonian_demo(result: HamiltonianDemoResult, max_slots: int | None = None) -> None:
+    print_hamiltonian_target(result.target)
+    print()
+    print(f"template: {result.template.name}")
+    print(f"CZ edges: {', '.join(f'{a}{b}' for a, b in result.template.edges)}")
+    print(f"source:   {result.source}")
+    steps = str(result.steps_to_threshold) if result.steps_to_threshold >= 0 else "miss"
+    print()
+    print("fidelity:")
+    print(f"  proposal: {result.refinement.initial_fidelity:.4f}")
+    print(f"  refined:  {result.refinement.refined_fidelity:.4f}")
+    print(f"  steps to F >= {result.threshold:g}: {steps}")
+    print("movement:")
+    print(f"  mean SU(2): {result.movement_mean:.4f}")
+    print(f"  max  SU(2): {result.movement_max:.4f}")
+    print()
+
+    header = "slot    label                movement"
+    print(header)
+    print("-" * len(header))
+    labels = result.candidate.slot_labels
+    n_slots = len(result.slot_movements) if max_slots is None else min(max_slots, len(result.slot_movements))
+    for slot in range(n_slots):
+        label = labels[slot] if slot < len(labels) and labels[slot] is not None else "continuous"
+        print(f"{_demo_slot_name(result.template, slot):<7} {str(label):<18} {result.slot_movements[slot]:>8.4f}")
+    if max_slots is not None and len(result.slot_movements) > max_slots:
+        print(f"... {len(result.slot_movements) - max_slots} more")
+
+
 def print_hamiltonian_two_entangler_benchmark(benchmark: HamiltonianSynthesisBenchmark) -> None:
     header = "mode                    best fidelity   best labels"
     print(header)
@@ -7412,4 +7580,28 @@ def plot_three_qubit_template_benchmark(result: ThreeQubitTemplateBenchmarkResul
     axes[1].set_ylim(0.0, 1.02)
     axes[1].set_title("Refined success")
     axes[1].legend()
+    fig.tight_layout()
+
+
+def plot_hamiltonian_demo(result: HamiltonianDemoResult) -> None:
+    trace = [result.refinement.initial_fidelity, *result.refinement.fidelity_trace]
+    steps = list(range(len(trace)))
+    slot_labels = [_demo_slot_name(result.template, slot) for slot in range(len(result.slot_movements))]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(steps, trace, marker="o")
+    axes[0].axhline(result.threshold, linestyle="--", color="tab:gray", label=f"F >= {result.threshold:g}")
+    axes[0].set_xlabel("refinement step")
+    axes[0].set_ylabel("unitary fidelity")
+    axes[0].set_ylim(0.0, 1.02)
+    axes[0].set_title("Hamiltonian demo refinement")
+    axes[0].legend()
+
+    axes[1].bar(slot_labels, result.slot_movements)
+    axes[1].set_xlabel("local slot")
+    axes[1].set_ylabel("SU(2) movement")
+    axes[1].set_title("Per-slot proposal movement")
+    axes[1].tick_params(axis="x", rotation=60)
+
+    fig.suptitle(f"{result.target.name}: {result.source} on {result.template.name}")
     fig.tight_layout()

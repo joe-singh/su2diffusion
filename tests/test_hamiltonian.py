@@ -14,6 +14,7 @@ from su2diffusion.hamiltonian import (
     HamiltonianTokenDataScaleResult,
     HamiltonianTokenStackDataScaleResult,
     HamiltonianTokenStackTrainingBudgetResult,
+    HamiltonianDemoResult,
     ThreeQubitTokenRefinementResult,
     ThreeQubitTokenRepeatabilityResult,
     HamiltonianTokenTemplateComparisonResult,
@@ -44,6 +45,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_budget_refinement_summary,
     print_hamiltonian_conditioned_diffusion,
     print_hamiltonian_conditioned_diffusion_summary,
+    print_hamiltonian_demo,
     print_hamiltonian_denoise_ablation,
     print_hamiltonian_denoise_diagnostic,
     print_hamiltonian_denoise_normalization,
@@ -84,6 +86,7 @@ from su2diffusion.hamiltonian import (
     print_three_qubit_token_refinement_headline,
     print_three_qubit_token_repeatability,
     print_three_qubit_token_repeatability_summary,
+    run_three_qubit_hamiltonian_demo,
     run_hamiltonian_conditioned_diffusion_benchmark,
     run_hamiltonian_conditioned_denoise_diagnostic,
     run_hamiltonian_conditioned_overfit_diagnostic,
@@ -362,6 +365,56 @@ def test_three_qubit_hamiltonian_solution_dataset_and_stack_report_smoke():
     assert dataset.refined_fidelities.shape == (1,)
     assert len(report.candidates) == 1
     assert 0.0 <= report.candidates[0].fidelity <= 1.0001
+
+
+def test_three_qubit_hamiltonian_demo_generated_and_token_paths(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    target = make_random_pauli_hamiltonian_targets(
+        n_targets=1,
+        terms=("XII", "IZZ"),
+        coefficient_scale=0.1,
+        time=0.3,
+        n_qubits=3,
+        seed=146,
+    )[0]
+
+    generated_demo = run_three_qubit_hamiltonian_demo(
+        target,
+        generated_gates=centers,
+        generated_labels=labels,
+        template="line-4cz",
+        n_random_candidates=4,
+        top_k=1,
+        seed=147,
+        refinement_steps=1,
+        refinement_lr=0.02,
+    )
+    token_stacks = centers[:15].unsqueeze(0).repeat(2, 1, 1)
+    token_demo = run_three_qubit_hamiltonian_demo(
+        target,
+        token_stacks=token_stacks,
+        template="line-4cz",
+        source="token",
+        top_k=1,
+        refinement_steps=1,
+        refinement_lr=0.02,
+    )
+    print_hamiltonian_demo(generated_demo, max_slots=3)
+    print_hamiltonian_demo(token_demo, max_slots=3)
+
+    captured = capsys.readouterr().out
+    assert "template: line-4cz" in captured
+    assert "fidelity:" in captured
+    assert isinstance(generated_demo, HamiltonianDemoResult)
+    assert isinstance(token_demo, HamiltonianDemoResult)
+    assert generated_demo.source == "generated-search"
+    assert token_demo.source == "token"
+    assert len(generated_demo.slot_movements) == 15
+    assert len(token_demo.slot_movements) == 15
+    assert 0.0 <= generated_demo.refinement.refined_fidelity <= 1.0001
+    assert 0.0 <= token_demo.refinement.refined_fidelity <= 1.0001
 
 
 def test_three_qubit_hamiltonian_token_training_budget_smoke(capsys):
