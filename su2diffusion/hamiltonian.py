@@ -372,6 +372,27 @@ class ThreeQubitTokenRefinementSummaryRow:
 
 
 @dataclass(frozen=True)
+class ThreeQubitTokenRepeatabilityRunRow:
+    run: int
+    source: str
+    n_targets: int
+    proposal_mean: float
+    refined_mean: float
+    refinement_success: float
+    median_steps: float
+    mean_movement: float
+    max_movement: float
+
+
+@dataclass
+class ThreeQubitTokenRepeatabilityResult:
+    runs: list[ThreeQubitTokenRefinementResult]
+    rows: list[ThreeQubitTokenRepeatabilityRunRow]
+    threshold: float
+    template: "ThreeQubitCZTemplate"
+
+
+@dataclass(frozen=True)
 class HamiltonianLevel1HeadlineRow:
     source: str
     n_targets: int
@@ -4115,6 +4136,165 @@ def run_three_qubit_hamiltonian_token_refinement_benchmark(
     )
 
 
+def run_three_qubit_hamiltonian_token_repeatability_benchmark(
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    config: CircuitExperimentConfig | str,
+    run_seeds: tuple[int, ...] | list[int] = (0, 1, 2),
+    n_heldout_targets: int = 48,
+    train_target_count: int = 32,
+    train_steps: int = 500,
+    template: str | ThreeQubitCZTemplate = "line-4cz",
+    terms: tuple[str, ...] = ("XII", "IZI", "IIZ", "XXI", "IZZ", "ZXZ"),
+    coefficient_scale: float = 0.25,
+    time: float = 0.6,
+    n_random_candidates: int = 10_000,
+    top_k: int = 1,
+    solution_refinement_steps: int = 80,
+    basin_refinement_steps: int = 80,
+    refinement_lr: float = 0.05,
+    fidelity_threshold: float = 0.0,
+    threshold: float = 0.99,
+    solutions_per_target: int = 1,
+    solution_selection: str = "top",
+    selection_pool_size: int | None = None,
+    heldout_seed_base: int = 9007,
+    train_seed_base: int = 9107,
+    dataset_seed_base: int = 9207,
+    baseline_seed_base: int = 9307,
+    haar_seed_base: int = 9707,
+    seed_stride: int = 1000,
+    keep_models: bool = False,
+    clear_cuda_cache: bool = True,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> ThreeQubitTokenRepeatabilityResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    template = _coerce_three_qubit_template(template)
+    if not run_seeds:
+        raise ValueError("run_seeds must contain at least one seed")
+    if n_heldout_targets <= 0:
+        raise ValueError("n_heldout_targets must be positive")
+    if train_target_count <= 0:
+        raise ValueError("train_target_count must be positive")
+    if train_steps <= 0:
+        raise ValueError("train_steps must be positive")
+    if len(generated_labels) != generated_gates.shape[0]:
+        raise ValueError("generated_labels must have one entry per generated gate")
+
+    device = torch.device(device) if device is not None else generated_gates.device
+    generated_gates = q_normalize(generated_gates.to(device=device))
+    config = replace(config, n_slots=template.n_slots)
+
+    runs: list[ThreeQubitTokenRefinementResult] = []
+    rows: list[ThreeQubitTokenRepeatabilityRunRow] = []
+    seeds = tuple(int(seed) for seed in run_seeds)
+    iterator = list(enumerate(seeds))
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(
+            iterator,
+            total=len(seeds),
+            desc=f"Three-qubit repeatability ({template.name})",
+            dynamic_ncols=True,
+        )
+
+    for run_index, run_seed in iterator:
+        seed_offset = run_seed * seed_stride
+        heldout_seed = heldout_seed_base + seed_offset
+        train_seed = train_seed_base + seed_offset
+        dataset_seed = dataset_seed_base + seed_offset
+        baseline_seed = baseline_seed_base + seed_offset
+        haar_seed = haar_seed_base + seed_offset
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(run=run_index, seed=run_seed)
+
+        heldout_targets = make_random_pauli_hamiltonian_targets(
+            n_targets=n_heldout_targets,
+            terms=terms,
+            coefficient_scale=coefficient_scale,
+            time=time,
+            name_prefix=f"threeq-run{run_index}",
+            n_qubits=3,
+            seed=heldout_seed,
+            device=device,
+        )
+        token_budget = run_three_qubit_hamiltonian_token_training_budget_benchmark(
+            train_target_counts=(train_target_count,),
+            train_step_counts=(train_steps,),
+            heldout_targets=heldout_targets,
+            generated_gates=generated_gates,
+            generated_labels=generated_labels,
+            config=replace(config, name=f"{config.name}-{template.name}-repeat{run_index}"),
+            template=template,
+            terms=terms,
+            coefficient_scale=coefficient_scale,
+            time=time,
+            train_seed=train_seed,
+            dataset_seed=dataset_seed,
+            heldout_baseline_seed=baseline_seed,
+            n_random_candidates=n_random_candidates,
+            top_k=top_k,
+            refinement_steps=solution_refinement_steps,
+            refinement_lr=refinement_lr,
+            fidelity_threshold=fidelity_threshold,
+            solutions_per_target=solutions_per_target,
+            solution_selection=solution_selection,
+            selection_pool_size=selection_pool_size,
+            keep_models=keep_models,
+            clear_cuda_cache=clear_cuda_cache,
+            device=device,
+            show_progress=show_progress,
+        )
+        refinement = run_three_qubit_hamiltonian_token_refinement_benchmark(
+            token_budget,
+            generated_gates=generated_gates,
+            template=template,
+            refinement_steps=basin_refinement_steps,
+            refinement_lr=refinement_lr,
+            threshold=threshold,
+            include_haar=True,
+            haar_seed=haar_seed,
+            show_progress=show_progress,
+        )
+        refinement_rows = [replace(row, run=run_index) for row in refinement.rows]
+        refinement = ThreeQubitTokenRefinementResult(
+            token_budget=refinement.token_budget,
+            rows=refinement_rows,
+            threshold=refinement.threshold,
+            template=refinement.template,
+        )
+        runs.append(refinement)
+
+        for headline in summarize_three_qubit_token_refinement_headline(refinement):
+            rows.append(
+                ThreeQubitTokenRepeatabilityRunRow(
+                    run=run_index,
+                    source=headline.source,
+                    n_targets=headline.n_targets,
+                    proposal_mean=headline.proposal_mean,
+                    refined_mean=headline.refined_mean,
+                    refinement_success=headline.refinement_success,
+                    median_steps=headline.median_steps,
+                    mean_movement=headline.mean_movement,
+                    max_movement=headline.max_movement,
+                )
+            )
+        if clear_cuda_cache:
+            _clear_cuda_cache_for_device(device)
+
+    return ThreeQubitTokenRepeatabilityResult(
+        runs=runs,
+        rows=rows,
+        threshold=threshold,
+        template=template,
+    )
+
+
 def evaluate_hamiltonian_conditioned_denoising(
     model: TargetConditionedCircuitDenoiser,
     dataset: HamiltonianSolutionDataset,
@@ -5336,6 +5516,12 @@ def summarize_three_qubit_token_refinement_headline(
     return rows
 
 
+def summarize_three_qubit_token_repeatability(
+    result: ThreeQubitTokenRepeatabilityResult,
+) -> list[ThreeQubitTokenRepeatabilityRunRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_token_training_budget(
     result: HamiltonianTokenTrainingBudgetResult,
 ) -> list[HamiltonianTokenTrainingBudgetRow]:
@@ -5893,6 +6079,61 @@ def print_three_qubit_token_refinement_headline(
             f"{row.median_steps:>12.1f}   "
             f"{row.mean_movement:>9.4f}   "
             f"{row.max_movement:>8.4f}"
+        )
+
+
+def print_three_qubit_token_repeatability(
+    result: ThreeQubitTokenRepeatabilityResult,
+) -> None:
+    header = "run   source             n   proposal   refined   >=threshold   median steps   mean move   max move"
+    print(header)
+    print("-" * len(header))
+    for row in summarize_three_qubit_token_repeatability(result):
+        print(
+            f"{row.run:<5} "
+            f"{row.source:<18} {row.n_targets:<3} "
+            f"{row.proposal_mean:>8.4f}   "
+            f"{row.refined_mean:>7.4f}   "
+            f"{row.refinement_success:>11.1%}   "
+            f"{row.median_steps:>12.1f}   "
+            f"{row.mean_movement:>9.4f}   "
+            f"{row.max_movement:>8.4f}"
+        )
+
+
+def print_three_qubit_token_repeatability_summary(
+    result: ThreeQubitTokenRepeatabilityResult,
+) -> None:
+    rows = summarize_three_qubit_token_repeatability(result)
+    if not rows:
+        raise ValueError("result must contain at least one repeatability row")
+    header = (
+        "source             runs   n/run   proposal mean/std   refined mean/std   "
+        "success mean/std   median steps   mean move   max move"
+    )
+    print(header)
+    print("-" * len(header))
+    sources = []
+    for row in rows:
+        if row.source not in sources:
+            sources.append(row.source)
+    for source in sources:
+        group = [row for row in rows if row.source == source]
+        proposal_mean, proposal_std = _mean_std([row.proposal_mean for row in group])
+        refined_mean, refined_std = _mean_std([row.refined_mean for row in group])
+        success_mean, success_std = _mean_std([row.refinement_success for row in group])
+        median_steps = torch.tensor([row.median_steps for row in group], dtype=torch.float32)
+        mean_move = torch.tensor([row.mean_movement for row in group], dtype=torch.float32)
+        max_move = torch.tensor([row.max_movement for row in group], dtype=torch.float32)
+        n_per_run = int(round(sum(row.n_targets for row in group) / len(group)))
+        print(
+            f"{source:<18} {len(group):<6} {n_per_run:<7} "
+            f"{proposal_mean:>8.4f}/{proposal_std:<6.4f}   "
+            f"{refined_mean:>7.4f}/{refined_std:<6.4f}   "
+            f"{success_mean:>7.1%}/{success_std:<6.1%}   "
+            f"{median_steps.median().item():>12.1f}   "
+            f"{mean_move.mean().item():>9.4f}   "
+            f"{max_move.max().item():>8.4f}"
         )
 
 
@@ -6770,6 +7011,47 @@ def plot_three_qubit_token_refinement(result: ThreeQubitTokenRefinementResult) -
     plot_hamiltonian_repeatability_refinement(result)
     fig = plt.gcf()
     fig.suptitle(f"Three-qubit {result.template.name} refinement basins")
+    fig.tight_layout()
+
+
+def plot_three_qubit_token_repeatability(result: ThreeQubitTokenRepeatabilityResult) -> None:
+    rows = summarize_three_qubit_token_repeatability(result)
+    if not rows:
+        raise ValueError("result must contain at least one repeatability row")
+    sources = []
+    for row in rows:
+        if row.source not in sources:
+            sources.append(row.source)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for source in sources:
+        group = [row for row in rows if row.source == source]
+        runs = [row.run for row in group]
+        refined = [row.refined_mean for row in group]
+        success = [row.refinement_success for row in group]
+        movement = [row.mean_movement for row in group]
+        axes[0].plot(runs, refined, marker="o", label=source)
+        axes[1].plot(runs, success, marker="o", label=source)
+        axes[2].plot(runs, movement, marker="o", label=source)
+
+    axes[0].set_xlabel("repeatability run")
+    axes[0].set_ylabel("mean refined fidelity")
+    axes[0].set_ylim(0.0, 1.02)
+    axes[0].set_title("Refined quality")
+    axes[0].legend()
+
+    axes[1].set_xlabel("repeatability run")
+    axes[1].set_ylabel(f"fraction with F >= {result.threshold:g}")
+    axes[1].set_ylim(0.0, 1.02)
+    axes[1].set_title("Success rate")
+    axes[1].legend()
+
+    axes[2].set_xlabel("repeatability run")
+    axes[2].set_ylabel("mean SU(2) movement")
+    axes[2].set_title("Proposal movement")
+    axes[2].legend()
+
+    fig.suptitle(f"Three-qubit {result.template.name} repeatability")
     fig.tight_layout()
 
 

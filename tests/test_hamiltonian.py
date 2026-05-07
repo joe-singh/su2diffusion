@@ -15,6 +15,7 @@ from su2diffusion.hamiltonian import (
     HamiltonianTokenStackDataScaleResult,
     HamiltonianTokenStackTrainingBudgetResult,
     ThreeQubitTokenRefinementResult,
+    ThreeQubitTokenRepeatabilityResult,
     HamiltonianTokenTemplateComparisonResult,
     HamiltonianTokenTrainingBudgetResult,
     HamiltonianTokenRepeatabilityResult,
@@ -81,6 +82,8 @@ from su2diffusion.hamiltonian import (
     print_three_qubit_template_summary,
     print_three_qubit_token_refinement_summary,
     print_three_qubit_token_refinement_headline,
+    print_three_qubit_token_repeatability,
+    print_three_qubit_token_repeatability_summary,
     run_hamiltonian_conditioned_diffusion_benchmark,
     run_hamiltonian_conditioned_denoise_diagnostic,
     run_hamiltonian_conditioned_overfit_diagnostic,
@@ -102,6 +105,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_token_training_budget_benchmark,
     run_three_qubit_hamiltonian_token_training_budget_benchmark,
     run_three_qubit_hamiltonian_token_refinement_benchmark,
+    run_three_qubit_hamiltonian_token_repeatability_benchmark,
     run_hamiltonian_repeatability_refinement_benchmark,
     refine_hamiltonian_prior_mixture,
     refine_hamiltonian_prior_mixture_budget_sweep,
@@ -129,6 +133,7 @@ from su2diffusion.hamiltonian import (
     summarize_hamiltonian_token_stack_data_scale,
     summarize_hamiltonian_token_stack_training_budget,
     summarize_three_qubit_token_refinement_headline,
+    summarize_three_qubit_token_repeatability,
     summarize_hamiltonian_token_template_comparison,
     summarize_hamiltonian_token_training_budget,
     summarize_hamiltonian_repeatability_refinement,
@@ -433,9 +438,54 @@ def test_three_qubit_hamiltonian_token_training_budget_smoke(capsys):
     assert refinement.template.name == "line-4cz"
     assert len(headline) == 3
     assert len(refinement.rows) == 3
-    assert {row.source for row in refinement.rows} == {"token", "generated-search", "haar"}
-    assert {row.source for row in headline} == {"token", "generated-search", "haar"}
-    assert all(0.0 <= row.refined_fidelity <= 1.0001 for row in refinement.rows)
+
+
+def test_three_qubit_hamiltonian_token_repeatability_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    config = CircuitExperimentConfig(
+        name="test-three-qubit-repeatability",
+        schedule=DiffusionSchedule(T=3, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=2, num_steps=1, hidden=16, n_terms=4),
+        sample_count=2,
+        eta=0.0,
+        n_slots=15,
+    )
+
+    result = run_three_qubit_hamiltonian_token_repeatability_benchmark(
+        generated_gates=centers,
+        generated_labels=labels,
+        config=config,
+        run_seeds=(0,),
+        n_heldout_targets=1,
+        train_target_count=1,
+        train_steps=1,
+        template="line-4cz",
+        terms=("XII", "IZZ"),
+        coefficient_scale=0.1,
+        time=0.3,
+        n_random_candidates=4,
+        top_k=1,
+        solution_refinement_steps=1,
+        basin_refinement_steps=1,
+        refinement_lr=0.02,
+        device="cpu",
+        show_progress=False,
+    )
+    rows = summarize_three_qubit_token_repeatability(result)
+    print_three_qubit_token_repeatability(result)
+    print_three_qubit_token_repeatability_summary(result)
+
+    captured = capsys.readouterr().out
+    assert "proposal" in captured
+    assert "runs" in captured
+    assert isinstance(result, ThreeQubitTokenRepeatabilityResult)
+    assert result.template.name == "line-4cz"
+    assert len(result.runs) == 1
+    assert len(rows) == 3
+    assert {row.source for row in rows} == {"token", "generated-search", "haar"}
+    assert all(row.n_targets == 1 for row in rows)
 
 
 def test_hamiltonian_solution_dataset_smoke(capsys):

@@ -273,3 +273,9 @@ movement. This checks whether the 3-qubit diffusion model gives a better
 refinement basin even when its raw proposal fidelity is still modest. The
 headline table reports proposal mean, refined mean, threshold success, median
 steps, and movement for token, generated-search, and Haar starts.
+
+Level 3D is the paper-grade repeatability version of Level 3C. It reruns the
+48-target `line-4cz` train/evaluate/refine workflow across independent seeds
+and aggregates the per-run proposal, refined-fidelity, success-rate, optimizer
+step, and movement metrics. The notebook keeps this cell off by default because
+it intentionally repeats the long 3-qubit run several times.
