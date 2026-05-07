@@ -451,16 +451,17 @@ refinement compared with generated-search and Haar baselines.
 
 ### 1. Turn The 3-Qubit Result Into A Clean Demo
 
-Build a user-facing function/notebook cell:
+The repo now has a first user-facing function/notebook cell:
 
 ```python
 H = ...
 t = ...
-proposal = synthesize_from_hamiltonian(H, t)
-print_circuit(proposal)
+demo = run_three_qubit_hamiltonian_demo(...)
+print_hamiltonian_demo(demo)
+plot_hamiltonian_demo(demo)
 ```
 
-This should display:
+It displays:
 
 - Hamiltonian terms;
 - chosen template;
@@ -568,4 +569,3 @@ Recommended first actions:
    ```bash
    .venv/bin/python -m pytest -q
    ```
-
