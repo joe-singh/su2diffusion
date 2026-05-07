@@ -251,3 +251,15 @@ pattern. For each 3-qubit Hamiltonian target it searches local `SU(2)` gates,
 refines them on the product manifold, and reports which entangler layout gives
 the best proposal/refinement geometry. The winning template becomes the first
 candidate for a later `SU(2)^n` circuit-token diffusion model.
+
+Level 3B trains that first 3-qubit circuit-token model on the winning four-CZ
+line template
+
+```text
+L0 CZ01 L1 CZ12 L2 CZ01 L3 CZ12 L4
+```
+
+where each `Lk` is a layer of three local `SU(2)` gates. One sample therefore
+lives on `SU(2)^15`. The benchmark builds refined Hamiltonian solution stacks,
+trains a Hamiltonian-conditioned token denoiser, and compares held-out proposal
+quality against the generated local-gate search baseline.
