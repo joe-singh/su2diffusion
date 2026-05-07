@@ -7689,15 +7689,25 @@ def _plot_three_qubit_demo_circuit(ax, template: ThreeQubitCZTemplate) -> None:
 
     for layer, x in enumerate(layer_x):
         for qubit, y in y_by_qubit.items():
+            slot = layer * template.n_qubits + qubit
             ax.text(
                 x,
                 y,
-                f"L{layer}q{qubit}",
+                _demo_gate_name(slot),
                 ha="center",
                 va="center",
                 fontsize=8,
                 bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "tab:blue"},
             )
+        ax.text(
+            x,
+            max(y_by_qubit.values()) + 0.35,
+            f"L{layer}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="tab:blue",
+        )
 
     for layer, (a, b) in enumerate(template.edges):
         x = layer_x[layer] + 1.0
