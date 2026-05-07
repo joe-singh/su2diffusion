@@ -22,6 +22,7 @@ from .synthesis import (
     SynthesisCandidate,
     SynthesisReport,
     compose_local_entangler_chain_units,
+    make_synthesis_report,
     quaternion_to_unitary,
     refine_two_entangler_candidate,
     sample_near_clifford_gates,
@@ -522,6 +523,45 @@ class HamiltonianBudgetRefinementResult:
     threshold: float
 
 
+@dataclass(frozen=True)
+class ThreeQubitCZTemplate:
+    name: str
+    edges: tuple[tuple[int, int], ...]
+
+    @property
+    def n_qubits(self) -> int:
+        return 3
+
+    @property
+    def n_slots(self) -> int:
+        return self.n_qubits * (len(self.edges) + 1)
+
+
+@dataclass(frozen=True)
+class ThreeQubitTemplateSummaryRow:
+    template: str
+    source: str
+    n_edges: int
+    n_slots: int
+    n_targets: int
+    proposal_mean: float
+    refined_mean: float
+    refined_success_95: float
+    refined_success_98: float
+    refined_success_99: float
+    median_steps: float
+
+
+@dataclass
+class ThreeQubitTemplateBenchmarkResult:
+    targets: list[HamiltonianTarget]
+    templates: tuple[ThreeQubitCZTemplate, ...]
+    rows: list[ThreeQubitTemplateSummaryRow]
+    reports: dict[tuple[str, str], list[SynthesisReport]]
+    refinements: dict[tuple[str, str], list[RefinementResult]]
+    threshold: float
+
+
 class HamiltonianStackPredictor(nn.Module):
     def __init__(self, input_dim: int = 33, hidden: int = 256, n_slots: int = 6):
         super().__init__()
@@ -679,6 +719,7 @@ def make_random_pauli_hamiltonian_targets(
     coefficient_scale: float = 0.35,
     time: float = 0.8,
     name_prefix: str = "pauli",
+    n_qubits: int = 2,
     seed: int = 0,
     device: torch.device | str | None = None,
 ) -> list[HamiltonianTarget]:
@@ -688,6 +729,8 @@ def make_random_pauli_hamiltonian_targets(
         raise ValueError("terms must contain at least one Pauli string")
     if coefficient_scale <= 0:
         raise ValueError("coefficient_scale must be positive")
+    if n_qubits <= 0:
+        raise ValueError("n_qubits must be positive")
 
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
@@ -703,6 +746,7 @@ def make_random_pauli_hamiltonian_targets(
                 target_terms,
                 time=time,
                 name=f"{name_prefix}-{i:02d}",
+                n_qubits=n_qubits,
                 device=device,
             )
         )
@@ -875,6 +919,350 @@ def run_hamiltonian_suite_benchmark(
         for i, target in iterator
     ]
     return HamiltonianSuiteResult(benchmarks=benchmarks)
+
+
+THREE_QUBIT_CZ_TEMPLATES: dict[str, tuple[tuple[int, int], ...]] = {
+    "line-3cz-a": ((0, 1), (1, 2), (0, 1)),
+    "line-3cz-b": ((1, 2), (0, 1), (1, 2)),
+    "line-4cz": ((0, 1), (1, 2), (0, 1), (1, 2)),
+    "all-3cz": ((0, 1), (0, 2), (1, 2)),
+}
+
+
+def get_three_qubit_cz_template(name: str) -> ThreeQubitCZTemplate:
+    name = name.lower()
+    try:
+        edges = THREE_QUBIT_CZ_TEMPLATES[name]
+    except KeyError as exc:
+        known = ", ".join(sorted(THREE_QUBIT_CZ_TEMPLATES))
+        raise ValueError(f"Unknown 3-qubit CZ template {name!r}; expected one of {known}") from exc
+    return ThreeQubitCZTemplate(name=name, edges=edges)
+
+
+def _coerce_three_qubit_template(template: str | ThreeQubitCZTemplate) -> ThreeQubitCZTemplate:
+    if isinstance(template, ThreeQubitCZTemplate):
+        return template
+    return get_three_qubit_cz_template(template)
+
+
+def _local_layer_n_qubits(units: torch.Tensor) -> torch.Tensor:
+    if units.ndim < 3 or units.shape[-2:] != (2, 2):
+        raise ValueError("units must have shape (..., n_qubits, 2, 2)")
+    result = units[..., 0, :, :]
+    for qubit in range(1, units.shape[-3]):
+        unit = units[..., qubit, :, :]
+        dim = result.shape[-1]
+        result = torch.einsum("...ab,...cd->...acbd", result, unit).reshape(
+            *result.shape[:-2],
+            dim * 2,
+            dim * 2,
+        )
+    return result
+
+
+def cz_on_qubits(
+    n_qubits: int,
+    edge: tuple[int, int],
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    if n_qubits <= 1:
+        raise ValueError("n_qubits must be greater than one")
+    a, b = edge
+    if a == b:
+        raise ValueError("CZ edge cannot connect a qubit to itself")
+    if a < 0 or b < 0 or a >= n_qubits or b >= n_qubits:
+        raise ValueError(f"CZ edge {edge!r} is outside n_qubits={n_qubits}")
+
+    a, b = sorted((a, b))
+    dim = 2**n_qubits
+    phases = torch.ones(dim, dtype=torch.complex64, device=device)
+    for basis in range(dim):
+        bit_a = (basis >> (n_qubits - 1 - a)) & 1
+        bit_b = (basis >> (n_qubits - 1 - b)) & 1
+        if bit_a and bit_b:
+            phases[basis] = -1
+    return torch.diag(phases)
+
+
+def compose_three_qubit_template_units(
+    units: torch.Tensor,
+    template: str | ThreeQubitCZTemplate = "line-3cz-a",
+) -> torch.Tensor:
+    template = _coerce_three_qubit_template(template)
+    if units.ndim < 3 or units.shape[-2:] != (2, 2):
+        raise ValueError("units must have shape (..., n_slots, 2, 2)")
+    if units.shape[-3] != template.n_slots:
+        raise ValueError(f"Template {template.name!r} expects {template.n_slots} local slots")
+
+    batch_shape = units.shape[:-3]
+    layers = units.reshape(*batch_shape, len(template.edges) + 1, template.n_qubits, 2, 2)
+    local_layers = torch.stack(
+        [_local_layer_n_qubits(layers[..., i, :, :, :]) for i in range(layers.shape[-4])],
+        dim=-3,
+    )
+    result = local_layers[..., 0, :, :]
+    for i, edge in enumerate(template.edges):
+        entangler = cz_on_qubits(template.n_qubits, edge, device=units.device)
+        result = result @ entangler @ local_layers[..., i + 1, :, :]
+    return result
+
+
+def synthesize_three_qubit_template_random_report(
+    local_gates: torch.Tensor,
+    target_unitary: torch.Tensor,
+    target_name: str = "target",
+    template: str | ThreeQubitCZTemplate = "line-3cz-a",
+    n_candidates: int = 25_000,
+    top_k: int = 5,
+    local_labels: list[str | None] | None = None,
+    seed: int = 0,
+    name: str | None = None,
+    mode: str = "random",
+    keep_fidelities: bool = False,
+) -> SynthesisReport:
+    template = _coerce_three_qubit_template(template)
+    if local_gates.shape[0] == 0:
+        raise ValueError("synthesize_three_qubit_template_random_report needs at least one local gate")
+    if local_labels is not None and len(local_labels) != local_gates.shape[0]:
+        raise ValueError("local_labels must have one entry per local gate")
+    if n_candidates <= 0:
+        raise ValueError("n_candidates must be positive")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    device = local_gates.device
+    target_unitary = target_unitary.to(device=device, dtype=torch.complex64)
+    units = quaternion_to_unitary(local_gates)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    indices = torch.randint(
+        low=0,
+        high=local_gates.shape[0],
+        size=(n_candidates, template.n_slots),
+        device=device,
+        generator=generator,
+    )
+    unitaries = compose_three_qubit_template_units(units[indices], template)
+    fidelities = unitary_fidelity_batch(unitaries, target_unitary)
+    values, rows = torch.topk(fidelities, k=min(top_k, fidelities.numel()))
+    candidates = []
+    for value, row in zip(values.tolist(), rows.tolist()):
+        slots = indices[row].tolist()
+        candidates.append(
+            SynthesisCandidate(
+                target=target_name,
+                template=template.name,
+                entangler=template.name,
+                fidelity=value,
+                slot_indices=tuple(slots),
+                slot_labels=tuple(local_labels[i] for i in slots) if local_labels is not None else (None,) * len(slots),
+            )
+        )
+    return make_synthesis_report(
+        candidates,
+        name=name or f"{target_name} {template.name} {mode} search",
+        mode=mode,
+        fidelities=fidelities.tolist() if keep_fidelities else None,
+    )
+
+
+def _differentiable_unitary_fidelity(unitary: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    dim = unitary.shape[-1]
+    overlap = torch.trace(target.conj().T @ unitary).abs() / dim
+    return overlap.real.clamp(0.0, 1.0)
+
+
+def refine_three_qubit_template_candidate(
+    local_gates: torch.Tensor,
+    candidate: SynthesisCandidate,
+    target_unitary: torch.Tensor,
+    template: str | ThreeQubitCZTemplate = "line-3cz-a",
+    num_steps: int = 120,
+    lr: float = 0.05,
+) -> RefinementResult:
+    template = _coerce_three_qubit_template(template)
+    if len(candidate.slot_indices) != template.n_slots:
+        raise ValueError(f"Candidate must contain {template.n_slots} slot indices for {template.name}")
+    if num_steps <= 0:
+        raise ValueError("num_steps must be positive")
+    if lr <= 0:
+        raise ValueError("lr must be positive")
+
+    device = local_gates.device
+    base_gates = q_normalize(local_gates[list(candidate.slot_indices)]).detach()
+    target_unitary = target_unitary.to(device=device, dtype=torch.complex64)
+    delta = torch.zeros(base_gates.shape[0], 3, device=device, dtype=base_gates.dtype, requires_grad=True)
+    optimizer = torch.optim.Adam([delta], lr=lr)
+    trace = []
+    best_delta = delta.detach().clone()
+    best_fidelity = float(candidate.fidelity)
+
+    for _ in range(num_steps):
+        optimizer.zero_grad()
+        refined_gates = q_normalize(q_mul(q_exp(delta), base_gates))
+        unitary = compose_three_qubit_template_units(quaternion_to_unitary(refined_gates), template)
+        fidelity = _differentiable_unitary_fidelity(unitary, target_unitary)
+        fidelity_value = float(fidelity.detach().clamp(0.0, 1.0).cpu())
+        trace.append(fidelity_value)
+        if fidelity_value > best_fidelity:
+            best_fidelity = fidelity_value
+            best_delta = delta.detach().clone()
+        loss = 1.0 - fidelity
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        final_gates = q_normalize(q_mul(q_exp(delta), base_gates))
+        final_unitary = compose_three_qubit_template_units(quaternion_to_unitary(final_gates), template)
+        final_fidelity = unitary_fidelity(final_unitary, target_unitary)
+        if final_fidelity > best_fidelity:
+            best_fidelity = final_fidelity
+            best_delta = delta.detach().clone()
+        refined_gates = q_normalize(q_mul(q_exp(best_delta), base_gates))
+        refined_unitary = compose_three_qubit_template_units(quaternion_to_unitary(refined_gates), template)
+        refined_fidelity = unitary_fidelity(refined_unitary, target_unitary)
+
+    return RefinementResult(
+        target=candidate.target,
+        entangler=template.name,
+        initial_fidelity=float(candidate.fidelity),
+        refined_fidelity=refined_fidelity,
+        fidelity_trace=tuple(trace),
+        slot_indices=candidate.slot_indices,
+        slot_labels=candidate.slot_labels,
+        refined_gates=refined_gates.detach(),
+    )
+
+
+def _three_qubit_template_row(
+    template: ThreeQubitCZTemplate,
+    source: str,
+    refinements: list[RefinementResult],
+    threshold: float,
+) -> ThreeQubitTemplateSummaryRow:
+    if not refinements:
+        raise ValueError("refinements must contain at least one result")
+    proposal = torch.tensor([item.initial_fidelity for item in refinements], dtype=torch.float32)
+    refined = torch.tensor([item.refined_fidelity for item in refinements], dtype=torch.float32)
+    steps = []
+    for item in refinements:
+        step = _steps_to_threshold(item.initial_fidelity, item.fidelity_trace, threshold)
+        if step < 0:
+            step = len(item.fidelity_trace) + 1
+        steps.append(step)
+    step_tensor = torch.tensor(steps, dtype=torch.float32)
+    return ThreeQubitTemplateSummaryRow(
+        template=template.name,
+        source=source,
+        n_edges=len(template.edges),
+        n_slots=template.n_slots,
+        n_targets=len(refinements),
+        proposal_mean=float(proposal.mean().item()),
+        refined_mean=float(refined.mean().item()),
+        refined_success_95=float((refined >= 0.95).float().mean().item()),
+        refined_success_98=float((refined >= 0.98).float().mean().item()),
+        refined_success_99=float((refined >= 0.99).float().mean().item()),
+        median_steps=float(step_tensor.median().item()),
+    )
+
+
+def run_three_qubit_template_benchmark(
+    targets: list[HamiltonianTarget],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    clifford_gates: torch.Tensor | None = None,
+    clifford_labels: list[str] | None = None,
+    templates: tuple[str, ...] | list[str] = ("line-3cz-a", "line-3cz-b", "line-4cz", "all-3cz"),
+    sources: tuple[str, ...] | list[str] = ("generated", "haar"),
+    n_random_candidates: int = 25_000,
+    n_haar_gates: int = 1024,
+    top_k: int = 1,
+    refinement_steps: int = 120,
+    refinement_lr: float = 0.05,
+    threshold: float = 0.99,
+    seed: int = 0,
+    show_progress: bool = True,
+) -> ThreeQubitTemplateBenchmarkResult:
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    if n_random_candidates <= 0:
+        raise ValueError("n_random_candidates must be positive")
+    if n_haar_gates <= 0:
+        raise ValueError("n_haar_gates must be positive")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("threshold must be between 0 and 1")
+
+    template_objs = tuple(_coerce_three_qubit_template(template) for template in templates)
+    source_names = tuple(sources)
+    device = generated_gates.device
+    source_pools: dict[str, tuple[torch.Tensor, list[str | None]]] = {
+        "generated": (generated_gates, generated_labels),
+    }
+    if "clifford" in source_names:
+        if clifford_gates is None or clifford_labels is None:
+            raise ValueError("clifford source requires clifford_gates and clifford_labels")
+        source_pools["clifford"] = (clifford_gates, clifford_labels)
+    if "haar" in source_names:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed + 90_000)
+        haar_gates = sample_haar(n_haar_gates, device=device, generator=generator)
+        source_pools["haar"] = (haar_gates, ["Haar"] * n_haar_gates)
+    unknown = set(source_names) - set(source_pools)
+    if unknown:
+        raise ValueError(f"Unknown 3-qubit template source(s): {sorted(unknown)}")
+
+    reports: dict[tuple[str, str], list[SynthesisReport]] = {}
+    refinements: dict[tuple[str, str], list[RefinementResult]] = {}
+    jobs = [(template, source, target) for template in template_objs for source in source_names for target in targets]
+    iterator = jobs
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(iterator, desc="Benchmarking 3-qubit templates", dynamic_ncols=True)
+    for job_index, (template, source, target) in enumerate(iterator):
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(template=template.name, source=source, target=target.name)
+        gates, labels = source_pools[source]
+        report = synthesize_three_qubit_template_random_report(
+            gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            template=template,
+            n_candidates=n_random_candidates,
+            top_k=top_k,
+            local_labels=labels,
+            seed=seed + 1000 * job_index + 17,
+            name=f"{target.name} {template.name} {source}",
+            mode=source,
+            keep_fidelities=False,
+        )
+        refinement = refine_three_qubit_template_candidate(
+            gates,
+            report.candidates[0],
+            target.unitary,
+            template=template,
+            num_steps=refinement_steps,
+            lr=refinement_lr,
+        )
+        key = (template.name, source)
+        reports.setdefault(key, []).append(report)
+        refinements.setdefault(key, []).append(refinement)
+
+    rows = [
+        _three_qubit_template_row(template, source, refinements[(template.name, source)], threshold)
+        for template in template_objs
+        for source in source_names
+    ]
+    return ThreeQubitTemplateBenchmarkResult(
+        targets=targets,
+        templates=template_objs,
+        rows=rows,
+        reports=reports,
+        refinements=refinements,
+        threshold=threshold,
+    )
 
 
 def _local_rotation_energy(q_stack: torch.Tensor) -> float:
@@ -4317,6 +4705,12 @@ def summarize_hamiltonian_token_stack_training_budget(
     return result.rows
 
 
+def summarize_three_qubit_template_benchmark(
+    result: ThreeQubitTemplateBenchmarkResult,
+) -> list[ThreeQubitTemplateSummaryRow]:
+    return result.rows
+
+
 def summarize_hamiltonian_token_training_budget(
     result: HamiltonianTokenTrainingBudgetResult,
 ) -> list[HamiltonianTokenTrainingBudgetRow]:
@@ -5113,6 +5507,29 @@ def print_hamiltonian_template_comparison(result: HamiltonianTemplateComparisonR
             f"{row.proposal_mean:>8.4f}   "
             f"{row.refined_mean:>7.4f}   "
             f"{row.refinement_success:>10.1%}   "
+            f"{row.median_steps:>12.1f}"
+        )
+
+
+def print_three_qubit_template_summary(result: ThreeQubitTemplateBenchmarkResult) -> None:
+    header = (
+        "template     source      CZs   slots   targets   proposal   refined   "
+        ">=0.95   >=0.98   >=0.99   median steps"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in summarize_three_qubit_template_benchmark(result):
+        print(
+            f"{row.template:<12} "
+            f"{row.source:<11} "
+            f"{row.n_edges:<5} "
+            f"{row.n_slots:<7} "
+            f"{row.n_targets:<8} "
+            f"{row.proposal_mean:>8.4f}   "
+            f"{row.refined_mean:>7.4f}   "
+            f"{row.refined_success_95:>6.1%}   "
+            f"{row.refined_success_98:>6.1%}   "
+            f"{row.refined_success_99:>6.1%}   "
             f"{row.median_steps:>12.1f}"
         )
 
@@ -6019,3 +6436,34 @@ def plot_hamiltonian_template_comparison(result: HamiltonianTemplateComparisonRe
     plt.ylim(0.0, 1.02)
     plt.xticks(rotation=15, ha="right")
     plt.tight_layout()
+
+
+def plot_three_qubit_template_benchmark(result: ThreeQubitTemplateBenchmarkResult) -> None:
+    rows = summarize_three_qubit_template_benchmark(result)
+    if not rows:
+        raise ValueError("result must contain at least one summary row")
+    labels = [f"{row.template}\n{row.source}" for row in rows]
+    proposal = [row.proposal_mean for row in rows]
+    refined = [row.refined_mean for row in rows]
+    success_95 = [row.refined_success_95 for row in rows]
+    success_99 = [row.refined_success_99 for row in rows]
+    x = torch.arange(len(rows), dtype=torch.float32)
+    width = 0.36
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].bar((x - width / 2).tolist(), proposal, width=width, label="proposal")
+    axes[0].bar((x + width / 2).tolist(), refined, width=width, label="after refinement")
+    axes[0].set_xticks(x.tolist(), labels, rotation=25, ha="right")
+    axes[0].set_ylabel("mean unitary fidelity")
+    axes[0].set_ylim(0.0, 1.02)
+    axes[0].set_title("Three-qubit template quality")
+    axes[0].legend()
+
+    axes[1].bar((x - width / 2).tolist(), success_95, width=width, label=">=0.95")
+    axes[1].bar((x + width / 2).tolist(), success_99, width=width, label=">=0.99")
+    axes[1].set_xticks(x.tolist(), labels, rotation=25, ha="right")
+    axes[1].set_ylabel("refined success fraction")
+    axes[1].set_ylim(0.0, 1.02)
+    axes[1].set_title("Refined success")
+    axes[1].legend()
+    fig.tight_layout()

@@ -24,6 +24,8 @@ from su2diffusion.hamiltonian import (
     HamiltonianStackPredictor,
     HamiltonianPriorTrainConfig,
     HamiltonianSupervisedTrainConfig,
+    compose_three_qubit_template_units,
+    cz_on_qubits,
     estimate_hamiltonian_denoise_target_scale,
     evaluate_hamiltonian_conditioned_denoising,
     evaluate_hamiltonian_skeleton_conditioned_denoising,
@@ -74,6 +76,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_suite_summary,
     print_hamiltonian_two_entangler_benchmark,
     print_hamiltonian_two_entangler_summary,
+    print_three_qubit_template_summary,
     run_hamiltonian_conditioned_diffusion_benchmark,
     run_hamiltonian_conditioned_denoise_diagnostic,
     run_hamiltonian_conditioned_overfit_diagnostic,
@@ -104,6 +107,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_suite_benchmark,
     run_hamiltonian_template_comparison,
     run_hamiltonian_two_entangler_benchmark,
+    run_three_qubit_template_benchmark,
     sample_hamiltonian_conditioned_circuit_reverse,
     summarize_hamiltonian_denoise_diagnostic,
     summarize_hamiltonian_denoise_ablation,
@@ -239,6 +243,73 @@ def test_random_hamiltonian_suite_smoke(capsys):
     assert len(result.benchmarks) == 3
     assert [row.n_targets for row in rows] == [3, 3, 3, 3]
     assert all(0.0 <= row.mean_best <= 1.0 for row in rows)
+
+
+def test_three_qubit_pauli_targets_and_template_composition():
+    target = make_hamiltonian_target(
+        [
+            ("XII", 0.12),
+            ("IZI", -0.08),
+            ("IZZ", 0.05),
+        ],
+        time=0.4,
+        name="three-qubit",
+        n_qubits=3,
+    )
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XII", "IZI", "IZZ"),
+        coefficient_scale=0.1,
+        time=0.3,
+        n_qubits=3,
+        seed=41,
+    )
+    identity_units = torch.eye(2, dtype=torch.complex64).expand(12, 2, 2).clone()
+    composed = compose_three_qubit_template_units(identity_units, "line-3cz-a")
+    expected = cz_on_qubits(3, (0, 1)) @ cz_on_qubits(3, (1, 2)) @ cz_on_qubits(3, (0, 1))
+
+    assert target.unitary.shape == (8, 8)
+    assert all(item.unitary.shape == (8, 8) for item in targets)
+    assert torch.allclose(composed, expected, atol=1e-6)
+
+
+def test_three_qubit_template_benchmark_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=2,
+        terms=("XII", "IZI", "IZZ"),
+        coefficient_scale=0.1,
+        time=0.3,
+        n_qubits=3,
+        seed=42,
+    )
+
+    result = run_three_qubit_template_benchmark(
+        targets,
+        generated_gates=centers,
+        generated_labels=labels,
+        templates=("line-3cz-a",),
+        sources=("generated", "haar"),
+        n_random_candidates=4,
+        n_haar_gates=4,
+        top_k=1,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        threshold=0.5,
+        seed=43,
+        show_progress=False,
+    )
+    print_three_qubit_template_summary(result)
+
+    captured = capsys.readouterr().out
+    assert "line-3cz-a" in captured
+    assert len(result.rows) == 2
+    assert set(result.reports) == {("line-3cz-a", "generated"), ("line-3cz-a", "haar")}
+    assert all(row.n_targets == 2 for row in result.rows)
+    assert all(0.0 <= row.proposal_mean <= 1.0 for row in result.rows)
+    assert all(0.0 <= row.refined_mean <= 1.0 for row in result.rows)
 
 
 def test_hamiltonian_solution_dataset_smoke(capsys):
