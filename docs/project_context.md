@@ -313,6 +313,77 @@ Interpretation:
 This is the current strongest evidence that the diffusion model is learning
 useful proposal geometry.
 
+### Simple By-Hand Sanity Checks
+
+The clearest "this is real" checkpoint is the optional Pauli sanity-check cell
+in `SU2GateExperiments.ipynb`. It uses deliberately simple Hamiltonians where
+the target evolution can be verified by hand, then compares the generated and
+refined circuit against that exact answer.
+
+For
+
+```text
+H = 0.5 XII,    t = 1
+```
+
+the target is
+
+```text
+U = exp(-i 0.5 XII).
+```
+
+Since `XII |000> = |100>`, the expected action is:
+
+```text
+exp(-i 0.5 XII) |000>
+  = cos(0.5) |000> - i sin(0.5) |100>.
+```
+
+Numerically, the notebook check produced:
+
+```text
+manual / obvious:
+|000> =  0.8776
+|100> = -0.4794 i
+
+generated/refined:
+|000> =  0.8768 - 0.0008 i
+|100> = -0.0016 - 0.4809 i
+
+fidelity to exp(-i 0.5 XII): 0.9999704
+```
+
+The same check with
+
+```text
+H = 0.5 YII,    t = 1
+```
+
+uses `YII |000> = i |100>`, so
+
+```text
+exp(-i 0.5 YII) |000>
+  = cos(0.5) |000> + sin(0.5) |100>.
+```
+
+The notebook check produced:
+
+```text
+manual:
+|000> = 0.8776
+|100> = 0.4794
+
+generated/refined:
+|000> = 0.8770 - 0.0015 i
+|100> = 0.4805 - 0.0011 i
+
+fidelity to exp(-i 0.5 YII): 0.9999725
+```
+
+These examples are useful because the generated circuit can look non-obvious
+internally, but multiplying out all local `SU(2)` gates and CZs recovers the
+same unitary as the hand-computed Hamiltonian evolution.
+
 ## What Failed Or Was Deprioritized
 
 ### Flat Hamiltonian-Conditioned MLP Denoiser
