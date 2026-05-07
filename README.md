@@ -5,6 +5,9 @@ Toy diffusion experiments on `SU(2)` using a heat-kernel target.
 The repo is set up so the reusable math/model code lives in importable Python
 modules, while the notebook stays as a Colab runner for GPU experiments.
 
+For a checkpoint of the current research state, architecture, benchmark results,
+and next steps, see [`docs/project_context.md`](docs/project_context.md).
+
 ## Local Setup
 
 ```bash
