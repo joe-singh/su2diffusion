@@ -30,6 +30,7 @@ from su2diffusion.hamiltonian import (
     evaluate_hamiltonian_conditioned_denoising,
     evaluate_hamiltonian_skeleton_conditioned_denoising,
     evaluate_hamiltonian_stack_predictor,
+    generate_three_qubit_hamiltonian_solution_dataset,
     generate_hamiltonian_solution_dataset,
     hamiltonian_denoise_diagnostic_from_model,
     hamiltonian_from_terms,
@@ -96,6 +97,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_token_stack_training_budget_benchmark,
     run_hamiltonian_token_template_comparison,
     run_hamiltonian_token_training_budget_benchmark,
+    run_three_qubit_hamiltonian_token_training_budget_benchmark,
     run_hamiltonian_repeatability_refinement_benchmark,
     refine_hamiltonian_prior_mixture,
     refine_hamiltonian_prior_mixture_budget_sweep,
@@ -109,6 +111,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_two_entangler_benchmark,
     run_three_qubit_template_benchmark,
     sample_hamiltonian_conditioned_circuit_reverse,
+    synthesize_three_qubit_template_stack_report,
     summarize_hamiltonian_denoise_diagnostic,
     summarize_hamiltonian_denoise_ablation,
     summarize_hamiltonian_denoise_normalization,
@@ -310,6 +313,100 @@ def test_three_qubit_template_benchmark_smoke(capsys):
     assert all(row.n_targets == 2 for row in result.rows)
     assert all(0.0 <= row.proposal_mean <= 1.0 for row in result.rows)
     assert all(0.0 <= row.refined_mean <= 1.0 for row in result.rows)
+
+
+def test_three_qubit_hamiltonian_solution_dataset_and_stack_report_smoke():
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=1,
+        terms=("XII", "IZI", "IZZ"),
+        coefficient_scale=0.1,
+        time=0.3,
+        n_qubits=3,
+        seed=44,
+    )
+
+    dataset = generate_three_qubit_hamiltonian_solution_dataset(
+        targets,
+        generated_gates=centers,
+        generated_labels=labels,
+        template="line-4cz",
+        n_random_candidates=4,
+        top_k=1,
+        seed=45,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        show_progress=False,
+    )
+    report = synthesize_three_qubit_template_stack_report(
+        dataset.stacks,
+        target_unitary=targets[0].unitary,
+        target_name=targets[0].name,
+        template="line-4cz",
+        top_k=1,
+    )
+
+    assert dataset.stacks.shape == (1, 15, 4)
+    assert dataset.refined_fidelities.shape == (1,)
+    assert len(report.candidates) == 1
+    assert 0.0 <= report.candidates[0].fidelity <= 1.0001
+
+
+def test_three_qubit_hamiltonian_token_training_budget_smoke(capsys):
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    heldout_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=1,
+        terms=("XII", "IZZ"),
+        coefficient_scale=0.1,
+        time=0.3,
+        n_qubits=3,
+        seed=46,
+    )
+    config = CircuitExperimentConfig(
+        name="test-three-qubit-token-budget",
+        schedule=DiffusionSchedule(T=3, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=2, num_steps=1, hidden=16, n_terms=4),
+        sample_count=2,
+        eta=0.0,
+        n_slots=15,
+    )
+
+    result = run_three_qubit_hamiltonian_token_training_budget_benchmark(
+        train_target_counts=(1,),
+        train_step_counts=(1,),
+        heldout_targets=heldout_targets,
+        generated_gates=centers,
+        generated_labels=labels,
+        config=config,
+        template="line-4cz",
+        terms=("XII", "IZZ"),
+        coefficient_scale=0.1,
+        time=0.3,
+        train_seed=47,
+        dataset_seed=48,
+        heldout_baseline_seed=49,
+        n_random_candidates=4,
+        top_k=1,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        device="cpu",
+        show_progress=False,
+    )
+    rows = summarize_hamiltonian_token_stack_training_budget(result)
+    print_hamiltonian_token_stack_training_budget_summary(result)
+
+    captured = capsys.readouterr().out
+    assert "steps" in captured
+    assert isinstance(result, HamiltonianTokenStackTrainingBudgetResult)
+    assert result.train_dataset.stacks.shape[1] == 15
+    assert set(result.diagnostics) == {(1, 1)}
+    assert len(rows) == 1
+    assert rows[0].n_solution_stacks == 1
+    assert 0.0 <= rows[0].heldout_mean_best <= 1.0001
 
 
 def test_hamiltonian_solution_dataset_smoke(capsys):

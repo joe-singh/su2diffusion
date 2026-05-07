@@ -1265,6 +1265,164 @@ def run_three_qubit_template_benchmark(
     )
 
 
+def synthesize_three_qubit_template_stack_report(
+    circuit_stacks: torch.Tensor,
+    target_unitary: torch.Tensor,
+    target_name: str,
+    template: str | ThreeQubitCZTemplate = "line-4cz",
+    top_k: int = 5,
+    name: str | None = None,
+    keep_fidelities: bool = True,
+) -> SynthesisReport:
+    template = _coerce_three_qubit_template(template)
+    if circuit_stacks.ndim != 3 or circuit_stacks.shape[-1] != 4:
+        raise ValueError("circuit_stacks must have shape (n, n_slots, 4)")
+    if circuit_stacks.shape[1] != template.n_slots:
+        raise ValueError(f"Template {template.name!r} expects {template.n_slots} local slots")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    target_name = target_name.lower()
+    device = circuit_stacks.device
+    units = quaternion_to_unitary(circuit_stacks)
+    target_unitary = target_unitary.to(device=device, dtype=torch.complex64)
+    unitaries = compose_three_qubit_template_units(units, template)
+    fidelities = unitary_fidelity_batch(unitaries, target_unitary)
+    values, rows = torch.topk(fidelities, k=min(top_k, fidelities.numel()))
+
+    candidates = [
+        SynthesisCandidate(
+            target=target_name,
+            template="three-qubit-joint-stack",
+            entangler=template.name,
+            fidelity=float(value),
+            slot_indices=(int(row),) * template.n_slots,
+            slot_labels=("joint",) * template.n_slots,
+        )
+        for value, row in zip(values.tolist(), rows.tolist())
+    ]
+    return SynthesisReport(
+        name=name or f"{target_name} {template.name} joint circuit diffusion",
+        mode=f"{template.name}-joint-circuit",
+        target=target_name,
+        entangler=template.name,
+        candidates=candidates,
+        fidelities=tuple(fidelities.tolist()) if keep_fidelities else tuple(float(candidate.fidelity) for candidate in candidates),
+    )
+
+
+def generate_three_qubit_hamiltonian_solution_dataset(
+    targets: list[HamiltonianTarget],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    template: str | ThreeQubitCZTemplate = "line-4cz",
+    n_random_candidates: int = 10_000,
+    top_k: int = 3,
+    seed: int = 0,
+    refinement_steps: int = 80,
+    refinement_lr: float = 0.05,
+    fidelity_threshold: float = 0.0,
+    solutions_per_target: int = 1,
+    solution_selection: str = "top",
+    selection_pool_size: int | None = None,
+    show_progress: bool = False,
+) -> HamiltonianSolutionDataset:
+    template = _coerce_three_qubit_template(template)
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    if n_random_candidates <= 0:
+        raise ValueError("n_random_candidates must be positive")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if refinement_steps <= 0:
+        raise ValueError("refinement_steps must be positive")
+    if refinement_lr <= 0:
+        raise ValueError("refinement_lr must be positive")
+    if not (0.0 <= fidelity_threshold <= 1.0):
+        raise ValueError("fidelity_threshold must be between 0 and 1")
+    if solutions_per_target <= 0:
+        raise ValueError("solutions_per_target must be positive")
+    if selection_pool_size is not None and selection_pool_size <= 0:
+        raise ValueError("selection_pool_size must be positive when provided")
+    if len(generated_labels) != generated_gates.shape[0]:
+        raise ValueError("generated_labels must have one entry per generated gate")
+
+    pool_size = selection_pool_size or solutions_per_target
+    kept_targets: list[HamiltonianTarget] = []
+    kept_benchmarks = []
+    refinements: list[RefinementResult] = []
+    iterator = enumerate(targets)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(
+            iterator,
+            total=len(targets),
+            desc=f"Building {template.name} 3-qubit solution stacks",
+            dynamic_ncols=True,
+        )
+
+    for i, target in iterator:
+        if target.unitary.shape != (8, 8):
+            raise ValueError("three-qubit solution dataset expects 8x8 target unitaries")
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(target=target.name, candidates=pool_size)
+        report = synthesize_three_qubit_template_random_report(
+            generated_gates,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            template=template,
+            n_candidates=n_random_candidates,
+            top_k=max(top_k, pool_size, solutions_per_target),
+            local_labels=generated_labels,
+            seed=seed + i,
+            name=f"{target.name} {template.name} generated",
+            mode="generated",
+            keep_fidelities=False,
+        )
+        target_refinements = [
+            refine_three_qubit_template_candidate(
+                generated_gates,
+                candidate,
+                target.unitary,
+                template=template,
+                num_steps=refinement_steps,
+                lr=refinement_lr,
+            )
+            for candidate in report.candidates[:pool_size]
+        ]
+        selected = _select_refined_solutions(
+            target_refinements,
+            solutions_per_target=solutions_per_target,
+            fidelity_threshold=fidelity_threshold,
+            solution_selection=solution_selection,
+        )
+        dummy_benchmark = HamiltonianSynthesisBenchmark(
+            target=target,
+            clifford_report=report,
+            analytic_report=report,
+            generated_report=report,
+            haar_report=report,
+        )
+        for refinement in selected:
+            kept_targets.append(target)
+            kept_benchmarks.append(dummy_benchmark)
+            refinements.append(refinement)
+
+    if not refinements:
+        raise RuntimeError("No 3-qubit Hamiltonian solution stacks met the fidelity threshold")
+
+    device = generated_gates.device
+    return HamiltonianSolutionDataset(
+        targets=kept_targets,
+        benchmarks=kept_benchmarks,
+        refinements=refinements,
+        stacks=torch.stack([item.refined_gates for item in refinements]),
+        initial_fidelities=torch.tensor([item.initial_fidelity for item in refinements], dtype=torch.float32, device=device),
+        refined_fidelities=torch.tensor([item.refined_fidelity for item in refinements], dtype=torch.float32, device=device),
+    )
+
+
 def _local_rotation_energy(q_stack: torch.Tensor) -> float:
     q_stack = q_normalize(q_stack)
     q_stack = torch.where(q_stack[..., :1] < 0.0, -q_stack, q_stack)
@@ -1512,8 +1670,8 @@ def _refinement_movement(
 def _validate_solution_stacks(stacks: torch.Tensor, name: str = "dataset.stacks") -> int:
     if stacks.ndim != 3 or stacks.shape[-1] != 4:
         raise ValueError(f"{name} must have shape (n, n_slots, 4)")
-    if stacks.shape[1] < 4 or stacks.shape[1] % 2 != 0:
-        raise ValueError(f"{name} must contain an even number of slots, at least 4")
+    if stacks.shape[1] <= 0:
+        raise ValueError(f"{name} must contain at least one slot")
     return int(stacks.shape[1])
 
 
@@ -2297,6 +2455,7 @@ def run_hamiltonian_token_conditioned_diffusion_benchmark(
     device: torch.device | str | None = None,
     show_progress: bool = True,
     entangler: str = "cz",
+    three_qubit_template: str | ThreeQubitCZTemplate | None = None,
     top_k: int = 5,
 ) -> HamiltonianConditionedDiffusionResult:
     from .circuit import get_circuit_experiment_config, synthesize_unitary_from_circuit_stack_report
@@ -2333,6 +2492,14 @@ def run_hamiltonian_token_conditioned_diffusion_benchmark(
             top_k=top_k,
             name=f"{target.name} Hamiltonian circuit-token diffusion",
             keep_fidelities=False,
+        ) if three_qubit_template is None else synthesize_three_qubit_template_stack_report(
+            stacks,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            template=three_qubit_template,
+            top_k=top_k,
+            name=f"{target.name} Hamiltonian circuit-token diffusion",
+            keep_fidelities=False,
         )
         for target, stacks in zip(eval_targets, generated_by_target)
     ]
@@ -2360,6 +2527,7 @@ def _hamiltonian_conditioned_reports_from_batches(
     prefix: str,
     entangler: str,
     top_k: int,
+    three_qubit_template: str | ThreeQubitCZTemplate | None = None,
 ) -> list[SynthesisReport]:
     from .circuit import synthesize_unitary_from_circuit_stack_report
 
@@ -2371,6 +2539,14 @@ def _hamiltonian_conditioned_reports_from_batches(
             target_unitary=target.unitary,
             target_name=target.name,
             entangler=entangler,
+            top_k=top_k,
+            name=f"{prefix} {target.name} Hamiltonian-conditioned diffusion",
+            keep_fidelities=False,
+        ) if three_qubit_template is None else synthesize_three_qubit_template_stack_report(
+            stacks,
+            target_unitary=target.unitary,
+            target_name=target.name,
+            template=three_qubit_template,
             top_k=top_k,
             name=f"{prefix} {target.name} Hamiltonian-conditioned diffusion",
             keep_fidelities=False,
@@ -2459,6 +2635,7 @@ def run_hamiltonian_token_conditioned_overfit_diagnostic(
     device: torch.device | str | None = None,
     show_progress: bool = True,
     entangler: str = "cz",
+    three_qubit_template: str | ThreeQubitCZTemplate | None = None,
     top_k: int = 5,
 ) -> HamiltonianConditionedOverfitDiagnosticResult:
     from .circuit import get_circuit_experiment_config
@@ -2503,6 +2680,7 @@ def run_hamiltonian_token_conditioned_overfit_diagnostic(
         prefix="train token",
         entangler=entangler,
         top_k=top_k,
+        three_qubit_template=three_qubit_template,
     )
     heldout_reports = _hamiltonian_conditioned_reports_from_batches(
         heldout_generated,
@@ -2510,6 +2688,7 @@ def run_hamiltonian_token_conditioned_overfit_diagnostic(
         prefix="heldout token",
         entangler=entangler,
         top_k=top_k,
+        three_qubit_template=three_qubit_template,
     )
     return HamiltonianConditionedOverfitDiagnosticResult(
         config=replace(config, name=f"{config.name}-token-overfit"),
@@ -2967,6 +3146,207 @@ def run_hamiltonian_token_stack_training_budget_benchmark(
             device=device,
             show_progress=show_progress,
             entangler=entangler,
+            top_k=top_k,
+        )
+        if not keep_models:
+            diagnostic = _overfit_diagnostic_to_cpu(diagnostic)
+        diagnostics[(count, step)] = diagnostic
+
+        train_summary = _aggregate_reports("train targets", diagnostic.train_reports)
+        heldout_summary = _aggregate_reports("heldout targets", diagnostic.heldout_reports)
+        final_loss = float(diagnostic.losses[-1]) if diagnostic.losses else float("nan")
+        rows.append(
+            HamiltonianTokenTrainingBudgetRow(
+                num_steps=step,
+                hidden=train_config.hidden,
+                batch_size=train_config.batch_size,
+                n_train_targets=len(_unique_hamiltonian_targets(dataset.targets)),
+                n_solution_stacks=int(dataset.stacks.shape[0]),
+                final_loss=final_loss,
+                train_mean_best=train_summary.mean_best,
+                heldout_mean_best=heldout_summary.mean_best,
+                generated_mean_best=generated_baseline.mean_best,
+                heldout_delta_vs_generated=heldout_summary.mean_best - generated_baseline.mean_best,
+                heldout_median_best=heldout_summary.median_best,
+                heldout_min_best=heldout_summary.min_best,
+                heldout_max_best=heldout_summary.max_best,
+                heldout_success_95=heldout_summary.success_95,
+                heldout_success_98=heldout_summary.success_98,
+                heldout_success_99=heldout_summary.success_99,
+            )
+        )
+        if clear_cuda_cache:
+            _clear_cuda_cache_for_device(device)
+
+    return HamiltonianTokenStackTrainingBudgetResult(
+        train_dataset=train_dataset,
+        heldout_targets=heldout_targets,
+        heldout_baseline=heldout_baseline,
+        diagnostics=diagnostics,
+        rows=rows,
+    )
+
+
+def _reports_as_hamiltonian_suite(
+    targets: list[HamiltonianTarget],
+    reports: list[SynthesisReport],
+) -> HamiltonianSuiteResult:
+    if len(targets) != len(reports):
+        raise ValueError("targets and reports must have the same length")
+    return HamiltonianSuiteResult(
+        benchmarks=[
+            HamiltonianSynthesisBenchmark(
+                target=target,
+                clifford_report=report,
+                analytic_report=report,
+                generated_report=report,
+                haar_report=report,
+            )
+            for target, report in zip(targets, reports)
+        ]
+    )
+
+
+def run_three_qubit_hamiltonian_token_training_budget_benchmark(
+    train_target_counts: tuple[int, ...] | list[int],
+    train_step_counts: tuple[int, ...] | list[int],
+    heldout_targets: list[HamiltonianTarget],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    config: CircuitExperimentConfig | str,
+    template: str | ThreeQubitCZTemplate = "line-4cz",
+    terms: tuple[str, ...] = ("XII", "IZI", "IIZ", "XXI", "IZZ", "ZXZ"),
+    coefficient_scale: float = 0.25,
+    time: float = 0.6,
+    train_seed: int = 9107,
+    dataset_seed: int = 9207,
+    heldout_baseline_seed: int = 9307,
+    n_random_candidates: int = 10_000,
+    top_k: int = 1,
+    refinement_steps: int = 80,
+    refinement_lr: float = 0.05,
+    fidelity_threshold: float = 0.0,
+    solutions_per_target: int = 1,
+    solution_selection: str = "top",
+    selection_pool_size: int | None = None,
+    keep_models: bool = False,
+    clear_cuda_cache: bool = True,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> HamiltonianTokenStackTrainingBudgetResult:
+    from .circuit import get_circuit_experiment_config
+
+    if isinstance(config, str):
+        config = get_circuit_experiment_config(config)
+    template = _coerce_three_qubit_template(template)
+    if not train_target_counts:
+        raise ValueError("train_target_counts must contain at least one count")
+    if not train_step_counts:
+        raise ValueError("train_step_counts must contain at least one step count")
+    counts = tuple(sorted({int(count) for count in train_target_counts}))
+    steps = tuple(sorted({int(step) for step in train_step_counts}))
+    if counts[0] <= 0:
+        raise ValueError("train target counts must be positive")
+    if steps[0] <= 0:
+        raise ValueError("train step counts must be positive")
+    if not heldout_targets:
+        raise ValueError("heldout_targets must contain at least one target")
+    if len(generated_labels) != generated_gates.shape[0]:
+        raise ValueError("generated_labels must have one entry per generated gate")
+
+    device = torch.device(device) if device is not None else generated_gates.device
+    generated_gates = q_normalize(generated_gates.to(device=device))
+    config = replace(config, n_slots=template.n_slots)
+    max_count = counts[-1]
+    train_targets = make_random_pauli_hamiltonian_targets(
+        n_targets=max_count,
+        terms=terms,
+        coefficient_scale=coefficient_scale,
+        time=time,
+        seed=train_seed,
+        n_qubits=3,
+        device=device,
+    )
+    train_dataset = generate_three_qubit_hamiltonian_solution_dataset(
+        train_targets,
+        generated_gates=generated_gates,
+        generated_labels=generated_labels,
+        template=template,
+        n_random_candidates=n_random_candidates,
+        top_k=max(top_k, selection_pool_size or solutions_per_target),
+        seed=dataset_seed,
+        refinement_steps=refinement_steps,
+        refinement_lr=refinement_lr,
+        fidelity_threshold=fidelity_threshold,
+        solutions_per_target=solutions_per_target,
+        solution_selection=solution_selection,
+        selection_pool_size=selection_pool_size,
+        show_progress=show_progress,
+    )
+
+    heldout_reports = []
+    heldout_iterator = enumerate(heldout_targets)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        heldout_iterator = tqdm(
+            heldout_iterator,
+            total=len(heldout_targets),
+            desc=f"Searching heldout {template.name} 3-qubit baselines",
+            dynamic_ncols=True,
+        )
+    for i, target in heldout_iterator:
+        if target.unitary.shape != (8, 8):
+            raise ValueError("heldout_targets must be three-qubit Hamiltonian targets")
+        heldout_reports.append(
+            synthesize_three_qubit_template_random_report(
+                generated_gates,
+                target_unitary=target.unitary,
+                target_name=target.name,
+                template=template,
+                n_candidates=n_random_candidates,
+                top_k=top_k,
+                local_labels=generated_labels,
+                seed=heldout_baseline_seed + i,
+                name=f"{target.name} {template.name} generated baseline",
+                mode="generated",
+                keep_fidelities=False,
+            )
+        )
+    heldout_baseline = _reports_as_hamiltonian_suite(heldout_targets, heldout_reports)
+    generated_baseline = _aggregate_reports("generated random", heldout_reports)
+
+    diagnostics: dict[tuple[int, int], HamiltonianConditionedOverfitDiagnosticResult] = {}
+    rows: list[HamiltonianTokenTrainingBudgetRow] = []
+    budget_pairs = [(count, step) for count in counts for step in steps]
+    iterator = budget_pairs
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(
+            iterator,
+            desc=f"Hamiltonian token budget rows ({template.name})",
+            dynamic_ncols=True,
+        )
+    for count, step in iterator:
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(targets=count, steps=step)
+        dataset = _solution_dataset_prefix(train_dataset, count)
+        train_config = replace(config.train, num_steps=step)
+        budget_config = replace(
+            config,
+            name=f"{config.name}-{template.name}-n{count}-steps{step}",
+            train=train_config,
+        )
+        if clear_cuda_cache:
+            _clear_cuda_cache_for_device(device)
+        diagnostic = run_hamiltonian_token_conditioned_overfit_diagnostic(
+            dataset,
+            heldout_targets=heldout_targets,
+            config=budget_config,
+            device=device,
+            show_progress=show_progress,
+            three_qubit_template=template,
             top_k=top_k,
         )
         if not keep_models:
@@ -5953,7 +6333,8 @@ def plot_hamiltonian_token_stack_training_budget(
     if len({row.num_steps for row in rows}) > 1:
         for ax in axes:
             ax.set_xscale("log", base=2)
-    fig.suptitle("Hamiltonian token budget on canonical SU(2)^8 data")
+    n_slots = result.train_dataset.stacks.shape[1]
+    fig.suptitle(f"Hamiltonian token budget on SU(2)^{n_slots} data")
     fig.tight_layout()
 
 
