@@ -238,3 +238,8 @@ total local rotation `sum_i ||log(q_i)||^2`. The scale-sweep helper also shows
 progress during search/refinement, chunks reverse sampling into smaller batches,
 and moves completed diagnostic models to CPU by default so Colab does not retain
 every row's CUDA memory.
+
+Level 2E reuses that canonical `SU(2)^8` setup for a focused training-budget
+check. It builds the largest canonical dataset once, trains on prefixes such as
+`128x1` and `256x1`, and compares multiple denoising step budgets against the
+same held-out Hamiltonians and generated-search baseline.
