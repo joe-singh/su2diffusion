@@ -467,6 +467,8 @@ It displays:
 - chosen template;
 - local gates before refinement;
 - local gates after refinement;
+- axis-angle descriptions of the refined local `SU(2)` gates;
+- a fixed-CZ circuit skeleton;
 - fidelity before/after;
 - optimizer steps;
 - movement.
@@ -479,7 +481,7 @@ Useful paper/demo plots:
 - steps-to-threshold histogram;
 - movement vs fidelity gain;
 - per-target before/after lines;
-- circuit diagram for best proposal;
+- richer circuit diagrams with local gate annotations;
 - Hamiltonian-to-circuit pipeline diagram.
 
 ### 3. Repeatability Beyond Three Seeds

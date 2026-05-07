@@ -33,6 +33,8 @@ from su2diffusion.hamiltonian import (
     evaluate_hamiltonian_conditioned_denoising,
     evaluate_hamiltonian_skeleton_conditioned_denoising,
     evaluate_hamiltonian_stack_predictor,
+    format_hamiltonian_demo_circuit,
+    format_su2_axis_angle,
     generate_three_qubit_hamiltonian_solution_dataset,
     generate_hamiltonian_solution_dataset,
     hamiltonian_denoise_diagnostic_from_model,
@@ -122,6 +124,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_two_entangler_benchmark,
     run_three_qubit_template_benchmark,
     sample_hamiltonian_conditioned_circuit_reverse,
+    su2_axis_angle,
     synthesize_three_qubit_template_stack_report,
     summarize_hamiltonian_denoise_diagnostic,
     summarize_hamiltonian_denoise_ablation,
@@ -407,6 +410,9 @@ def test_three_qubit_hamiltonian_demo_generated_and_token_paths(capsys):
     captured = capsys.readouterr().out
     assert "template: line-4cz" in captured
     assert "fidelity:" in captured
+    assert "synthesized circuit after refinement:" in captured
+    assert "refined local gate" in captured
+    assert "L0: q0=" in format_hamiltonian_demo_circuit(token_demo)
     assert isinstance(generated_demo, HamiltonianDemoResult)
     assert isinstance(token_demo, HamiltonianDemoResult)
     assert generated_demo.source == "generated-search"
@@ -415,6 +421,18 @@ def test_three_qubit_hamiltonian_demo_generated_and_token_paths(capsys):
     assert len(token_demo.slot_movements) == 15
     assert 0.0 <= generated_demo.refinement.refined_fidelity <= 1.0001
     assert 0.0 <= token_demo.refinement.refined_fidelity <= 1.0001
+
+
+def test_su2_axis_angle_format_is_readable():
+    identity = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    x90 = torch.tensor([2.0**-0.5, 2.0**-0.5, 0.0, 0.0])
+
+    angle, axis = su2_axis_angle(x90)
+
+    assert format_su2_axis_angle(identity) == "I"
+    assert "R(" in format_su2_axis_angle(x90)
+    assert abs(angle - float(torch.pi / 2)) < 1e-5
+    assert axis[0] > 0.99
 
 
 def test_three_qubit_hamiltonian_token_training_budget_smoke(capsys):

@@ -285,7 +285,8 @@ it intentionally repeats the long 3-qubit run several times.
 
 Level 3E turns the statistical workflow into a single-target demo report. Given
 one Hamiltonian target, it prints the `line-4cz` template, proposal/refined
-fidelity, steps to threshold, and per-slot `SU(2)` movement, then plots the
-refinement trace and local-gate movement. If the Level 3B token model has been
-run, this demo uses a token-diffusion proposal; otherwise it falls back to
-generated local-gate search.
+fidelity, steps to threshold, a readable local-layer circuit, refined local
+gates in axis-angle form, and per-slot `SU(2)` movement. The plot combines the
+refinement trace, the fixed CZ skeleton, and movement by local slot. If the
+Level 3B token model has been run, this demo uses a token-diffusion proposal;
+otherwise it falls back to generated local-gate search.
