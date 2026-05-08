@@ -1,6 +1,6 @@
 # SU(2) Diffusion Project Context
 
-Last updated: 2026-05-07
+Last updated: 2026-05-08
 
 This memo is a checkpoint for the `su2diffusion` project. It is meant to let a
 new conversation, collaborator, or future version of us recover the state of the
@@ -434,6 +434,19 @@ SU2PaperBenchmarks.ipynb
 This is the paper-style benchmark entry point. It wraps the canonical
 three-qubit `line-4cz` repeatability workflow, exports CSV summaries and a
 repeatability figure, and keeps the full three-seed run behind an explicit flag.
+
+Pareto candidate notebook:
+
+```text
+SU2ParetoDemo.ipynb
+```
+
+This is the first hardware-cost-aware candidate-cloud view. For one Hamiltonian
+target it searches and refines several fixed three-qubit CZ templates, then
+plots refined fidelity against a simple post-hoc cost proxy made from CZ count,
+local-gate count, refinement movement, and local rotation angle. The score is
+reported after synthesis; it does not change the diffusion training loss or the
+local refinement objective.
 
 Main notebook:
 
