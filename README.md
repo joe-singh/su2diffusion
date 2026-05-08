@@ -16,6 +16,10 @@ For paper-style benchmarks, open [`SU2PaperBenchmarks.ipynb`](SU2PaperBenchmarks
 It wraps the current canonical three-qubit `line-4cz` repeatability benchmark and
 exports summary CSVs plus a repeatability figure.
 
+For hardware-cost-aware candidate clouds, open [`SU2ParetoDemo.ipynb`](SU2ParetoDemo.ipynb).
+It searches/refines several fixed three-qubit CZ templates for one Hamiltonian and
+plots the tradeoff between fidelity and simple cost proxies.
+
 ## Local Setup
 
 ```bash
