@@ -12,6 +12,10 @@ For the cleanest current demo, open [`SU2HamiltonianDemo.ipynb`](SU2HamiltonianD
 It runs the local `SU(2)` diffusion sampler, then demonstrates Hamiltonian-to-circuit
 synthesis on `XII`, `YII`, and a small three-qubit transverse-Ising target.
 
+For paper-style benchmarks, open [`SU2PaperBenchmarks.ipynb`](SU2PaperBenchmarks.ipynb).
+It wraps the current canonical three-qubit `line-4cz` repeatability benchmark and
+exports summary CSVs plus a repeatability figure.
+
 ## Local Setup
 
 ```bash

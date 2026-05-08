@@ -414,6 +414,27 @@ in a finite table.
 
 ## Current Notebook Workflow
 
+Clean demo notebook:
+
+```text
+SU2HamiltonianDemo.ipynb
+```
+
+This is the portfolio/demo notebook. It runs the local `SU(2)` gate generator,
+then shows `XII`, `YII`, and a transverse-Ising-style three-qubit Hamiltonian
+compiled into the fixed `line-4cz` template. The `XII` and `YII` cells include
+by-hand amplitude checks against `exp(-iHt)`.
+
+Paper benchmark notebook:
+
+```text
+SU2PaperBenchmarks.ipynb
+```
+
+This is the paper-style benchmark entry point. It wraps the canonical
+three-qubit `line-4cz` repeatability workflow, exports CSV summaries and a
+repeatability figure, and keeps the full three-seed run behind an explicit flag.
+
 Main notebook:
 
 ```text
