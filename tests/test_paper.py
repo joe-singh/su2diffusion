@@ -67,6 +67,9 @@ def test_named_paper_benchmark_configs() -> None:
     full = get_paper_benchmark_config("level3")
 
     assert smoke.train_steps < quick.train_steps < full.train_steps
+    assert smoke.sample_count < quick.sample_count < full.sample_count
+    assert quick.n_heldout_targets == 4
+    assert quick.train_target_count == 4
     assert smoke.template == quick.template == full.template == "line-4cz"
     assert full.n_heldout_targets == 48
     with pytest.raises(ValueError):
@@ -101,4 +104,3 @@ def test_save_paper_benchmark_artifacts(tmp_path: Path) -> None:
         assert path.exists()
     assert "token" in paths["rows"].read_text()
     assert "proposal_mean" in paths["summary"].read_text()
-

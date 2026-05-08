@@ -35,6 +35,7 @@ class PaperBenchmarkConfig:
     terms: tuple[str, ...] = ("XII", "IZI", "IIZ", "XXI", "IZZ", "ZXZ")
     coefficient_scale: float = 0.25
     time: float = 0.6
+    sample_count: int | None = 256
     n_random_candidates: int = 10_000
     top_k: int = 1
     solution_refinement_steps: int = 80
@@ -88,6 +89,7 @@ def get_paper_benchmark_config(name: str = "level3") -> PaperBenchmarkConfig:
             n_heldout_targets=3,
             train_target_count=2,
             train_steps=5,
+            sample_count=8,
             n_random_candidates=64,
             solution_refinement_steps=2,
             basin_refinement_steps=2,
@@ -97,10 +99,13 @@ def get_paper_benchmark_config(name: str = "level3") -> PaperBenchmarkConfig:
         return PaperBenchmarkConfig(
             name="quick-paper-benchmark",
             run_seeds=(0,),
-            n_heldout_targets=12,
-            train_target_count=16,
-            train_steps=250,
-            n_random_candidates=5_000,
+            n_heldout_targets=4,
+            train_target_count=4,
+            train_steps=50,
+            sample_count=32,
+            n_random_candidates=512,
+            solution_refinement_steps=10,
+            basin_refinement_steps=10,
             keep_models=False,
         )
     if normalized in {"level3", "paper", "full"}:
@@ -124,6 +129,17 @@ def run_paper_benchmark_suite(
         benchmark_config = get_paper_benchmark_config("level3")
     elif isinstance(benchmark_config, str):
         benchmark_config = get_paper_benchmark_config(benchmark_config)
+    if benchmark_config.sample_count is not None:
+        circuit_config = CircuitExperimentConfig(
+            name=circuit_config.name,
+            schedule=circuit_config.schedule,
+            train=circuit_config.train,
+            data=circuit_config.data,
+            sample_count=benchmark_config.sample_count,
+            eta=circuit_config.eta,
+            deterministic_eta=circuit_config.deterministic_eta,
+            n_slots=circuit_config.n_slots,
+        )
 
     repeatability = run_three_qubit_hamiltonian_token_repeatability_benchmark(
         generated_gates=generated_gates,
@@ -273,4 +289,3 @@ def save_paper_benchmark_artifacts(
         "summary": summary_path,
         "figure": figure_path,
     }
-
