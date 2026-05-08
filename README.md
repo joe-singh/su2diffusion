@@ -8,6 +8,10 @@ modules, while the notebook stays as a Colab runner for GPU experiments.
 For a checkpoint of the current research state, architecture, benchmark results,
 and next steps, see [`docs/project_context.md`](docs/project_context.md).
 
+For the cleanest current demo, open [`SU2HamiltonianDemo.ipynb`](SU2HamiltonianDemo.ipynb).
+It runs the local `SU(2)` diffusion sampler, then demonstrates Hamiltonian-to-circuit
+synthesis on `XII`, `YII`, and a small three-qubit transverse-Ising target.
+
 ## Local Setup
 
 ```bash
