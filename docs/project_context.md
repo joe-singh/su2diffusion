@@ -448,6 +448,11 @@ local-gate count, refinement movement, and local rotation angle. The score is
 reported after synthesis; it does not change the diffusion training loss or the
 local refinement objective.
 
+The Pareto template library now includes cheap 2-CZ line baselines, mirrored
+3-CZ and 4-CZ line templates, 5-CZ line templates, and the nonline `all-3cz`
+pattern. This gives the scatter plot multiple depth/cost levels instead of only
+one cheap family and one accurate family.
+
 Main notebook:
 
 ```text

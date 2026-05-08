@@ -18,7 +18,8 @@ exports summary CSVs plus a repeatability figure.
 
 For hardware-cost-aware candidate clouds, open [`SU2ParetoDemo.ipynb`](SU2ParetoDemo.ipynb).
 It searches/refines several fixed three-qubit CZ templates for one Hamiltonian and
-plots the tradeoff between fidelity and simple cost proxies.
+plots the tradeoff between fidelity and simple cost proxies. The template library
+includes 2-, 3-, 4-, and 5-CZ line skeletons for richer Pareto frontiers.
 
 ## Local Setup
 

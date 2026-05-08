@@ -37,6 +37,7 @@ from su2diffusion.hamiltonian import (
     format_su2_axis_angle,
     generate_three_qubit_hamiltonian_solution_dataset,
     generate_hamiltonian_solution_dataset,
+    get_three_qubit_cz_template,
     hamiltonian_denoise_diagnostic_from_model,
     hamiltonian_from_terms,
     hamiltonian_target_features,
@@ -290,6 +291,25 @@ def test_three_qubit_pauli_targets_and_template_composition():
     assert target.unitary.shape == (8, 8)
     assert all(item.unitary.shape == (8, 8) for item in targets)
     assert torch.allclose(composed, expected, atol=1e-6)
+
+
+def test_three_qubit_template_library_has_line_depth_variants():
+    expected = {
+        "line-2cz-a": (2, 9),
+        "line-2cz-b": (2, 9),
+        "line-3cz-a": (3, 12),
+        "line-3cz-b": (3, 12),
+        "line-4cz": (4, 15),
+        "line-4cz-b": (4, 15),
+        "line-5cz-a": (5, 18),
+        "line-5cz-b": (5, 18),
+        "all-3cz": (3, 12),
+    }
+
+    for name, (n_edges, n_slots) in expected.items():
+        template = get_three_qubit_cz_template(name)
+        assert len(template.edges) == n_edges
+        assert template.n_slots == n_slots
 
 
 def test_three_qubit_template_benchmark_smoke(capsys):

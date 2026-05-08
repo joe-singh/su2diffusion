@@ -980,9 +980,14 @@ def run_hamiltonian_suite_benchmark(
 
 
 THREE_QUBIT_CZ_TEMPLATES: dict[str, tuple[tuple[int, int], ...]] = {
+    "line-2cz-a": ((0, 1), (1, 2)),
+    "line-2cz-b": ((1, 2), (0, 1)),
     "line-3cz-a": ((0, 1), (1, 2), (0, 1)),
     "line-3cz-b": ((1, 2), (0, 1), (1, 2)),
     "line-4cz": ((0, 1), (1, 2), (0, 1), (1, 2)),
+    "line-4cz-b": ((1, 2), (0, 1), (1, 2), (0, 1)),
+    "line-5cz-a": ((0, 1), (1, 2), (0, 1), (1, 2), (0, 1)),
+    "line-5cz-b": ((1, 2), (0, 1), (1, 2), (0, 1), (1, 2)),
     "all-3cz": ((0, 1), (0, 2), (1, 2)),
 }
 
