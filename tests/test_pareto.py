@@ -8,9 +8,13 @@ from su2diffusion import (
     make_hamiltonian_target,
     pareto_frontier_rows,
     pareto_hardware_cost,
+    print_circuit_diversity,
+    print_circuit_diversity_summary,
     rescore_pareto_circuit_result,
+    run_circuit_diversity_diagnostic,
     run_pareto_circuit_sampling,
     sample_haar,
+    summarize_circuit_diversity,
     top_pareto_rows,
 )
 
@@ -120,3 +124,63 @@ def test_run_pareto_circuit_sampling_smoke() -> None:
     assert all(0.0 <= row.refined_fidelity <= 1.0 for row in result.rows)
     assert all(torch.isfinite(row.refined_gates).all() for row in result.rows)
     assert any(row.is_pareto for row in result.rows)
+
+
+def test_run_circuit_diversity_diagnostic_generated_smoke(capsys) -> None:
+    target = make_hamiltonian_target([("XII", 0.2)], time=0.3, n_qubits=3)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(13)
+    gates = sample_haar(12, device="cpu", generator=generator)
+    labels = [f"g{i}" for i in range(gates.shape[0])]
+
+    result = run_circuit_diversity_diagnostic(
+        target,
+        generated_gates=gates,
+        generated_labels=labels,
+        template="line-3cz-a",
+        n_random_candidates=8,
+        n_selected=3,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        seed=17,
+        show_progress=False,
+    )
+    summary = summarize_circuit_diversity(result)
+    print_circuit_diversity(result, max_rows=2)
+    print_circuit_diversity_summary(result)
+    captured = capsys.readouterr().out
+
+    assert len(result.rows) == 3
+    assert result.proposal_pairwise_distances.shape == (3, 3)
+    assert result.refined_pairwise_distances.shape == (3, 3)
+    assert summary.n == 3
+    assert summary.proposal_clusters >= 1
+    assert summary.refined_clusters >= 1
+    assert "nn proposal" in captured
+    assert all(0.0 <= row.proposal_fidelity <= 1.0 for row in result.rows)
+    assert all(0.0 <= row.refined_fidelity <= 1.0 for row in result.rows)
+
+
+def test_run_circuit_diversity_diagnostic_stack_smoke() -> None:
+    target = make_hamiltonian_target([("ZII", 0.1)], time=0.2, n_qubits=3)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(23)
+    template_slots = 12
+    stacks = sample_haar(4 * template_slots, device="cpu", generator=generator).reshape(4, template_slots, 4)
+
+    result = run_circuit_diversity_diagnostic(
+        target,
+        candidate_stacks=stacks,
+        template="line-3cz-a",
+        source="token",
+        n_selected=2,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        show_progress=False,
+    )
+
+    assert len(result.rows) == 2
+    assert result.source == "token"
+    assert result.rows[0].slot_labels == ("token",) * template_slots
+    assert torch.isfinite(result.proposal_pairwise_distances).all()
+    assert torch.isfinite(result.refined_pairwise_distances).all()
