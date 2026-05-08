@@ -113,6 +113,34 @@ class CircuitDiversitySummary:
     refined_clusters: int
 
 
+@dataclass(frozen=True)
+class CircuitDiversityCoverageResult:
+    reference: CircuitDiversityResult
+    results: dict[str, CircuitDiversityResult]
+    cluster_radius: float
+    success_threshold: float
+    reference_cluster_count: int
+
+
+@dataclass(frozen=True)
+class CircuitDiversityCoverageSummary:
+    source: str
+    n: int
+    n_success: int
+    proposal_mean: float
+    proposal_std: float
+    refined_mean: float
+    refined_std: float
+    success_fraction: float
+    median_steps: float
+    pairwise_refined_mean: float
+    within_cluster_mean: float
+    across_cluster_mean: float
+    cluster_count: int
+    coverage_count: int
+    coverage_fraction: float
+
+
 def _coerce_template(template: str | ThreeQubitCZTemplate) -> ThreeQubitCZTemplate:
     if isinstance(template, ThreeQubitCZTemplate):
         return template
@@ -179,6 +207,24 @@ def _stack_pairwise_distances(stacks: torch.Tensor) -> torch.Tensor:
     return distances.mean(dim=-1).detach().cpu()
 
 
+def _stack_cross_distances(left_stacks: torch.Tensor, right_stacks: torch.Tensor) -> torch.Tensor:
+    left_stacks = q_normalize(left_stacks)
+    right_stacks = q_normalize(right_stacks)
+    if left_stacks.ndim != 3 or left_stacks.shape[-1] != 4:
+        raise ValueError("left_stacks must have shape (n, n_slots, 4)")
+    if right_stacks.ndim != 3 or right_stacks.shape[-1] != 4:
+        raise ValueError("right_stacks must have shape (n, n_slots, 4)")
+    if left_stacks.shape[1] != right_stacks.shape[1]:
+        raise ValueError("stacks must have the same number of local slots")
+    if left_stacks.shape[0] == 0 or right_stacks.shape[0] == 0:
+        return torch.empty(left_stacks.shape[0], right_stacks.shape[0], device=left_stacks.device)
+
+    left = left_stacks[:, None, :, :]
+    right = right_stacks[None, :, :, :]
+    distances = torch.minimum(su2_distance(left, right), su2_distance(left, -right))
+    return distances.mean(dim=-1).detach().cpu()
+
+
 def _offdiag_values(pairwise: torch.Tensor) -> torch.Tensor:
     if pairwise.numel() == 0 or pairwise.shape[0] <= 1:
         return torch.empty(0, dtype=pairwise.dtype, device=pairwise.device)
@@ -197,11 +243,15 @@ def _nearest_distances(pairwise: torch.Tensor) -> torch.Tensor:
 
 
 def _greedy_cluster_count(pairwise: torch.Tensor, radius: float) -> int:
+    return len(_greedy_clusters(pairwise, radius))
+
+
+def _greedy_clusters(pairwise: torch.Tensor, radius: float) -> tuple[tuple[int, ...], ...]:
     if radius < 0:
         raise ValueError("cluster radius must be non-negative")
     n = pairwise.shape[0]
     remaining = set(range(n))
-    clusters = 0
+    clusters: list[tuple[int, ...]] = []
     while remaining:
         center = min(remaining)
         neighbors = {
@@ -210,8 +260,46 @@ def _greedy_cluster_count(pairwise: torch.Tensor, radius: float) -> int:
             if float(pairwise[center, i]) <= radius
         }
         remaining -= neighbors
-        clusters += 1
-    return clusters
+        clusters.append(tuple(sorted(neighbors)))
+    return tuple(clusters)
+
+
+def _successful_diversity_rows(
+    result: CircuitDiversityResult,
+    threshold: float,
+) -> list[CircuitDiversityCandidateRow]:
+    return [row for row in result.rows if row.refined_fidelity >= threshold]
+
+
+def _row_stack(rows: list[CircuitDiversityCandidateRow], attr: str = "refined_gates") -> torch.Tensor:
+    if not rows:
+        return torch.empty(0, 0, 4)
+    return torch.stack([getattr(row, attr).detach().cpu() for row in rows])
+
+
+def _mean_std(values: torch.Tensor) -> tuple[float, float]:
+    if values.numel() == 0:
+        return float("nan"), float("nan")
+    return float(values.mean().item()), float(values.std(unbiased=False).item())
+
+
+def _cluster_within_across(pairwise: torch.Tensor, radius: float) -> tuple[int, float, float]:
+    if pairwise.numel() == 0 or pairwise.shape[0] == 0:
+        return 0, float("nan"), float("nan")
+    clusters = _greedy_clusters(pairwise, radius)
+    n = pairwise.shape[0]
+    labels = torch.full((n,), -1, dtype=torch.long)
+    for cluster_index, cluster in enumerate(clusters):
+        labels[list(cluster)] = cluster_index
+
+    offdiag = ~torch.eye(n, dtype=torch.bool)
+    within_mask = (labels[:, None] == labels[None, :]) & offdiag
+    across_mask = (labels[:, None] != labels[None, :]) & offdiag
+    within = pairwise[within_mask]
+    across = pairwise[across_mask]
+    within_mean = float(within.mean().item()) if within.numel() else float("nan")
+    across_mean = float(across.mean().item()) if across.numel() else float("nan")
+    return len(clusters), within_mean, across_mean
 
 
 def _make_stack_report(
@@ -716,6 +804,157 @@ def summarize_circuit_diversity(
     )
 
 
+def compare_circuit_diversity_coverage(
+    reference: CircuitDiversityResult,
+    results: dict[str, CircuitDiversityResult],
+    cluster_radius: float | None = None,
+    success_threshold: float | None = None,
+) -> CircuitDiversityCoverageResult:
+    """Compare successful samples against search-found reference solution clusters.
+
+    The reference clusters are built from refined circuits that pass the success
+    threshold. Each comparison source receives credit for a reference cluster if
+    at least one of its successful refined circuits lies within ``cluster_radius``.
+    """
+
+    radius = reference.cluster_radius if cluster_radius is None else cluster_radius
+    threshold = reference.threshold if success_threshold is None else success_threshold
+    if radius < 0.0:
+        raise ValueError("cluster_radius must be non-negative")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("success_threshold must be between 0 and 1")
+    if not reference.rows:
+        raise ValueError("reference must contain at least one diversity row")
+
+    reference_rows = _successful_diversity_rows(reference, threshold)
+    if not reference_rows:
+        raise ValueError("reference must contain at least one successful row")
+    reference_stacks = _row_stack(reference_rows)
+    reference_pairwise = _stack_pairwise_distances(reference_stacks)
+    reference_clusters = _greedy_clusters(reference_pairwise, radius)
+    if not reference_clusters:
+        raise ValueError("reference clustering produced no clusters")
+
+    for name, result in results.items():
+        if result.template.name != reference.template.name:
+            raise ValueError(f"{name!r} uses template {result.template.name!r}, expected {reference.template.name!r}")
+        if result.target.name != reference.target.name:
+            raise ValueError(f"{name!r} uses target {result.target.name!r}, expected {reference.target.name!r}")
+
+    return CircuitDiversityCoverageResult(
+        reference=reference,
+        results=dict(results),
+        cluster_radius=radius,
+        success_threshold=threshold,
+        reference_cluster_count=len(reference_clusters),
+    )
+
+
+def summarize_circuit_diversity_coverage(
+    coverage: CircuitDiversityCoverageResult,
+) -> list[CircuitDiversityCoverageSummary]:
+    reference_rows = _successful_diversity_rows(coverage.reference, coverage.success_threshold)
+    reference_stacks = _row_stack(reference_rows)
+    reference_pairwise = _stack_pairwise_distances(reference_stacks)
+    reference_clusters = _greedy_clusters(reference_pairwise, coverage.cluster_radius)
+    center_indices = [cluster[0] for cluster in reference_clusters]
+    reference_centers = reference_stacks[center_indices]
+
+    summaries: list[CircuitDiversityCoverageSummary] = []
+    for source, result in coverage.results.items():
+        rows = result.rows
+        success_rows = _successful_diversity_rows(result, coverage.success_threshold)
+
+        proposal_values = torch.tensor([row.proposal_fidelity for row in rows], dtype=torch.float32)
+        refined_values = torch.tensor([row.refined_fidelity for row in rows], dtype=torch.float32)
+        proposal_mean, proposal_std = _mean_std(proposal_values)
+        refined_mean, refined_std = _mean_std(refined_values)
+        success_fraction = len(success_rows) / len(rows) if rows else float("nan")
+
+        reached_steps = torch.tensor(
+            [row.steps_to_threshold for row in success_rows if row.steps_to_threshold >= 0],
+            dtype=torch.float32,
+        )
+        median_steps = float(reached_steps.median().item()) if reached_steps.numel() else float("nan")
+
+        if success_rows:
+            stacks = _row_stack(success_rows)
+            pairwise = _stack_pairwise_distances(stacks)
+            offdiag = _offdiag_values(pairwise)
+            pairwise_mean = float(offdiag.mean().item()) if offdiag.numel() else 0.0
+            cluster_count, within_mean, across_mean = _cluster_within_across(pairwise, coverage.cluster_radius)
+            cross = _stack_cross_distances(stacks, reference_centers)
+            covered = (cross <= coverage.cluster_radius).any(dim=0)
+            coverage_count = int(covered.sum().item())
+        else:
+            pairwise_mean = float("nan")
+            cluster_count = 0
+            within_mean = float("nan")
+            across_mean = float("nan")
+            coverage_count = 0
+
+        coverage_fraction = (
+            coverage_count / coverage.reference_cluster_count
+            if coverage.reference_cluster_count
+            else float("nan")
+        )
+        summaries.append(
+            CircuitDiversityCoverageSummary(
+                source=source,
+                n=len(rows),
+                n_success=len(success_rows),
+                proposal_mean=proposal_mean,
+                proposal_std=proposal_std,
+                refined_mean=refined_mean,
+                refined_std=refined_std,
+                success_fraction=success_fraction,
+                median_steps=median_steps,
+                pairwise_refined_mean=pairwise_mean,
+                within_cluster_mean=within_mean,
+                across_cluster_mean=across_mean,
+                cluster_count=cluster_count,
+                coverage_count=coverage_count,
+                coverage_fraction=coverage_fraction,
+            )
+        )
+    return summaries
+
+
+def print_circuit_diversity_coverage_summary(
+    coverage: CircuitDiversityCoverageResult,
+) -> None:
+    print(f"reference: {coverage.reference.source}")
+    print(f"target:    {coverage.reference.target.name}")
+    print(f"template:  {coverage.reference.template.name}")
+    print(f"success:   F >= {coverage.success_threshold:g}")
+    print(f"radius:    {coverage.cluster_radius:g}")
+    print(f"reference clusters: {coverage.reference_cluster_count}")
+    print()
+    header = (
+        "source             n   success   proposal      refined       steps   "
+        "pairwise   clusters   coverage   within/across"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in summarize_circuit_diversity_coverage(coverage):
+        steps = f"{row.median_steps:.1f}" if torch.isfinite(torch.tensor(row.median_steps)) else "nan"
+        within = f"{row.within_cluster_mean:.4f}" if torch.isfinite(torch.tensor(row.within_cluster_mean)) else "nan"
+        across = f"{row.across_cluster_mean:.4f}" if torch.isfinite(torch.tensor(row.across_cluster_mean)) else "nan"
+        print(
+            f"{row.source:<18} "
+            f"{row.n:<3} "
+            f"{100 * row.success_fraction:>6.1f}%   "
+            f"{row.proposal_mean:>6.4f}/{row.proposal_std:<6.4f} "
+            f"{row.refined_mean:>6.4f}/{row.refined_std:<6.4f} "
+            f"{steps:>7}   "
+            f"{row.pairwise_refined_mean:>7.4f}   "
+            f"{row.cluster_count:>4}      "
+            f"{row.coverage_count:>3}/{coverage.reference_cluster_count:<3} "
+            f"{100 * row.coverage_fraction:>6.1f}%   "
+            f"{within}/{across}"
+        )
+
+
 def print_circuit_diversity(result: CircuitDiversityResult, max_rows: int | None = 12) -> None:
     print(f"target:   {result.target.name}")
     print(f"template: {result.template.name}")
@@ -860,5 +1099,52 @@ def plot_circuit_diversity(result: CircuitDiversityResult) -> None:
     axes[2].set_title("Local crowding")
 
     fig.suptitle(f"Circuit diversity: {result.target.name} on {result.template.name}")
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_circuit_diversity_coverage(coverage: CircuitDiversityCoverageResult) -> None:
+    rows = summarize_circuit_diversity_coverage(coverage)
+    if not rows:
+        raise ValueError("coverage must contain at least one source")
+
+    labels = [row.source for row in rows]
+    refined = [[row.refined_fidelity for row in coverage.results[label].rows] for label in labels]
+    coverage_values = [row.coverage_fraction for row in rows]
+    clusters = [row.cluster_count for row in rows]
+    pairwise = [row.pairwise_refined_mean for row in rows]
+    within = [row.within_cluster_mean for row in rows]
+    across = [row.across_cluster_mean for row in rows]
+
+    x = torch.arange(len(labels), dtype=torch.float32).numpy()
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+    axes[0].boxplot(refined, labels=labels, showmeans=True)
+    axes[0].axhline(coverage.success_threshold, linestyle="--", color="black", linewidth=1)
+    axes[0].set_ylabel("refined unitary fidelity")
+    axes[0].set_title("Refined proposal quality")
+
+    axes[1].bar(x - 0.18, coverage_values, width=0.36, label="reference coverage")
+    if coverage.reference_cluster_count:
+        normalized_clusters = [item / coverage.reference_cluster_count for item in clusters]
+    else:
+        normalized_clusters = [float("nan") for _ in clusters]
+    axes[1].bar(x + 0.18, normalized_clusters, width=0.36, label="own clusters / reference")
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels, rotation=20, ha="right")
+    axes[1].set_ylim(0.0, 1.05)
+    axes[1].set_ylabel("fraction")
+    axes[1].set_title("Mode coverage")
+    axes[1].legend()
+
+    axes[2].scatter(labels, pairwise, label="pairwise", s=45)
+    axes[2].scatter(labels, within, label="within cluster", s=45)
+    axes[2].scatter(labels, across, label="across cluster", s=45)
+    axes[2].axhline(coverage.cluster_radius, linestyle="--", color="black", linewidth=1)
+    axes[2].set_ylabel("sign-invariant SU(2)^n distance")
+    axes[2].set_title("Successful-sample diversity")
+    axes[2].tick_params(axis="x", rotation=20)
+    axes[2].legend()
+
+    fig.suptitle(f"Circuit diversity coverage: {coverage.reference.target.name}")
     fig.tight_layout()
     plt.show()

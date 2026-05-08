@@ -4,10 +4,12 @@ from su2diffusion import (
     ParetoCandidateRow,
     ParetoCircuitResult,
     ParetoScoringConfig,
+    compare_circuit_diversity_coverage,
     get_three_qubit_cz_template,
     make_hamiltonian_target,
     pareto_frontier_rows,
     pareto_hardware_cost,
+    print_circuit_diversity_coverage_summary,
     print_circuit_diversity,
     print_circuit_diversity_summary,
     rescore_pareto_circuit_result,
@@ -15,6 +17,7 @@ from su2diffusion import (
     run_pareto_circuit_sampling,
     sample_haar,
     summarize_circuit_diversity,
+    summarize_circuit_diversity_coverage,
     top_pareto_rows,
 )
 
@@ -184,3 +187,58 @@ def test_run_circuit_diversity_diagnostic_stack_smoke() -> None:
     assert result.rows[0].slot_labels == ("token",) * template_slots
     assert torch.isfinite(result.proposal_pairwise_distances).all()
     assert torch.isfinite(result.refined_pairwise_distances).all()
+
+
+def test_circuit_diversity_coverage_smoke(capsys) -> None:
+    target = make_hamiltonian_target([("XII", 0.1)], time=0.2, n_qubits=3)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(31)
+    gates = sample_haar(12, device="cpu", generator=generator)
+    labels = [f"g{i}" for i in range(gates.shape[0])]
+
+    reference = run_circuit_diversity_diagnostic(
+        target,
+        generated_gates=gates,
+        generated_labels=labels,
+        template="line-3cz-a",
+        n_random_candidates=8,
+        n_selected=3,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        threshold=0.0,
+        cluster_radius=0.5,
+        seed=37,
+        show_progress=False,
+    )
+    stacks = sample_haar(4 * reference.template.n_slots, device="cpu", generator=generator).reshape(
+        4,
+        reference.template.n_slots,
+        4,
+    )
+    haar = run_circuit_diversity_diagnostic(
+        target,
+        candidate_stacks=stacks,
+        template=reference.template,
+        source="haar",
+        n_selected=3,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        threshold=0.0,
+        cluster_radius=0.5,
+        show_progress=False,
+    )
+
+    coverage = compare_circuit_diversity_coverage(
+        reference,
+        {"generated-search": reference, "haar": haar},
+        cluster_radius=0.5,
+        success_threshold=0.0,
+    )
+    rows = summarize_circuit_diversity_coverage(coverage)
+    print_circuit_diversity_coverage_summary(coverage)
+    captured = capsys.readouterr().out
+
+    assert coverage.reference_cluster_count >= 1
+    assert {row.source for row in rows} == {"generated-search", "haar"}
+    assert all(0.0 <= row.coverage_fraction <= 1.0 for row in rows)
+    assert "coverage" in captured
