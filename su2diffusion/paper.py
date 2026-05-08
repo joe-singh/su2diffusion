@@ -86,13 +86,13 @@ def get_paper_benchmark_config(name: str = "level3") -> PaperBenchmarkConfig:
         return PaperBenchmarkConfig(
             name="smoke-paper-benchmark",
             run_seeds=(0,),
-            n_heldout_targets=3,
-            train_target_count=2,
-            train_steps=5,
-            sample_count=8,
-            n_random_candidates=64,
-            solution_refinement_steps=2,
-            basin_refinement_steps=2,
+            n_heldout_targets=1,
+            train_target_count=1,
+            train_steps=2,
+            sample_count=4,
+            n_random_candidates=16,
+            solution_refinement_steps=1,
+            basin_refinement_steps=1,
             keep_models=False,
         )
     if normalized in {"quick", "colab-quick"}:

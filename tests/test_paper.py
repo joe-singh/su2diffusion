@@ -68,6 +68,8 @@ def test_named_paper_benchmark_configs() -> None:
 
     assert smoke.train_steps < quick.train_steps < full.train_steps
     assert smoke.sample_count < quick.sample_count < full.sample_count
+    assert smoke.n_heldout_targets == 1
+    assert smoke.train_target_count == 1
     assert quick.n_heldout_targets == 4
     assert quick.train_target_count == 4
     assert smoke.template == quick.template == full.template == "line-4cz"
