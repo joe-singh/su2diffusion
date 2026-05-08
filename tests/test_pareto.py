@@ -5,6 +5,7 @@ from su2diffusion import (
     ParetoCircuitResult,
     ParetoScoringConfig,
     compare_circuit_diversity_coverage,
+    compare_circuit_unitary_cross_fidelity,
     get_three_qubit_cz_template,
     make_hamiltonian_target,
     pareto_frontier_rows,
@@ -12,12 +13,14 @@ from su2diffusion import (
     print_circuit_diversity_coverage_summary,
     print_circuit_diversity,
     print_circuit_diversity_summary,
+    print_circuit_unitary_cross_fidelity_summary,
     rescore_pareto_circuit_result,
     run_circuit_diversity_diagnostic,
     run_pareto_circuit_sampling,
     sample_haar,
     summarize_circuit_diversity,
     summarize_circuit_diversity_coverage,
+    summarize_circuit_unitary_cross_fidelity,
     top_pareto_rows,
 )
 
@@ -242,3 +245,56 @@ def test_circuit_diversity_coverage_smoke(capsys) -> None:
     assert {row.source for row in rows} == {"generated-search", "haar"}
     assert all(0.0 <= row.coverage_fraction <= 1.0 for row in rows)
     assert "coverage" in captured
+
+
+def test_circuit_unitary_cross_fidelity_smoke(capsys) -> None:
+    target = make_hamiltonian_target([("XII", 0.1)], time=0.2, n_qubits=3)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(41)
+    gates = sample_haar(12, device="cpu", generator=generator)
+    labels = [f"g{i}" for i in range(gates.shape[0])]
+
+    reference = run_circuit_diversity_diagnostic(
+        target,
+        generated_gates=gates,
+        generated_labels=labels,
+        template="line-3cz-a",
+        n_random_candidates=8,
+        n_selected=3,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        threshold=0.0,
+        seed=43,
+        show_progress=False,
+    )
+    stacks = sample_haar(4 * reference.template.n_slots, device="cpu", generator=generator).reshape(
+        4,
+        reference.template.n_slots,
+        4,
+    )
+    haar = run_circuit_diversity_diagnostic(
+        target,
+        candidate_stacks=stacks,
+        template=reference.template,
+        source="haar",
+        n_selected=3,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        threshold=0.0,
+        show_progress=False,
+    )
+
+    result = compare_circuit_unitary_cross_fidelity(
+        reference,
+        {"generated-search": reference, "haar": haar},
+        success_threshold=0.0,
+    )
+    rows = summarize_circuit_unitary_cross_fidelity(result)
+    print_circuit_unitary_cross_fidelity_summary(result)
+    captured = capsys.readouterr().out
+
+    assert {row.source for row in rows} == {"generated-search", "haar"}
+    assert result.matrices["generated-search"].shape == (3, 3)
+    assert result.matrices["haar"].shape == (3, 3)
+    assert all(0.0 <= row.best_match_min <= row.best_match_max <= 1.0 for row in rows)
+    assert "best mean/std" in captured

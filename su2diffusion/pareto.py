@@ -141,6 +141,29 @@ class CircuitDiversityCoverageSummary:
     coverage_fraction: float
 
 
+@dataclass(frozen=True)
+class CircuitUnitaryCrossFidelityResult:
+    reference: CircuitDiversityResult
+    results: dict[str, CircuitDiversityResult]
+    success_threshold: float
+    matrices: dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class CircuitUnitaryCrossFidelitySummary:
+    source: str
+    n: int
+    n_success: int
+    best_match_mean: float
+    best_match_std: float
+    best_match_median: float
+    best_match_min: float
+    best_match_max: float
+    fraction_above_099: float
+    fraction_above_0999: float
+    all_pairwise_mean: float
+
+
 def _coerce_template(template: str | ThreeQubitCZTemplate) -> ThreeQubitCZTemplate:
     if isinstance(template, ThreeQubitCZTemplate):
         return template
@@ -300,6 +323,33 @@ def _cluster_within_across(pairwise: torch.Tensor, radius: float) -> tuple[int, 
     within_mean = float(within.mean().item()) if within.numel() else float("nan")
     across_mean = float(across.mean().item()) if across.numel() else float("nan")
     return len(clusters), within_mean, across_mean
+
+
+def _unitaries_from_diversity_rows(
+    rows: list[CircuitDiversityCandidateRow],
+    template: ThreeQubitCZTemplate,
+) -> torch.Tensor:
+    dim = 2**template.n_qubits
+    if not rows:
+        return torch.empty(0, dim, dim, dtype=torch.complex64)
+    stacks = _row_stack(rows)
+    local_units = quaternion_to_unitary(stacks)
+    return compose_three_qubit_template_units(local_units, template).detach().cpu()
+
+
+def _unitary_cross_fidelity_matrix(
+    source: torch.Tensor,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    if source.ndim != 3 or reference.ndim != 3:
+        raise ValueError("source and reference unitaries must have shape (n, dim, dim)")
+    if source.shape[-2:] != reference.shape[-2:]:
+        raise ValueError("source and reference unitaries must have matching dimensions")
+    if source.shape[0] == 0 or reference.shape[0] == 0:
+        return torch.empty(source.shape[0], reference.shape[0], dtype=torch.float32)
+    dim = source.shape[-1]
+    overlaps = torch.einsum("rij,sij->sr", reference.conj(), source).abs() / dim
+    return overlaps.real.clamp(0.0, 1.0).detach().cpu()
 
 
 def _make_stack_report(
@@ -955,6 +1005,113 @@ def print_circuit_diversity_coverage_summary(
         )
 
 
+def compare_circuit_unitary_cross_fidelity(
+    reference: CircuitDiversityResult,
+    results: dict[str, CircuitDiversityResult],
+    success_threshold: float | None = None,
+) -> CircuitUnitaryCrossFidelityResult:
+    """Compare full-unitary agreement between successful diversity samples.
+
+    The reference set is usually the generated-search result. For each source,
+    the returned matrix has shape ``(n_source_success, n_reference_success)`` and
+    stores global-phase-invariant unitary fidelity between refined circuits.
+    """
+
+    threshold = reference.threshold if success_threshold is None else success_threshold
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("success_threshold must be between 0 and 1")
+    reference_rows = _successful_diversity_rows(reference, threshold)
+    if not reference_rows:
+        raise ValueError("reference must contain at least one successful row")
+    reference_units = _unitaries_from_diversity_rows(reference_rows, reference.template)
+
+    matrices: dict[str, torch.Tensor] = {}
+    for source, result in results.items():
+        if result.template.name != reference.template.name:
+            raise ValueError(f"{source!r} uses template {result.template.name!r}, expected {reference.template.name!r}")
+        if result.target.name != reference.target.name:
+            raise ValueError(f"{source!r} uses target {result.target.name!r}, expected {reference.target.name!r}")
+        rows = _successful_diversity_rows(result, threshold)
+        source_units = _unitaries_from_diversity_rows(rows, result.template)
+        matrices[source] = _unitary_cross_fidelity_matrix(source_units, reference_units)
+
+    return CircuitUnitaryCrossFidelityResult(
+        reference=reference,
+        results=dict(results),
+        success_threshold=threshold,
+        matrices=matrices,
+    )
+
+
+def summarize_circuit_unitary_cross_fidelity(
+    result: CircuitUnitaryCrossFidelityResult,
+) -> list[CircuitUnitaryCrossFidelitySummary]:
+    summaries: list[CircuitUnitaryCrossFidelitySummary] = []
+    for source, diversity in result.results.items():
+        matrix = result.matrices[source]
+        rows = diversity.rows
+        n_success = matrix.shape[0]
+        if matrix.numel():
+            best = matrix.max(dim=1).values
+            best_mean, best_std = _mean_std(best)
+            summary = CircuitUnitaryCrossFidelitySummary(
+                source=source,
+                n=len(rows),
+                n_success=n_success,
+                best_match_mean=best_mean,
+                best_match_std=best_std,
+                best_match_median=float(best.median().item()),
+                best_match_min=float(best.min().item()),
+                best_match_max=float(best.max().item()),
+                fraction_above_099=float((best >= 0.99).float().mean().item()),
+                fraction_above_0999=float((best >= 0.999).float().mean().item()),
+                all_pairwise_mean=float(matrix.mean().item()),
+            )
+        else:
+            summary = CircuitUnitaryCrossFidelitySummary(
+                source=source,
+                n=len(rows),
+                n_success=n_success,
+                best_match_mean=float("nan"),
+                best_match_std=float("nan"),
+                best_match_median=float("nan"),
+                best_match_min=float("nan"),
+                best_match_max=float("nan"),
+                fraction_above_099=float("nan"),
+                fraction_above_0999=float("nan"),
+                all_pairwise_mean=float("nan"),
+            )
+        summaries.append(summary)
+    return summaries
+
+
+def print_circuit_unitary_cross_fidelity_summary(
+    result: CircuitUnitaryCrossFidelityResult,
+) -> None:
+    reference_success = result.matrices[next(iter(result.matrices))].shape[1] if result.matrices else 0
+    print(f"reference: {result.reference.source}")
+    print(f"target:    {result.reference.target.name}")
+    print(f"template:  {result.reference.template.name}")
+    print(f"success:   F >= {result.success_threshold:g}")
+    print(f"reference successful circuits: {reference_success}")
+    print()
+    header = "source             success   best mean/std   median   min      max      >=0.99   >=0.999   all-pair mean"
+    print(header)
+    print("-" * len(header))
+    for row in summarize_circuit_unitary_cross_fidelity(result):
+        print(
+            f"{row.source:<18} "
+            f"{row.n_success:>3}/{row.n:<3}   "
+            f"{row.best_match_mean:>6.4f}/{row.best_match_std:<6.4f} "
+            f"{row.best_match_median:>7.4f} "
+            f"{row.best_match_min:>7.4f} "
+            f"{row.best_match_max:>7.4f} "
+            f"{100 * row.fraction_above_099:>7.1f}% "
+            f"{100 * row.fraction_above_0999:>8.1f}% "
+            f"{row.all_pairwise_mean:>12.4f}"
+        )
+
+
 def print_circuit_diversity(result: CircuitDiversityResult, max_rows: int | None = 12) -> None:
     print(f"target:   {result.target.name}")
     print(f"template: {result.template.name}")
@@ -1146,5 +1303,46 @@ def plot_circuit_diversity_coverage(coverage: CircuitDiversityCoverageResult) ->
     axes[2].legend()
 
     fig.suptitle(f"Circuit diversity coverage: {coverage.reference.target.name}")
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_circuit_unitary_cross_fidelity(result: CircuitUnitaryCrossFidelityResult) -> None:
+    summaries = summarize_circuit_unitary_cross_fidelity(result)
+    if not summaries:
+        raise ValueError("result must contain at least one source")
+
+    labels = [row.source for row in summaries]
+    best_matches = []
+    all_pairs = []
+    for label in labels:
+        matrix = result.matrices[label]
+        if matrix.numel():
+            best_matches.append(matrix.max(dim=1).values.numpy())
+            all_pairs.append(matrix.flatten().numpy())
+        else:
+            best_matches.append([])
+            all_pairs.append([])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].boxplot(best_matches, labels=labels, showmeans=True)
+    axes[0].axhline(0.99, linestyle="--", color="black", linewidth=1, label="0.99")
+    axes[0].axhline(0.999, linestyle=":", color="black", linewidth=1, label="0.999")
+    axes[0].set_ylabel("best unitary fidelity to reference set")
+    axes[0].set_title("Best cross-method match")
+    axes[0].tick_params(axis="x", rotation=20)
+    axes[0].legend()
+
+    bins = torch.linspace(0.0, 1.0, 41).numpy()
+    for label, values in zip(labels, all_pairs):
+        if len(values):
+            axes[1].hist(values, bins=bins, alpha=0.45, density=True, label=label)
+    axes[1].axvline(0.99, linestyle="--", color="black", linewidth=1)
+    axes[1].set_xlabel("unitary fidelity to reference circuits")
+    axes[1].set_ylabel("density")
+    axes[1].set_title("All successful cross-pairs")
+    axes[1].legend()
+
+    fig.suptitle(f"Unitary cross-fidelity: {result.reference.target.name}")
     fig.tight_layout()
     plt.show()
