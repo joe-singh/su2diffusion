@@ -1,6 +1,6 @@
 # SU(2) Diffusion Project Context
 
-Last updated: 2026-05-08
+Last updated: 2026-05-09
 
 This memo is a checkpoint for the `su2diffusion` project. It is meant to let a
 new conversation, collaborator, or future version of us recover the state of the
@@ -312,6 +312,74 @@ Interpretation:
 
 This is the current strongest evidence that the diffusion model is learning
 useful proposal geometry.
+
+### Circuit Diversity And Cross-Fidelity Checkpoint
+
+The most recent diversity experiment asks whether the trained proposal model is
+only finding one kind of solution, or whether it samples multiple distinct
+decompositions for a fixed Hamiltonian target.
+
+Setup:
+
+```text
+target:   threeq-heldout-00
+template: line-4cz
+K:        200 candidates per source
+success:  F >= 0.99
+radius:   0.15 in sign-invariant slotwise SU(2)^15 distance
+reference clusters: generated-search successful refined circuits
+```
+
+The coverage result was:
+
+```text
+source             n    success   refined mean/std   pairwise   clusters   search coverage
+token-diffusion    200   96.5%     0.9876/0.0537     0.7307    192        0/161
+generated-search   200   80.5%     0.9409/0.1157     1.1163    161        161/161
+haar               200   82.0%     0.9449/0.1120     1.1178    164        0/161
+```
+
+Interpretation:
+
+- token diffusion has the highest refinement success rate in this run;
+- token diffusion produces many distinct successful local-gate decompositions
+  under the `SU(2)^15` slotwise metric;
+- those token-diffusion decompositions are not near the generated-search
+  decompositions at radius `0.15`;
+- Haar is also slotwise-diverse, but starts much worse and moves much farther in
+  refinement.
+
+A radius sweep showed that this zero-coverage result is not a fragile threshold
+artifact. Token/search overlap stayed essentially zero up to radius `0.50`.
+At radius `1.00`, token coverage rose to `24/25`, but the generated-search
+reference clusters had already collapsed from about `168` clusters to `25`.
+
+The crucial follow-up was the unitary cross-fidelity diagnostic. This compares
+the final unitaries implemented by successful circuits across methods, instead
+of comparing the slotwise local-gate coordinates. Against the generated-search
+successful set:
+
+```text
+source             success   best overlap mean/std   min      >=0.99   >=0.999
+token-diffusion    193/200   0.9991/0.0004          0.9968   100.0%    68.9%
+generated-search   161/200   1.0000/0.0000          1.0000   100.0%   100.0%
+haar               164/200   0.9987/0.0010          0.9899    99.4%    42.7%
+```
+
+So the current conclusion is subtle but strong:
+
+```text
+Token diffusion, generated search, and Haar can all refine to circuits that
+implement essentially the same target unitary, but they occupy different
+regions of the local-gate decomposition space. Token diffusion finds a compact,
+multimodal, high-success family of decompositions rather than merely
+reproducing generated-search solutions.
+```
+
+Metric convention note: the package's `unitary_fidelity` currently reports the
+normalized unitary overlap `|Tr(V^dagger U)| / d`, not the squared process
+fidelity. Rankings are unchanged by squaring, but the paper should state this
+convention explicitly.
 
 ### Simple By-Hand Sanity Checks
 
