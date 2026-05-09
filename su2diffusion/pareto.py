@@ -1,4 +1,5 @@
 from dataclasses import dataclass, replace
+import math
 
 import matplotlib.pyplot as plt
 import torch
@@ -164,6 +165,70 @@ class CircuitUnitaryCrossFidelitySummary:
     all_pairwise_mean: float
 
 
+@dataclass(frozen=True)
+class CircuitDiversityPropertyRow:
+    source: str
+    scope: str
+    index: int
+    n_members: int
+    representative_rank: int
+    proposal_fidelity: float
+    refined_fidelity: float
+    steps_to_threshold: int
+    movement_mean: float
+    movement_max: float
+    local_angle_sum: float
+    within_template_cost: float
+    hardware_cost: float
+
+
+@dataclass(frozen=True)
+class CircuitDiversityPropertySummary:
+    source: str
+    scope: str
+    n: int
+    proposal_mean: float
+    proposal_std: float
+    refined_mean: float
+    refined_std: float
+    cost_mean: float
+    cost_std: float
+    cost_median: float
+    cost_iqr: float
+    angle_mean: float
+    angle_std: float
+    movement_mean: float
+    movement_std: float
+    max_movement_mean: float
+    max_movement_std: float
+    steps_median: float
+    steps_iqr: float
+
+
+@dataclass(frozen=True)
+class CircuitDiversityPropertyTestRow:
+    metric: str
+    scope: str
+    kruskal_h: float
+    kruskal_p: float
+    primary_vs_search_effect: float
+    primary_vs_search_p: float
+    primary_vs_search_p_bonf: float
+    primary_vs_haar_effect: float
+    primary_vs_haar_p: float
+    primary_vs_haar_p_bonf: float
+
+
+@dataclass(frozen=True)
+class CircuitDiversityPropertyResult:
+    results: dict[str, CircuitDiversityResult]
+    cluster_radius: float
+    success_threshold: float
+    scoring: ParetoScoringConfig
+    cluster_rows: list[CircuitDiversityPropertyRow]
+    circuit_rows: list[CircuitDiversityPropertyRow]
+
+
 def _coerce_template(template: str | ThreeQubitCZTemplate) -> ThreeQubitCZTemplate:
     if isinstance(template, ThreeQubitCZTemplate):
         return template
@@ -304,6 +369,149 @@ def _mean_std(values: torch.Tensor) -> tuple[float, float]:
     if values.numel() == 0:
         return float("nan"), float("nan")
     return float(values.mean().item()), float(values.std(unbiased=False).item())
+
+
+def _finite_values(values: torch.Tensor) -> torch.Tensor:
+    values = values.detach().cpu().to(dtype=torch.float64).flatten()
+    return values[torch.isfinite(values)]
+
+
+def _median_iqr(values: torch.Tensor) -> tuple[float, float]:
+    values = _finite_values(values)
+    if values.numel() == 0:
+        return float("nan"), float("nan")
+    median = float(values.median().item())
+    if values.numel() == 1:
+        return median, 0.0
+    q25, q75 = torch.quantile(values, torch.tensor([0.25, 0.75], dtype=values.dtype))
+    return median, float((q75 - q25).item())
+
+
+def _average_ranks(values: torch.Tensor) -> torch.Tensor:
+    values = values.detach().cpu().to(dtype=torch.float64).flatten()
+    order = torch.argsort(values)
+    ranks = torch.empty_like(values)
+    n = values.numel()
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and values[order[j]] == values[order[i]]:
+            j += 1
+        average_rank = 0.5 * (i + 1 + j)
+        ranks[order[i:j]] = average_rank
+        i = j
+    return ranks
+
+
+def _chi_square_survival(value: float, df: int) -> float:
+    if not math.isfinite(value) or value < 0.0:
+        return float("nan")
+    if df == 1:
+        return math.erfc(math.sqrt(value / 2.0))
+    if df == 2:
+        return math.exp(-0.5 * value)
+    return float("nan")
+
+
+def _kruskal_wallis(groups: list[torch.Tensor]) -> tuple[float, float]:
+    groups = [_finite_values(group) for group in groups if _finite_values(group).numel()]
+    if len(groups) < 2:
+        return float("nan"), float("nan")
+    all_values = torch.cat(groups)
+    n_total = all_values.numel()
+    if n_total <= len(groups):
+        return float("nan"), float("nan")
+    ranks = _average_ranks(all_values)
+    offset = 0
+    rank_sum_term = 0.0
+    for group in groups:
+        n_group = group.numel()
+        rank_sum = float(ranks[offset : offset + n_group].sum().item())
+        rank_sum_term += rank_sum * rank_sum / n_group
+        offset += n_group
+    h_value = 12.0 / (n_total * (n_total + 1.0)) * rank_sum_term - 3.0 * (n_total + 1.0)
+    h_value = max(0.0, h_value)
+    return h_value, _chi_square_survival(h_value, len(groups) - 1)
+
+
+def _mann_whitney_effect_p(primary: torch.Tensor, other: torch.Tensor) -> tuple[float, float]:
+    primary = _finite_values(primary)
+    other = _finite_values(other)
+    n_primary = primary.numel()
+    n_other = other.numel()
+    if n_primary == 0 or n_other == 0:
+        return float("nan"), float("nan")
+    combined = torch.cat([primary, other])
+    ranks = _average_ranks(combined)
+    rank_sum_primary = float(ranks[:n_primary].sum().item())
+    u_primary = rank_sum_primary - n_primary * (n_primary + 1.0) / 2.0
+    effect = 2.0 * u_primary / (n_primary * n_other) - 1.0
+    mean_u = n_primary * n_other / 2.0
+    std_u = math.sqrt(n_primary * n_other * (n_primary + n_other + 1.0) / 12.0)
+    if std_u == 0.0:
+        return effect, float("nan")
+    z_value = (u_primary - mean_u) / std_u
+    p_value = math.erfc(abs(z_value) / math.sqrt(2.0))
+    return effect, p_value
+
+
+def _property_values(
+    rows: list[CircuitDiversityPropertyRow],
+    metric: str,
+) -> torch.Tensor:
+    values = []
+    for row in rows:
+        value = getattr(row, metric)
+        if metric == "steps_to_threshold" and value < 0:
+            continue
+        values.append(float(value))
+    return torch.tensor(values, dtype=torch.float64)
+
+
+def _property_source_rows(
+    rows: list[CircuitDiversityPropertyRow],
+    source: str,
+) -> list[CircuitDiversityPropertyRow]:
+    return [row for row in rows if row.source == source]
+
+
+def _property_row_from_diversity_row(
+    row: CircuitDiversityCandidateRow,
+    *,
+    source: str,
+    scope: str,
+    index: int,
+    n_members: int,
+    scoring: ParetoScoringConfig,
+    template: ThreeQubitCZTemplate,
+) -> CircuitDiversityPropertyRow:
+    local_angle_sum = _local_angle_sum(row.refined_gates)
+    within_template_cost = (
+        scoring.movement_weight * row.movement_mean
+        + scoring.angle_weight * local_angle_sum
+    )
+    hardware_cost = pareto_hardware_cost(
+        n_cz=len(template.edges),
+        n_local_gates=template.n_slots,
+        movement_mean=row.movement_mean,
+        local_angle_sum=local_angle_sum,
+        scoring=scoring,
+    )
+    return CircuitDiversityPropertyRow(
+        source=source,
+        scope=scope,
+        index=index,
+        n_members=n_members,
+        representative_rank=row.candidate_rank,
+        proposal_fidelity=row.proposal_fidelity,
+        refined_fidelity=row.refined_fidelity,
+        steps_to_threshold=row.steps_to_threshold,
+        movement_mean=row.movement_mean,
+        movement_max=row.movement_max,
+        local_angle_sum=local_angle_sum,
+        within_template_cost=within_template_cost,
+        hardware_cost=hardware_cost,
+    )
 
 
 def _cluster_within_across(pairwise: torch.Tensor, radius: float) -> tuple[int, float, float]:
@@ -1110,6 +1318,306 @@ def print_circuit_unitary_cross_fidelity_summary(
             f"{100 * row.fraction_above_0999:>8.1f}% "
             f"{row.all_pairwise_mean:>12.4f}"
         )
+
+
+def compare_circuit_diversity_properties(
+    results: dict[str, CircuitDiversityResult],
+    cluster_radius: float | None = None,
+    success_threshold: float | None = None,
+    scoring: ParetoScoringConfig | None = None,
+) -> CircuitDiversityPropertyResult:
+    """Characterize successful decomposition families by simple circuit properties.
+
+    The cluster-level rows use the highest-fidelity successful circuit in each
+    slotwise SU(2)^n cluster as a representative. The per-circuit rows keep every
+    successful circuit and are mainly a robustness check for the cluster-level
+    comparison.
+    """
+
+    if not results:
+        raise ValueError("results must contain at least one diversity result")
+    first = next(iter(results.values()))
+    radius = first.cluster_radius if cluster_radius is None else cluster_radius
+    threshold = first.threshold if success_threshold is None else success_threshold
+    scoring = scoring or ParetoScoringConfig()
+    if radius < 0.0:
+        raise ValueError("cluster_radius must be non-negative")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("success_threshold must be between 0 and 1")
+
+    for source, result in results.items():
+        if result.template.name != first.template.name:
+            raise ValueError(f"{source!r} uses template {result.template.name!r}, expected {first.template.name!r}")
+        if result.target.name != first.target.name:
+            raise ValueError(f"{source!r} uses target {result.target.name!r}, expected {first.target.name!r}")
+
+    cluster_rows: list[CircuitDiversityPropertyRow] = []
+    circuit_rows: list[CircuitDiversityPropertyRow] = []
+    for source, result in results.items():
+        success_rows = _successful_diversity_rows(result, threshold)
+        for index, row in enumerate(success_rows):
+            circuit_rows.append(
+                _property_row_from_diversity_row(
+                    row,
+                    source=source,
+                    scope="circuit",
+                    index=index,
+                    n_members=1,
+                    scoring=scoring,
+                    template=result.template,
+                )
+            )
+
+        if not success_rows:
+            continue
+        stacks = _row_stack(success_rows)
+        pairwise = _stack_pairwise_distances(stacks)
+        clusters = _greedy_clusters(pairwise, radius)
+        for cluster_index, cluster in enumerate(clusters):
+            representative_index = max(
+                cluster,
+                key=lambda item: success_rows[item].refined_fidelity,
+            )
+            cluster_rows.append(
+                _property_row_from_diversity_row(
+                    success_rows[representative_index],
+                    source=source,
+                    scope="cluster",
+                    index=cluster_index,
+                    n_members=len(cluster),
+                    scoring=scoring,
+                    template=result.template,
+                )
+            )
+
+    return CircuitDiversityPropertyResult(
+        results=dict(results),
+        cluster_radius=radius,
+        success_threshold=threshold,
+        scoring=scoring,
+        cluster_rows=cluster_rows,
+        circuit_rows=circuit_rows,
+    )
+
+
+def summarize_circuit_diversity_properties(
+    result: CircuitDiversityPropertyResult,
+    scope: str = "cluster",
+) -> list[CircuitDiversityPropertySummary]:
+    if scope not in {"cluster", "circuit"}:
+        raise ValueError("scope must be 'cluster' or 'circuit'")
+    rows = result.cluster_rows if scope == "cluster" else result.circuit_rows
+    summaries: list[CircuitDiversityPropertySummary] = []
+    for source in result.results:
+        source_rows = _property_source_rows(rows, source)
+        proposal = _property_values(source_rows, "proposal_fidelity")
+        refined = _property_values(source_rows, "refined_fidelity")
+        cost = _property_values(source_rows, "within_template_cost")
+        angle = _property_values(source_rows, "local_angle_sum")
+        movement = _property_values(source_rows, "movement_mean")
+        max_movement = _property_values(source_rows, "movement_max")
+        steps = _property_values(source_rows, "steps_to_threshold")
+        proposal_mean, proposal_std = _mean_std(_finite_values(proposal).to(dtype=torch.float32))
+        refined_mean, refined_std = _mean_std(_finite_values(refined).to(dtype=torch.float32))
+        cost_mean, cost_std = _mean_std(_finite_values(cost).to(dtype=torch.float32))
+        angle_mean, angle_std = _mean_std(_finite_values(angle).to(dtype=torch.float32))
+        movement_mean, movement_std = _mean_std(_finite_values(movement).to(dtype=torch.float32))
+        max_movement_mean, max_movement_std = _mean_std(_finite_values(max_movement).to(dtype=torch.float32))
+        cost_median, cost_iqr = _median_iqr(cost)
+        steps_median, steps_iqr = _median_iqr(steps)
+        summaries.append(
+            CircuitDiversityPropertySummary(
+                source=source,
+                scope=scope,
+                n=len(source_rows),
+                proposal_mean=proposal_mean,
+                proposal_std=proposal_std,
+                refined_mean=refined_mean,
+                refined_std=refined_std,
+                cost_mean=cost_mean,
+                cost_std=cost_std,
+                cost_median=cost_median,
+                cost_iqr=cost_iqr,
+                angle_mean=angle_mean,
+                angle_std=angle_std,
+                movement_mean=movement_mean,
+                movement_std=movement_std,
+                max_movement_mean=max_movement_mean,
+                max_movement_std=max_movement_std,
+                steps_median=steps_median,
+                steps_iqr=steps_iqr,
+            )
+        )
+    return summaries
+
+
+def test_circuit_diversity_properties(
+    result: CircuitDiversityPropertyResult,
+    scope: str = "cluster",
+    primary_source: str = "token-diffusion",
+    search_source: str = "generated-search",
+    haar_source: str = "haar",
+) -> list[CircuitDiversityPropertyTestRow]:
+    """Run precommitted non-parametric comparisons for property diagnostics.
+
+    The p-values use lightweight normal/chi-square approximations so the package
+    does not need a SciPy dependency. Effect sizes are rank-biserial/Cliff-style:
+    positive means the primary source tends to have larger values than the
+    comparison source.
+    """
+
+    if scope not in {"cluster", "circuit"}:
+        raise ValueError("scope must be 'cluster' or 'circuit'")
+    rows = result.cluster_rows if scope == "cluster" else result.circuit_rows
+    metrics = (
+        "within_template_cost",
+        "local_angle_sum",
+        "movement_mean",
+        "movement_max",
+        "steps_to_threshold",
+        "proposal_fidelity",
+        "refined_fidelity",
+    )
+    test_rows: list[CircuitDiversityPropertyTestRow] = []
+    for metric in metrics:
+        groups = [
+            _property_values(_property_source_rows(rows, source), metric)
+            for source in result.results
+        ]
+        kruskal_h, kruskal_p = _kruskal_wallis(groups)
+        primary = _property_values(_property_source_rows(rows, primary_source), metric)
+        search = _property_values(_property_source_rows(rows, search_source), metric)
+        haar = _property_values(_property_source_rows(rows, haar_source), metric)
+        primary_search_effect, primary_search_p = _mann_whitney_effect_p(primary, search)
+        primary_haar_effect, primary_haar_p = _mann_whitney_effect_p(primary, haar)
+        test_rows.append(
+            CircuitDiversityPropertyTestRow(
+                metric=metric,
+                scope=scope,
+                kruskal_h=kruskal_h,
+                kruskal_p=kruskal_p,
+                primary_vs_search_effect=primary_search_effect,
+                primary_vs_search_p=primary_search_p,
+                primary_vs_search_p_bonf=min(1.0, 2.0 * primary_search_p)
+                if math.isfinite(primary_search_p)
+                else float("nan"),
+                primary_vs_haar_effect=primary_haar_effect,
+                primary_vs_haar_p=primary_haar_p,
+                primary_vs_haar_p_bonf=min(1.0, 2.0 * primary_haar_p)
+                if math.isfinite(primary_haar_p)
+                else float("nan"),
+            )
+        )
+    return test_rows
+
+
+def print_circuit_diversity_property_summary(
+    result: CircuitDiversityPropertyResult,
+    scope: str = "cluster",
+) -> None:
+    label = "cluster representatives" if scope == "cluster" else "successful circuits"
+    print(f"scope: {label}")
+    print(f"radius: {result.cluster_radius:g}")
+    print(f"success: F >= {result.success_threshold:g}")
+    print("within-template cost: movement/angle terms only; fixed CZ/local-gate constants omitted")
+    print()
+    header = (
+        "source             n   proposal      refined       cost mean/std   "
+        "angle mean/std   move mean/std   max move   steps med/IQR"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in summarize_circuit_diversity_properties(result, scope=scope):
+        print(
+            f"{row.source:<18} "
+            f"{row.n:<3} "
+            f"{row.proposal_mean:>6.4f}/{row.proposal_std:<6.4f} "
+            f"{row.refined_mean:>6.4f}/{row.refined_std:<6.4f} "
+            f"{row.cost_mean:>7.4f}/{row.cost_std:<7.4f} "
+            f"{row.angle_mean:>7.3f}/{row.angle_std:<7.3f} "
+            f"{row.movement_mean:>6.4f}/{row.movement_std:<6.4f} "
+            f"{row.max_movement_mean:>7.4f}   "
+            f"{row.steps_median:>5.1f}/{row.steps_iqr:<5.1f}"
+        )
+
+
+def print_circuit_diversity_property_tests(
+    result: CircuitDiversityPropertyResult,
+    scope: str = "cluster",
+    primary_source: str = "token-diffusion",
+    search_source: str = "generated-search",
+    haar_source: str = "haar",
+) -> None:
+    print(f"scope: {scope}")
+    print(f"primary source: {primary_source}")
+    print("effect size: positive means primary tends larger")
+    print()
+    header = (
+        "metric                 KW H     KW p     "
+        f"effect vs {search_source:<16} p(bonf)   "
+        f"effect vs {haar_source:<8} p(bonf)"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in test_circuit_diversity_properties(
+        result,
+        scope=scope,
+        primary_source=primary_source,
+        search_source=search_source,
+        haar_source=haar_source,
+    ):
+        print(
+            f"{row.metric:<22} "
+            f"{row.kruskal_h:>6.2f}  "
+            f"{row.kruskal_p:>7.2g}   "
+            f"{row.primary_vs_search_effect:>8.3f}          "
+            f"{row.primary_vs_search_p_bonf:>7.2g}   "
+            f"{row.primary_vs_haar_effect:>8.3f}    "
+            f"{row.primary_vs_haar_p_bonf:>7.2g}"
+        )
+
+
+def plot_circuit_diversity_properties(
+    result: CircuitDiversityPropertyResult,
+    scope: str = "cluster",
+) -> None:
+    if scope not in {"cluster", "circuit"}:
+        raise ValueError("scope must be 'cluster' or 'circuit'")
+    rows = result.cluster_rows if scope == "cluster" else result.circuit_rows
+    if not rows:
+        raise ValueError("result contains no property rows for the requested scope")
+    sources = [source for source in result.results if _property_source_rows(rows, source)]
+    metrics = (
+        ("within_template_cost", "within-template cost"),
+        ("local_angle_sum", "total local angle"),
+        ("movement_mean", "mean movement"),
+    )
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    for axis, (metric, title) in zip(axes[:3], metrics):
+        data = [
+            _finite_values(_property_values(_property_source_rows(rows, source), metric)).tolist()
+            for source in sources
+        ]
+        axis.boxplot(data, labels=sources, showmeans=True)
+        axis.set_title(title)
+        axis.tick_params(axis="x", rotation=20)
+
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    for index, source in enumerate(sources):
+        source_rows = _property_source_rows(rows, source)
+        axes[3].scatter(
+            [row.local_angle_sum for row in source_rows],
+            [row.movement_mean for row in source_rows],
+            label=source,
+            alpha=0.75,
+            color=colors[index % len(colors)],
+        )
+    axes[3].set_title("movement vs angle")
+    axes[3].set_xlabel("total local angle")
+    axes[3].set_ylabel("mean movement")
+    axes[3].legend()
+    fig.suptitle(f"Circuit diversity properties ({scope})")
+    fig.tight_layout()
 
 
 def print_circuit_diversity(result: CircuitDiversityResult, max_rows: int | None = 12) -> None:
