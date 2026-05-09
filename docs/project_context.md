@@ -366,6 +366,14 @@ generated-search   161/200   1.0000/0.0000          1.0000   100.0%   100.0%
 haar               164/200   0.9987/0.0010          0.9899    99.4%    42.7%
 ```
 
+Important caveat: the slotwise `SU(2)^15` distance is a parametrization-space
+metric, not a gauge-invariant distance on physical circuits. Two circuits can be
+far apart under this metric if their local gates differ by template gauge
+freedoms or entangler-commuting reparameterizations, even when they implement
+the same overall unitary. That is why the unitary cross-fidelity check matters:
+it separates "different local-gate decompositions" from "different target
+operations."
+
 So the current conclusion is subtle but strong:
 
 ```text
@@ -711,7 +719,8 @@ especially as we move toward 3+ qubits and Hamiltonian families.
 3. How much of the improvement comes from better proposal fidelity versus better
    optimizer basin geometry?
 4. What is the right canonicalization/gauge convention for many valid solution
-   stacks?
+   stacks, and how should we define a quotient-space distance that separates
+   parametrization diversity from gauge redundancy?
 5. When does model scaling beat data scaling?
 6. What is the cleanest demonstration target for a paper or AI-for-science
    portfolio piece?
