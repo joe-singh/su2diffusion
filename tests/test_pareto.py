@@ -5,12 +5,15 @@ from su2diffusion import (
     ParetoCircuitResult,
     ParetoScoringConfig,
     compare_circuit_diversity_coverage,
+    compare_circuit_diversity_properties,
     compare_circuit_unitary_cross_fidelity,
     get_three_qubit_cz_template,
     make_hamiltonian_target,
     pareto_frontier_rows,
     pareto_hardware_cost,
     print_circuit_diversity_coverage_summary,
+    print_circuit_diversity_property_summary,
+    print_circuit_diversity_property_tests,
     print_circuit_diversity,
     print_circuit_diversity_summary,
     print_circuit_unitary_cross_fidelity_summary,
@@ -20,7 +23,9 @@ from su2diffusion import (
     sample_haar,
     summarize_circuit_diversity,
     summarize_circuit_diversity_coverage,
+    summarize_circuit_diversity_properties,
     summarize_circuit_unitary_cross_fidelity,
+    test_circuit_diversity_properties as run_circuit_diversity_property_tests,
     top_pareto_rows,
 )
 
@@ -245,6 +250,68 @@ def test_circuit_diversity_coverage_smoke(capsys) -> None:
     assert {row.source for row in rows} == {"generated-search", "haar"}
     assert all(0.0 <= row.coverage_fraction <= 1.0 for row in rows)
     assert "coverage" in captured
+
+
+def test_circuit_diversity_property_comparison_smoke(capsys) -> None:
+    target = make_hamiltonian_target([("XII", 0.1)], time=0.2, n_qubits=3)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(51)
+    gates = sample_haar(12, device="cpu", generator=generator)
+    labels = [f"g{i}" for i in range(gates.shape[0])]
+
+    reference = run_circuit_diversity_diagnostic(
+        target,
+        generated_gates=gates,
+        generated_labels=labels,
+        template="line-3cz-a",
+        n_random_candidates=8,
+        n_selected=3,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        threshold=0.0,
+        cluster_radius=0.5,
+        seed=53,
+        show_progress=False,
+    )
+    stacks = sample_haar(4 * reference.template.n_slots, device="cpu", generator=generator).reshape(
+        4,
+        reference.template.n_slots,
+        4,
+    )
+    token = run_circuit_diversity_diagnostic(
+        target,
+        candidate_stacks=stacks,
+        template=reference.template,
+        source="token-diffusion",
+        n_selected=3,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        threshold=0.0,
+        cluster_radius=0.5,
+        show_progress=False,
+    )
+
+    properties = compare_circuit_diversity_properties(
+        {"token-diffusion": token, "generated-search": reference},
+        cluster_radius=0.5,
+        success_threshold=0.0,
+    )
+    summaries = summarize_circuit_diversity_properties(properties, scope="cluster")
+    test_rows = run_circuit_diversity_property_tests(
+        properties,
+        scope="cluster",
+        haar_source="generated-search",
+    )
+    print_circuit_diversity_property_summary(properties, scope="cluster")
+    print_circuit_diversity_property_tests(properties, scope="cluster", haar_source="generated-search")
+    captured = capsys.readouterr().out
+
+    assert {row.source for row in summaries} == {"token-diffusion", "generated-search"}
+    assert all(row.n >= 1 for row in summaries)
+    assert all(torch.isfinite(torch.tensor(row.cost_mean)) for row in summaries)
+    assert {row.metric for row in test_rows} >= {"within_template_cost", "movement_mean", "local_angle_sum"}
+    assert "within-template cost" in captured
+    assert "effect size" in captured
 
 
 def test_circuit_unitary_cross_fidelity_smoke(capsys) -> None:
