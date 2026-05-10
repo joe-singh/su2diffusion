@@ -464,9 +464,15 @@ measured hardware-noise result.
 
 Be careful not to overclaim the mechanism. The lower-angle bias could come from
 the solution-stack construction, from the heat-kernel geometry of the noising
-process, or from their interaction. A sharp future ablation would train on
-deliberately high-angle solution stacks and check whether the lower-angle bias
-persists.
+process, or from their interaction. Level 3I in `SU2GateExperiments.ipynb` is
+the mechanism ablation for this question: it trains two fresh token models from
+the same candidate pools, one selecting the lowest-rotation refined solution
+stack per training target and one selecting the highest-rotation refined stack.
+The output table compares training-dataset total local angle, refined success,
+successful cluster count, and output total local angle on the same three named
+targets as Level 3H. If the high-angle-trained model still emits low-angle
+decompositions, that supports a geometry/model-side bias; if it emits high-angle
+decompositions, the bias is mainly inherited from solution-stack selection.
 
 Level 3H in `SU2GateExperiments.ipynb` is the multi-target robustness check for
 this claim. It reuses the Level 3B token model and repeats the coverage/property
