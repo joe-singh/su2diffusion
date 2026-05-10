@@ -229,6 +229,48 @@ class CircuitDiversityPropertyResult:
     circuit_rows: list[CircuitDiversityPropertyRow]
 
 
+@dataclass(frozen=True)
+class CircuitDiversityMultiTargetPropertyRow:
+    target: str
+    regime: str
+    reference_clusters: int
+    token_success_fraction: float
+    search_success_fraction: float
+    haar_success_fraction: float
+    token_clusters: int
+    search_clusters: int
+    haar_clusters: int
+    token_coverage_count: int
+    token_coverage_fraction: float
+    token_angle_mean: float
+    token_angle_std: float
+    search_angle_mean: float
+    search_angle_std: float
+    haar_angle_mean: float
+    haar_angle_std: float
+    search_minus_token_angle: float
+    token_search_angle_effect: float
+    token_search_angle_p_bonf: float
+    token_cost_mean: float
+    search_cost_mean: float
+    haar_cost_mean: float
+
+
+@dataclass(frozen=True)
+class CircuitDiversityMultiTargetPropertyResult:
+    diagnostics: dict[str, dict[str, CircuitDiversityResult]]
+    regimes: dict[str, str]
+    coverages: dict[str, CircuitDiversityCoverageResult]
+    properties: dict[str, CircuitDiversityPropertyResult]
+    rows: list[CircuitDiversityMultiTargetPropertyRow]
+    cluster_radius: float
+    success_threshold: float
+    primary_source: str
+    reference_source: str
+    search_source: str
+    haar_source: str
+
+
 def _coerce_template(template: str | ThreeQubitCZTemplate) -> ThreeQubitCZTemplate:
     if isinstance(template, ThreeQubitCZTemplate):
         return template
@@ -1575,6 +1617,283 @@ def print_circuit_diversity_property_tests(
             f"{row.primary_vs_haar_effect:>8.3f}    "
             f"{row.primary_vs_haar_p_bonf:>7.2g}"
         )
+
+
+def _summarize_sources_without_reference_clusters(
+    results: dict[str, CircuitDiversityResult],
+    threshold: float,
+    radius: float,
+) -> dict[str, CircuitDiversityCoverageSummary]:
+    summaries: dict[str, CircuitDiversityCoverageSummary] = {}
+    for source, result in results.items():
+        rows = result.rows
+        success_rows = _successful_diversity_rows(result, threshold)
+        proposal_values = torch.tensor([row.proposal_fidelity for row in rows], dtype=torch.float32)
+        refined_values = torch.tensor([row.refined_fidelity for row in rows], dtype=torch.float32)
+        proposal_mean, proposal_std = _mean_std(proposal_values)
+        refined_mean, refined_std = _mean_std(refined_values)
+        success_fraction = len(success_rows) / len(rows) if rows else float("nan")
+        reached_steps = torch.tensor(
+            [row.steps_to_threshold for row in success_rows if row.steps_to_threshold >= 0],
+            dtype=torch.float32,
+        )
+        median_steps = float(reached_steps.median().item()) if reached_steps.numel() else float("nan")
+
+        if success_rows:
+            stacks = _row_stack(success_rows)
+            pairwise = _stack_pairwise_distances(stacks)
+            offdiag = _offdiag_values(pairwise)
+            pairwise_mean = float(offdiag.mean().item()) if offdiag.numel() else 0.0
+            cluster_count, within_mean, across_mean = _cluster_within_across(pairwise, radius)
+        else:
+            pairwise_mean = float("nan")
+            cluster_count = 0
+            within_mean = float("nan")
+            across_mean = float("nan")
+
+        summaries[source] = CircuitDiversityCoverageSummary(
+            source=source,
+            n=len(rows),
+            n_success=len(success_rows),
+            proposal_mean=proposal_mean,
+            proposal_std=proposal_std,
+            refined_mean=refined_mean,
+            refined_std=refined_std,
+            success_fraction=success_fraction,
+            median_steps=median_steps,
+            pairwise_refined_mean=pairwise_mean,
+            within_cluster_mean=within_mean,
+            across_cluster_mean=across_mean,
+            cluster_count=cluster_count,
+            coverage_count=0,
+            coverage_fraction=float("nan"),
+        )
+    return summaries
+
+
+def compare_multitarget_circuit_diversity_properties(
+    diagnostics: dict[str, dict[str, CircuitDiversityResult]],
+    regimes: dict[str, str] | None = None,
+    reference_source: str = "generated-search",
+    primary_source: str = "token-diffusion",
+    search_source: str = "generated-search",
+    haar_source: str = "haar",
+    cluster_radius: float | None = None,
+    success_threshold: float | None = None,
+    scoring: ParetoScoringConfig | None = None,
+) -> CircuitDiversityMultiTargetPropertyResult:
+    """Summarize coverage and property tests across several Hamiltonian targets.
+
+    Each target entry should contain the same source names used in the single-target
+    diversity diagnostics, typically token-diffusion, generated-search, and Haar.
+    The returned rows precommit to the angle comparison used in the paper draft:
+    token diffusion is the primary source, generated-search is the reference
+    decomposition family, and negative effects mean token diffusion has smaller
+    total local angle.
+    """
+
+    if not diagnostics:
+        raise ValueError("diagnostics must contain at least one target")
+    regimes = dict(regimes or {})
+    scoring = scoring or ParetoScoringConfig()
+
+    coverages: dict[str, CircuitDiversityCoverageResult] = {}
+    properties: dict[str, CircuitDiversityPropertyResult] = {}
+    rows: list[CircuitDiversityMultiTargetPropertyRow] = []
+    resolved_radius = float("nan")
+    resolved_threshold = float("nan")
+
+    for target_name, result_map in diagnostics.items():
+        for source in (reference_source, primary_source, search_source, haar_source):
+            if source not in result_map:
+                raise ValueError(f"{target_name!r} is missing source {source!r}")
+
+        reference = result_map[reference_source]
+        radius = reference.cluster_radius if cluster_radius is None else cluster_radius
+        threshold = reference.threshold if success_threshold is None else success_threshold
+        if radius < 0.0:
+            raise ValueError("cluster_radius must be non-negative")
+        if not (0.0 <= threshold <= 1.0):
+            raise ValueError("success_threshold must be between 0 and 1")
+        for source, source_result in result_map.items():
+            if source_result.template.name != reference.template.name:
+                raise ValueError(
+                    f"{source!r} uses template {source_result.template.name!r}, "
+                    f"expected {reference.template.name!r}"
+                )
+            if source_result.target.name != reference.target.name:
+                raise ValueError(
+                    f"{source!r} uses target {source_result.target.name!r}, "
+                    f"expected {reference.target.name!r}"
+                )
+
+        reference_rows = _successful_diversity_rows(reference, threshold)
+        coverage: CircuitDiversityCoverageResult | None = None
+        reference_cluster_count = 0
+        if reference_rows:
+            coverage = compare_circuit_diversity_coverage(
+                reference,
+                result_map,
+                cluster_radius=radius,
+                success_threshold=threshold,
+            )
+            coverages[target_name] = coverage
+            coverage_by_source = {
+                item.source: item
+                for item in summarize_circuit_diversity_coverage(coverage)
+            }
+            reference_cluster_count = coverage.reference_cluster_count
+        else:
+            coverage_by_source = _summarize_sources_without_reference_clusters(
+                result_map,
+                threshold=threshold,
+                radius=radius,
+            )
+        property_result = compare_circuit_diversity_properties(
+            result_map,
+            cluster_radius=radius,
+            success_threshold=threshold,
+            scoring=scoring,
+        )
+        properties[target_name] = property_result
+        resolved_radius = radius
+        resolved_threshold = threshold
+
+        summary_by_source = {
+            item.source: item
+            for item in summarize_circuit_diversity_properties(property_result, scope="cluster")
+        }
+        tests_by_metric = {
+            item.metric: item
+            for item in test_circuit_diversity_properties(
+                property_result,
+                scope="cluster",
+                primary_source=primary_source,
+                search_source=search_source,
+                haar_source=haar_source,
+            )
+        }
+        angle_test = tests_by_metric["local_angle_sum"]
+        token_coverage = coverage_by_source[primary_source]
+        search_coverage = coverage_by_source[search_source]
+        haar_coverage = coverage_by_source[haar_source]
+        token_summary = summary_by_source[primary_source]
+        search_summary = summary_by_source[search_source]
+        haar_summary = summary_by_source[haar_source]
+        rows.append(
+            CircuitDiversityMultiTargetPropertyRow(
+                target=target_name,
+                regime=regimes.get(target_name, "unspecified"),
+                reference_clusters=reference_cluster_count,
+                token_success_fraction=token_coverage.success_fraction,
+                search_success_fraction=search_coverage.success_fraction,
+                haar_success_fraction=haar_coverage.success_fraction,
+                token_clusters=token_coverage.cluster_count,
+                search_clusters=search_coverage.cluster_count,
+                haar_clusters=haar_coverage.cluster_count,
+                token_coverage_count=token_coverage.coverage_count,
+                token_coverage_fraction=token_coverage.coverage_fraction,
+                token_angle_mean=token_summary.angle_mean,
+                token_angle_std=token_summary.angle_std,
+                search_angle_mean=search_summary.angle_mean,
+                search_angle_std=search_summary.angle_std,
+                haar_angle_mean=haar_summary.angle_mean,
+                haar_angle_std=haar_summary.angle_std,
+                search_minus_token_angle=search_summary.angle_mean - token_summary.angle_mean,
+                token_search_angle_effect=angle_test.primary_vs_search_effect,
+                token_search_angle_p_bonf=angle_test.primary_vs_search_p_bonf,
+                token_cost_mean=token_summary.cost_mean,
+                search_cost_mean=search_summary.cost_mean,
+                haar_cost_mean=haar_summary.cost_mean,
+            )
+        )
+
+    return CircuitDiversityMultiTargetPropertyResult(
+        diagnostics={name: dict(result_map) for name, result_map in diagnostics.items()},
+        regimes=regimes,
+        coverages=coverages,
+        properties=properties,
+        rows=rows,
+        cluster_radius=resolved_radius,
+        success_threshold=resolved_threshold,
+        primary_source=primary_source,
+        reference_source=reference_source,
+        search_source=search_source,
+        haar_source=haar_source,
+    )
+
+
+def print_multitarget_circuit_diversity_property_summary(
+    result: CircuitDiversityMultiTargetPropertyResult,
+) -> None:
+    print("multi-target diversity/property summary")
+    print(f"radius: {result.cluster_radius:g}")
+    print(f"success: F >= {result.success_threshold:g}")
+    print(f"primary source: {result.primary_source}")
+    print(f"reference source: {result.reference_source}")
+    print("angle effect: negative means primary has smaller total local angle than generated-search")
+    print()
+    header = (
+        "target                    regime                 "
+        "succ tok/search/haar   clusters tok/search/haar   coverage      "
+        "A token/search/haar        search-token A   effect    p(bonf)"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in result.rows:
+        print(
+            f"{row.target:<25} "
+            f"{row.regime:<22} "
+            f"{100.0 * row.token_success_fraction:>5.1f}/"
+            f"{100.0 * row.search_success_fraction:>5.1f}/"
+            f"{100.0 * row.haar_success_fraction:<5.1f}   "
+            f"{row.token_clusters:>4}/{row.search_clusters:<4}/{row.haar_clusters:<4}          "
+            f"{row.token_coverage_count:>4}/{row.reference_clusters:<4} "
+            f"{100.0 * row.token_coverage_fraction:>5.1f}%   "
+            f"{row.token_angle_mean:>6.2f}/"
+            f"{row.search_angle_mean:>6.2f}/"
+            f"{row.haar_angle_mean:<6.2f}       "
+            f"{row.search_minus_token_angle:>7.2f}   "
+            f"{row.token_search_angle_effect:>7.3f}   "
+            f"{row.token_search_angle_p_bonf:>7.2g}"
+        )
+
+
+def plot_multitarget_circuit_diversity_properties(
+    result: CircuitDiversityMultiTargetPropertyResult,
+) -> None:
+    if not result.rows:
+        raise ValueError("result contains no rows")
+    labels = [row.target for row in result.rows]
+    xs = torch.arange(len(labels), dtype=torch.float32)
+    width = 0.24
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    axes[0].bar(xs - width, [row.token_angle_mean for row in result.rows], width, label="token")
+    axes[0].bar(xs, [row.search_angle_mean for row in result.rows], width, label="search")
+    axes[0].bar(xs + width, [row.haar_angle_mean for row in result.rows], width, label="haar")
+    axes[0].set_title("total local angle")
+    axes[0].set_ylabel("radians")
+    axes[0].set_xticks(xs)
+    axes[0].set_xticklabels(labels, rotation=20, ha="right")
+    axes[0].legend()
+
+    axes[1].bar(xs - width, [row.token_success_fraction for row in result.rows], width, label="token")
+    axes[1].bar(xs, [row.search_success_fraction for row in result.rows], width, label="search")
+    axes[1].bar(xs + width, [row.haar_success_fraction for row in result.rows], width, label="haar")
+    axes[1].set_title("refined success")
+    axes[1].set_ylim(0.0, 1.05)
+    axes[1].set_ylabel("fraction with F >= threshold")
+    axes[1].set_xticks(xs)
+    axes[1].set_xticklabels(labels, rotation=20, ha="right")
+
+    axes[2].bar(xs, [row.token_coverage_fraction for row in result.rows])
+    axes[2].set_title("token coverage of search clusters")
+    axes[2].set_ylim(0.0, 1.05)
+    axes[2].set_ylabel("fraction")
+    axes[2].set_xticks(xs)
+    axes[2].set_xticklabels(labels, rotation=20, ha="right")
+    fig.tight_layout()
 
 
 def plot_circuit_diversity_properties(

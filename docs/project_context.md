@@ -25,6 +25,27 @@ The current target form is:
 H, t -> Hamiltonian-conditioned SU(2)^n diffusion -> circuit proposal -> local SU(2)^n refinement
 ```
 
+## Proposal Sources And Baselines
+
+There are two diffusion models in the current project, and they play different
+roles:
+
+1. **Single-gate diffusion** is the older local model. It is an unconditional
+   sampler on one copy of `SU(2)`, trained to generate plausible local
+   near-Clifford gates. It does not see the Hamiltonian.
+2. **Circuit-token diffusion** is the main Hamiltonian-conditioned model. It
+   samples all local gates jointly on `SU(2)^n` given `H` and `t`.
+
+This distinction matters for the baseline names:
+
+- `token-diffusion` means the main Hamiltonian-conditioned product-manifold
+  model, i.e. `H, t -> q_1, ..., q_n`.
+- `generated-search` means random slot filling from the single-gate diffusion
+  pool. It uses generated local gates, but it is not Hamiltonian-conditioned and
+  does not sample a whole circuit jointly.
+- `Haar` means independent Haar-random `SU(2)` gates in every local slot. It is
+  the fully uninformed continuous baseline.
+
 ## What Makes This Project Different
 
 The reference circuit-diffusion literature denoises circuit encodings: qubit
@@ -446,6 +467,35 @@ the solution-stack construction, from the heat-kernel geometry of the noising
 process, or from their interaction. A sharp future ablation would train on
 deliberately high-angle solution stacks and check whether the lower-angle bias
 persists.
+
+Level 3H in `SU2GateExperiments.ipynb` is the multi-target robustness check for
+this claim. It reuses the Level 3B token model and repeats the coverage/property
+diagnostic on named three-qubit Hamiltonians rather than only `threeq-heldout-00`.
+The precommitted targets are `three-qubit-transverse-ising`,
+`three-qubit-weak-heisenberg`, and `three-qubit-mixed-pauli`. They are
+intentionally not sampled from the exact random Level 3B training-target
+distribution. The compact table reports, per target, token/search/Haar success
+rates, cluster counts, token coverage of generated-search clusters, total local
+angle for each source, and the precommitted token-vs-search angle effect size
+with Bonferroni-corrected p-value.
+
+The three-seed Level 3H check used full experimental seeds `17007`, `23007`,
+and `29007`; in each run, token/search/Haar seeds were derived from the same
+run seed. The important multi-seed summary was:
+
+```text
+target                      token success   search success   Haar success   A token   A search   A Haar   search-token A
+three-qubit-transverse-ising   91.5±2.3%       81.8±2.8%      80.5±1.3%     27.48±0.07 33.08±0.17 33.51±0.30   5.60±0.17
+three-qubit-weak-heisenberg   96.3±0.8%       82.8±4.4%      84.2±2.5%     25.37±0.24 33.17±0.20 33.61±0.19   7.80±0.41
+three-qubit-mixed-pauli       70.2±3.3%       62.8±1.0%      59.7±2.3%     29.33±0.22 33.20±0.09 33.55±0.46   3.88±0.22
+```
+
+Coverage of generated-search clusters by token-diffusion clusters remained zero
+at radius `0.15` for all three targets and all three seeds. This upgrades the
+property-comparison story from a single-target observation to a reproducible
+multi-target result: token diffusion consistently finds successful decompositions
+with lower total local angle while occupying a slotwise-disjoint decomposition
+family.
 
 Metric convention note: the package's `unitary_fidelity` currently reports the
 normalized unitary overlap `|Tr(V^dagger U)| / d`, not the squared process
