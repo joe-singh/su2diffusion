@@ -1624,13 +1624,19 @@ def _select_refined_solutions(
             eligible,
             key=lambda item: (_local_rotation_energy(item.refined_gates), -item.refined_fidelity),
         )[:solutions_per_target]
+    if solution_selection in {"max_local_rotation", "max-local-rotation"}:
+        return sorted(
+            eligible,
+            key=lambda item: (-_local_rotation_energy(item.refined_gates), -item.refined_fidelity),
+        )[:solutions_per_target]
     if solution_selection in {"best_fidelity", "best-fidelity"}:
         return sorted(
             eligible,
             key=lambda item: (-item.refined_fidelity, _local_rotation_energy(item.refined_gates)),
         )[:solutions_per_target]
     raise ValueError(
-        "solution_selection must be 'top', 'best_fidelity', or 'min_local_rotation'"
+        "solution_selection must be 'top', 'best_fidelity', "
+        "'min_local_rotation', or 'max_local_rotation'"
     )
 
 

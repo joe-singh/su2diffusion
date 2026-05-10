@@ -462,11 +462,31 @@ This is a hardware-relevant bias, but it is still a proxy result rather than a
 measured hardware-noise result.
 ```
 
-Be careful not to overclaim the mechanism. The lower-angle bias could come from
-the solution-stack construction, from the heat-kernel geometry of the noising
-process, or from their interaction. A sharp future ablation would train on
-deliberately high-angle solution stacks and check whether the lower-angle bias
-persists.
+Level 3I in `SU2GateExperiments.ipynb` is the mechanism ablation for this
+question. It trains two fresh token models from the same candidate pools: one
+selecting the lowest-rotation refined solution stack per training target and
+one selecting the highest-rotation refined stack. Two independent runs showed
+the output angle tracks the training-stack angle:
+
+```text
+run 1: low train A=29.18 -> output A=20.95-23.91
+       high train A=36.79 -> output A=34.28-36.26
+
+run 2: low train A=29.74 -> output A=23.73-25.29
+       high train A=36.75 -> output A=33.07-34.04
+```
+
+So the lower-angle bias is not an unavoidable consequence of heat-kernel
+geometry. It is largely steerable through the solution-stack selection rule.
+This is useful: the representative-selection policy is an angle knob for the
+learned circuit prior. Lower total angle is often hardware-friendly because it
+corresponds to smaller total local rotation/pulse area, which can reduce
+coherent-control error, leakage, heating, and calibration sensitivity. Higher
+total angle can still be desirable when larger calibrated primitives are more
+reliable than tiny rotations, when extra rotations help refocus coherent errors,
+when randomized compiling/error tailoring benefits from alternate
+decompositions, or when a hardware optimizer prefers a different calibration
+basin.
 
 Level 3H in `SU2GateExperiments.ipynb` is the multi-target robustness check for
 this claim. It reuses the Level 3B token model and repeats the coverage/property

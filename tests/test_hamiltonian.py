@@ -154,7 +154,40 @@ from su2diffusion.hamiltonian import (
     train_hamiltonian_token_circuit_diffusion,
     train_hamiltonian_slot_prior,
     unitary_from_hamiltonian,
+    _select_refined_solutions,
 )
+from su2diffusion.synthesis import RefinementResult
+
+
+def _dummy_refinement(label: str, q_stack: torch.Tensor, fidelity: float = 0.999) -> RefinementResult:
+    return RefinementResult(
+        target="dummy",
+        entangler="line-4cz",
+        initial_fidelity=0.1,
+        refined_fidelity=fidelity,
+        fidelity_trace=(fidelity,),
+        slot_indices=tuple(range(q_stack.shape[0])),
+        slot_labels=(label,) * q_stack.shape[0],
+        refined_gates=q_stack,
+    )
+
+
+def test_select_refined_solutions_supports_max_local_rotation() -> None:
+    low = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    high = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+    refinements = [
+        _dummy_refinement("low", low, fidelity=0.999),
+        _dummy_refinement("high", high, fidelity=0.998),
+    ]
+
+    selected = _select_refined_solutions(
+        refinements,
+        solutions_per_target=1,
+        fidelity_threshold=0.99,
+        solution_selection="max_local_rotation",
+    )
+
+    assert selected[0].slot_labels == ("high",)
 
 
 def test_parse_pauli_string_accepts_compact_and_subscript_notation():
