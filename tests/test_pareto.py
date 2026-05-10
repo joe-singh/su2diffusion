@@ -379,6 +379,65 @@ def test_multitarget_circuit_diversity_property_summary_smoke(capsys) -> None:
     assert "search-token A" in captured
 
 
+def test_multitarget_property_summary_allows_no_reference_success(capsys) -> None:
+    target = make_hamiltonian_target([("XII", 0.1)], time=0.2, n_qubits=3, name="no-ref-success")
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(251)
+    gates = sample_haar(12, device="cpu", generator=generator)
+    labels = [f"g{i}" for i in range(gates.shape[0])]
+
+    reference = run_circuit_diversity_diagnostic(
+        target,
+        generated_gates=gates,
+        generated_labels=labels,
+        template="line-3cz-a",
+        n_random_candidates=4,
+        n_selected=2,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        threshold=0.0,
+        cluster_radius=0.5,
+        seed=253,
+        show_progress=False,
+    )
+    token_stacks = sample_haar(2 * reference.template.n_slots, device="cpu", generator=generator).reshape(
+        2,
+        reference.template.n_slots,
+        4,
+    )
+    token = run_circuit_diversity_diagnostic(
+        target,
+        candidate_stacks=token_stacks,
+        template=reference.template,
+        source="token-diffusion",
+        n_selected=2,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        threshold=0.0,
+        cluster_radius=0.5,
+        show_progress=False,
+    )
+
+    result = compare_multitarget_circuit_diversity_properties(
+        {
+            target.name: {
+                "token-diffusion": token,
+                "generated-search": reference,
+                "haar": reference,
+            }
+        },
+        cluster_radius=0.5,
+        success_threshold=1.0,
+    )
+    print_multitarget_circuit_diversity_property_summary(result)
+    captured = capsys.readouterr().out
+
+    assert result.rows[0].reference_clusters == 0
+    assert result.rows[0].token_coverage_count == 0
+    assert torch.isnan(torch.tensor(result.rows[0].token_coverage_fraction))
+    assert "0/0" in captured
+
+
 def test_circuit_unitary_cross_fidelity_smoke(capsys) -> None:
     target = make_hamiltonian_target([("XII", 0.1)], time=0.2, n_qubits=3)
     generator = torch.Generator(device="cpu")

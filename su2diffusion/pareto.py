@@ -1619,6 +1619,58 @@ def print_circuit_diversity_property_tests(
         )
 
 
+def _summarize_sources_without_reference_clusters(
+    results: dict[str, CircuitDiversityResult],
+    threshold: float,
+    radius: float,
+) -> dict[str, CircuitDiversityCoverageSummary]:
+    summaries: dict[str, CircuitDiversityCoverageSummary] = {}
+    for source, result in results.items():
+        rows = result.rows
+        success_rows = _successful_diversity_rows(result, threshold)
+        proposal_values = torch.tensor([row.proposal_fidelity for row in rows], dtype=torch.float32)
+        refined_values = torch.tensor([row.refined_fidelity for row in rows], dtype=torch.float32)
+        proposal_mean, proposal_std = _mean_std(proposal_values)
+        refined_mean, refined_std = _mean_std(refined_values)
+        success_fraction = len(success_rows) / len(rows) if rows else float("nan")
+        reached_steps = torch.tensor(
+            [row.steps_to_threshold for row in success_rows if row.steps_to_threshold >= 0],
+            dtype=torch.float32,
+        )
+        median_steps = float(reached_steps.median().item()) if reached_steps.numel() else float("nan")
+
+        if success_rows:
+            stacks = _row_stack(success_rows)
+            pairwise = _stack_pairwise_distances(stacks)
+            offdiag = _offdiag_values(pairwise)
+            pairwise_mean = float(offdiag.mean().item()) if offdiag.numel() else 0.0
+            cluster_count, within_mean, across_mean = _cluster_within_across(pairwise, radius)
+        else:
+            pairwise_mean = float("nan")
+            cluster_count = 0
+            within_mean = float("nan")
+            across_mean = float("nan")
+
+        summaries[source] = CircuitDiversityCoverageSummary(
+            source=source,
+            n=len(rows),
+            n_success=len(success_rows),
+            proposal_mean=proposal_mean,
+            proposal_std=proposal_std,
+            refined_mean=refined_mean,
+            refined_std=refined_std,
+            success_fraction=success_fraction,
+            median_steps=median_steps,
+            pairwise_refined_mean=pairwise_mean,
+            within_cluster_mean=within_mean,
+            across_cluster_mean=across_mean,
+            cluster_count=cluster_count,
+            coverage_count=0,
+            coverage_fraction=float("nan"),
+        )
+    return summaries
+
+
 def compare_multitarget_circuit_diversity_properties(
     diagnostics: dict[str, dict[str, CircuitDiversityResult]],
     regimes: dict[str, str] | None = None,
@@ -1657,27 +1709,56 @@ def compare_multitarget_circuit_diversity_properties(
                 raise ValueError(f"{target_name!r} is missing source {source!r}")
 
         reference = result_map[reference_source]
-        coverage = compare_circuit_diversity_coverage(
-            reference,
-            result_map,
-            cluster_radius=cluster_radius,
-            success_threshold=success_threshold,
-        )
+        radius = reference.cluster_radius if cluster_radius is None else cluster_radius
+        threshold = reference.threshold if success_threshold is None else success_threshold
+        if radius < 0.0:
+            raise ValueError("cluster_radius must be non-negative")
+        if not (0.0 <= threshold <= 1.0):
+            raise ValueError("success_threshold must be between 0 and 1")
+        for source, source_result in result_map.items():
+            if source_result.template.name != reference.template.name:
+                raise ValueError(
+                    f"{source!r} uses template {source_result.template.name!r}, "
+                    f"expected {reference.template.name!r}"
+                )
+            if source_result.target.name != reference.target.name:
+                raise ValueError(
+                    f"{source!r} uses target {source_result.target.name!r}, "
+                    f"expected {reference.target.name!r}"
+                )
+
+        reference_rows = _successful_diversity_rows(reference, threshold)
+        coverage: CircuitDiversityCoverageResult | None = None
+        reference_cluster_count = 0
+        if reference_rows:
+            coverage = compare_circuit_diversity_coverage(
+                reference,
+                result_map,
+                cluster_radius=radius,
+                success_threshold=threshold,
+            )
+            coverages[target_name] = coverage
+            coverage_by_source = {
+                item.source: item
+                for item in summarize_circuit_diversity_coverage(coverage)
+            }
+            reference_cluster_count = coverage.reference_cluster_count
+        else:
+            coverage_by_source = _summarize_sources_without_reference_clusters(
+                result_map,
+                threshold=threshold,
+                radius=radius,
+            )
         property_result = compare_circuit_diversity_properties(
             result_map,
-            cluster_radius=coverage.cluster_radius,
-            success_threshold=coverage.success_threshold,
+            cluster_radius=radius,
+            success_threshold=threshold,
             scoring=scoring,
         )
-        coverages[target_name] = coverage
         properties[target_name] = property_result
-        resolved_radius = coverage.cluster_radius
-        resolved_threshold = coverage.success_threshold
+        resolved_radius = radius
+        resolved_threshold = threshold
 
-        coverage_by_source = {
-            item.source: item
-            for item in summarize_circuit_diversity_coverage(coverage)
-        }
         summary_by_source = {
             item.source: item
             for item in summarize_circuit_diversity_properties(property_result, scope="cluster")
@@ -1703,7 +1784,7 @@ def compare_multitarget_circuit_diversity_properties(
             CircuitDiversityMultiTargetPropertyRow(
                 target=target_name,
                 regime=regimes.get(target_name, "unspecified"),
-                reference_clusters=coverage.reference_cluster_count,
+                reference_clusters=reference_cluster_count,
                 token_success_fraction=token_coverage.success_fraction,
                 search_success_fraction=search_coverage.success_fraction,
                 haar_success_fraction=haar_coverage.success_fraction,
