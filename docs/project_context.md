@@ -25,6 +25,27 @@ The current target form is:
 H, t -> Hamiltonian-conditioned SU(2)^n diffusion -> circuit proposal -> local SU(2)^n refinement
 ```
 
+## Proposal Sources And Baselines
+
+There are two diffusion models in the current project, and they play different
+roles:
+
+1. **Single-gate diffusion** is the older local model. It is an unconditional
+   sampler on one copy of `SU(2)`, trained to generate plausible local
+   near-Clifford gates. It does not see the Hamiltonian.
+2. **Circuit-token diffusion** is the main Hamiltonian-conditioned model. It
+   samples all local gates jointly on `SU(2)^n` given `H` and `t`.
+
+This distinction matters for the baseline names:
+
+- `token-diffusion` means the main Hamiltonian-conditioned product-manifold
+  model, i.e. `H, t -> q_1, ..., q_n`.
+- `generated-search` means random slot filling from the single-gate diffusion
+  pool. It uses generated local gates, but it is not Hamiltonian-conditioned and
+  does not sample a whole circuit jointly.
+- `Haar` means independent Haar-random `SU(2)` gates in every local slot. It is
+  the fully uninformed continuous baseline.
+
 ## What Makes This Project Different
 
 The reference circuit-diffusion literature denoises circuit encodings: qubit
