@@ -336,7 +336,7 @@ The coverage result was:
 source             n    success   refined mean/std   pairwise   clusters   search coverage
 token-diffusion    200   96.5%     0.9876/0.0537     0.7307    192        0/161
 generated-search   200   80.5%     0.9409/0.1157     1.1163    161        161/161
-haar               200   82.0%     0.9449/0.1120     1.1178    164        0/161
+haar               200   80.5%     0.9405/0.1155     1.1168    161        0/161
 ```
 
 Interpretation:
@@ -363,7 +363,7 @@ successful set:
 source             success   best overlap mean/std   min      >=0.99   >=0.999
 token-diffusion    193/200   0.9991/0.0004          0.9968   100.0%    68.9%
 generated-search   161/200   1.0000/0.0000          1.0000   100.0%   100.0%
-haar               164/200   0.9987/0.0010          0.9899    99.4%    42.7%
+haar               161/200   0.9986/0.0012          0.9897    99.4%    42.2%
 ```
 
 Important caveat: the slotwise `SU(2)^15` distance is a parametrization-space
