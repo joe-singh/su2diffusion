@@ -447,6 +447,16 @@ process, or from their interaction. A sharp future ablation would train on
 deliberately high-angle solution stacks and check whether the lower-angle bias
 persists.
 
+Level 3H in `SU2GateExperiments.ipynb` is the next robustness check for this
+claim. It reuses the Level 3B token model and repeats the coverage/property
+diagnostic on named three-qubit Hamiltonians rather than only `threeq-heldout-00`.
+The precommitted targets are `three-qubit-transverse-ising`, `three-qubit-heisenberg`,
+and `three-qubit-mixed-pauli`. They are intentionally not sampled from the exact
+random Level 3B training-target distribution. The compact table reports, per
+target, token/search/Haar success rates, cluster counts, token coverage of
+generated-search clusters, total local angle for each source, and the
+precommitted token-vs-search angle effect size with Bonferroni-corrected p-value.
+
 Metric convention note: the package's `unitary_fidelity` currently reports the
 normalized unitary overlap `|Tr(V^dagger U)| / d`, not the squared process
 fidelity. Rankings are unchanged by squaring, but the paper should state this
