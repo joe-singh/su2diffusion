@@ -384,6 +384,69 @@ multimodal, high-success family of decompositions rather than merely
 reproducing generated-search solutions.
 ```
 
+### Diversity Property Comparison
+
+After the coverage and unitary cross-fidelity diagnostics, we asked what makes
+the token-diffusion decomposition family different from generated-search and
+Haar successful circuits.
+
+The comparison uses the same fixed `line-4cz` template and the same target
+`threeq-heldout-00`. Because the template is fixed, CZ count and local-gate
+count are constants. The reported within-template hardware proxy therefore
+only includes movement and total local principal angle:
+
+```text
+cost_within = 0.04 * mean_refinement_movement + 0.001 * total_local_angle
+```
+
+Cluster-level results, using the highest-fidelity member of each radius-0.15
+cluster as its representative:
+
+```text
+source             n   proposal      refined       cost mean/std   angle mean/std   move mean/std   max move   steps med/IQR
+token-diffusion    192 0.1218/0.0840 0.9978/0.0005  0.0383/0.0042   25.171/2.897   0.3287/0.0576  0.7303    35.0/6.2
+generated-search   161 0.2933/0.0391 0.9979/0.0006  0.0454/0.0040   33.240/3.233   0.3028/0.0553  0.7746    33.0/4.0
+haar               161 0.1065/0.0618 0.9973/0.0011  0.0491/0.0036   33.530/2.810   0.3891/0.0547  0.8511    39.0/7.0
+```
+
+Important interpretation:
+
+- `angle mean/std` is the sum of the principal local rotation angles across all
+  15 `SU(2)` gates, in radians.
+- Token diffusion has about `8.069` radians less total local rotation than
+  generated-search, or roughly `0.538` radians less per local gate on average.
+- The cost advantage is almost entirely from the angle term:
+  - token: `0.04 * 0.3287 + 0.001 * 25.171 = 0.0383`
+  - generated-search: `0.04 * 0.3028 + 0.001 * 33.240 = 0.0454`
+  - Haar: `0.04 * 0.3891 + 0.001 * 33.530 = 0.0491`
+- Token diffusion does not have smaller mean refinement movement than
+  generated-search; it is slightly larger on that term. The meaningful
+  difference is that token diffusion finds lower-angle decompositions at
+  matched refined fidelity.
+
+The main statistical result for total local angle:
+
+```text
+Kruskal-Wallis H = 322.26, p = 1.1e-70
+Cliff's delta token vs generated-search = -0.932, Bonferroni p = 4.5e-51
+Cliff's delta token vs Haar             = -0.959, Bonferroni p = 5.1e-54
+```
+
+Paper framing:
+
+```text
+Token diffusion finds a parametrization-distinct, unitary-equivalent
+decomposition family whose local gates are systematically closer to identity.
+This is a hardware-relevant bias, but it is still a proxy result rather than a
+measured hardware-noise result.
+```
+
+Be careful not to overclaim the mechanism. The lower-angle bias could come from
+the solution-stack construction, from the heat-kernel geometry of the noising
+process, or from their interaction. A sharp future ablation would train on
+deliberately high-angle solution stacks and check whether the lower-angle bias
+persists.
+
 Metric convention note: the package's `unitary_fidelity` currently reports the
 normalized unitary overlap `|Tr(V^dagger U)| / d`, not the squared process
 fidelity. Rankings are unchanged by squaring, but the paper should state this
