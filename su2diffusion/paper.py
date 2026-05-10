@@ -20,6 +20,23 @@ from .hamiltonian import (
     run_three_qubit_hamiltonian_token_repeatability_benchmark,
     summarize_three_qubit_token_repeatability,
 )
+from .pareto import (
+    CircuitDiversityCoverageResult,
+    CircuitDiversityMultiTargetPropertyResult,
+    CircuitDiversityPropertyResult,
+    CircuitDiversityResult,
+    CircuitUnitaryCrossFidelityResult,
+    compare_circuit_diversity_properties,
+    plot_circuit_diversity_coverage,
+    plot_circuit_diversity_properties,
+    plot_circuit_unitary_cross_fidelity,
+    plot_multitarget_circuit_diversity_properties,
+    summarize_circuit_diversity,
+    summarize_circuit_diversity_coverage,
+    summarize_circuit_diversity_properties,
+    summarize_circuit_unitary_cross_fidelity,
+    test_circuit_diversity_properties,
+)
 
 
 @dataclass(frozen=True)
@@ -289,3 +306,445 @@ def save_paper_benchmark_artifacts(
         "summary": summary_path,
         "figure": figure_path,
     }
+
+
+def paper_plot_rc() -> dict[str, Any]:
+    """Return a compact Matplotlib style for paper draft figures."""
+
+    return {
+        "figure.dpi": 140,
+        "savefig.dpi": 300,
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "legend.fontsize": 9,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "grid.linewidth": 0.6,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    }
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> Path:
+    path.write_text(json.dumps(_json_ready(payload), indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()) if rows else [])
+        if rows:
+            writer.writeheader()
+            writer.writerows(rows)
+    return path
+
+
+def _latex_escape(value: Any) -> str:
+    text = str(value)
+    replacements = {
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def _format_table_value(value: Any) -> str:
+    if isinstance(value, float):
+        if value != value:
+            return "nan"
+        if abs(value) >= 1000 or (0 < abs(value) < 1e-3):
+            return f"{value:.2e}"
+        return f"{value:.4f}"
+    return str(value)
+
+
+def _write_latex_table(
+    path: Path,
+    rows: list[dict[str, Any]],
+    caption: str | None = None,
+    label: str | None = None,
+) -> Path:
+    columns = list(rows[0].keys()) if rows else []
+    lines = []
+    if caption is not None or label is not None:
+        lines.append(r"\begin{table}")
+        lines.append(r"\centering")
+    colspec = "l" * max(1, len(columns))
+    lines.append(rf"\begin{{tabular}}{{{colspec}}}")
+    if columns:
+        lines.append(" & ".join(_latex_escape(column) for column in columns) + r" \\")
+        lines.append(r"\hline")
+        for row in rows:
+            lines.append(
+                " & ".join(_latex_escape(_format_table_value(row[column])) for column in columns)
+                + r" \\"
+            )
+    lines.append(r"\end{tabular}")
+    if caption is not None:
+        lines.append(rf"\caption{{{_latex_escape(caption)}}}")
+    if label is not None:
+        lines.append(rf"\label{{{_latex_escape(label)}}}")
+    if caption is not None or label is not None:
+        lines.append(r"\end{table}")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _save_current_figure(output_dir: Path, stem: str) -> dict[str, Path]:
+    import matplotlib.pyplot as plt
+
+    png_path = output_dir / f"{stem}.png"
+    pdf_path = output_dir / f"{stem}.pdf"
+    fig = plt.gcf()
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    fig.savefig(pdf_path, bbox_inches="tight")
+    plt.close(fig)
+    return {f"{stem}_png": png_path, f"{stem}_pdf": pdf_path}
+
+
+def _plot_and_save(output_dir: Path, stem: str, plotter: Any) -> dict[str, Path]:
+    import matplotlib.pyplot as plt
+
+    with plt.rc_context(paper_plot_rc()):
+        plotter()
+        return _save_current_figure(output_dir, stem)
+
+
+def _asdict_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    return [asdict(row) for row in rows]
+
+
+def _artifact_metadata(
+    kind: str,
+    metadata: dict[str, Any] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    payload = {"artifact_kind": kind, **extra}
+    if metadata:
+        payload["metadata"] = dict(metadata)
+    return payload
+
+
+def save_level3f_diversity_artifacts(
+    coverage: CircuitDiversityCoverageResult,
+    unitary_cross_fidelity: CircuitUnitaryCrossFidelityResult,
+    output_dir: str | Path,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Path]:
+    """Export Level 3F diversity and unitary cross-fidelity results."""
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    coverage_rows = _asdict_rows(summarize_circuit_diversity_coverage(coverage))
+    cross_rows = _asdict_rows(summarize_circuit_unitary_cross_fidelity(unitary_cross_fidelity))
+    paths = {
+        "metadata": _write_json(
+            output / "metadata.json",
+            _artifact_metadata(
+                "level3f_diversity",
+                metadata,
+                target=coverage.reference.target.name,
+                template=coverage.reference.template.name,
+                reference_source=coverage.reference.source,
+                cluster_radius=coverage.cluster_radius,
+                success_threshold=coverage.success_threshold,
+                reference_cluster_count=coverage.reference_cluster_count,
+            ),
+        ),
+        "coverage_csv": _write_csv(output / "coverage_summary.csv", coverage_rows),
+        "coverage_tex": _write_latex_table(
+            output / "coverage_summary.tex",
+            coverage_rows,
+            caption="Level 3F circuit-diversity coverage summary.",
+            label="tab:level3f-coverage",
+        ),
+        "unitary_cross_fidelity_csv": _write_csv(
+            output / "unitary_cross_fidelity_summary.csv",
+            cross_rows,
+        ),
+        "unitary_cross_fidelity_tex": _write_latex_table(
+            output / "unitary_cross_fidelity_summary.tex",
+            cross_rows,
+            caption="Level 3F unitary cross-fidelity summary.",
+            label="tab:level3f-cross-fidelity",
+        ),
+    }
+    paths.update(
+        _plot_and_save(
+            output,
+            "coverage",
+            lambda: plot_circuit_diversity_coverage(coverage),
+        )
+    )
+    paths.update(
+        _plot_and_save(
+            output,
+            "unitary_cross_fidelity",
+            lambda: plot_circuit_unitary_cross_fidelity(unitary_cross_fidelity),
+        )
+    )
+    return paths
+
+
+def save_level3g_property_artifacts(
+    properties: CircuitDiversityPropertyResult,
+    output_dir: str | Path,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Path]:
+    """Export Level 3G cluster/property comparison tables and figures."""
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    cluster_summary = _asdict_rows(summarize_circuit_diversity_properties(properties, scope="cluster"))
+    circuit_summary = _asdict_rows(summarize_circuit_diversity_properties(properties, scope="circuit"))
+    cluster_tests = _asdict_rows(test_circuit_diversity_properties(properties, scope="cluster"))
+    paths = {
+        "metadata": _write_json(
+            output / "metadata.json",
+            _artifact_metadata(
+                "level3g_properties",
+                metadata,
+                cluster_radius=properties.cluster_radius,
+                success_threshold=properties.success_threshold,
+                sources=list(properties.results),
+            ),
+        ),
+        "cluster_summary_csv": _write_csv(output / "cluster_summary.csv", cluster_summary),
+        "cluster_summary_tex": _write_latex_table(
+            output / "cluster_summary.tex",
+            cluster_summary,
+            caption="Level 3G cluster-level circuit-property summary.",
+            label="tab:level3g-cluster-summary",
+        ),
+        "cluster_tests_csv": _write_csv(output / "cluster_tests.csv", cluster_tests),
+        "cluster_tests_tex": _write_latex_table(
+            output / "cluster_tests.tex",
+            cluster_tests,
+            caption="Level 3G non-parametric property tests.",
+            label="tab:level3g-property-tests",
+        ),
+        "circuit_summary_csv": _write_csv(output / "circuit_summary.csv", circuit_summary),
+        "circuit_summary_tex": _write_latex_table(
+            output / "circuit_summary.tex",
+            circuit_summary,
+            caption="Level 3G per-circuit property robustness summary.",
+            label="tab:level3g-circuit-summary",
+        ),
+    }
+    paths.update(
+        _plot_and_save(
+            output,
+            "cluster_properties",
+            lambda: plot_circuit_diversity_properties(properties, scope="cluster"),
+        )
+    )
+    paths.update(
+        _plot_and_save(
+            output,
+            "circuit_properties",
+            lambda: plot_circuit_diversity_properties(properties, scope="circuit"),
+        )
+    )
+    return paths
+
+
+def save_level3h_multitarget_artifacts(
+    result: CircuitDiversityMultiTargetPropertyResult,
+    output_dir: str | Path,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Path]:
+    """Export Level 3H multi-target diversity/property robustness results."""
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    rows = _asdict_rows(result.rows)
+    paths = {
+        "metadata": _write_json(
+            output / "metadata.json",
+            _artifact_metadata(
+                "level3h_multitarget",
+                metadata,
+                cluster_radius=result.cluster_radius,
+                success_threshold=result.success_threshold,
+                primary_source=result.primary_source,
+                reference_source=result.reference_source,
+                targets=list(result.diagnostics),
+                regimes=result.regimes,
+            ),
+        ),
+        "summary_csv": _write_csv(output / "summary.csv", rows),
+        "summary_tex": _write_latex_table(
+            output / "summary.tex",
+            rows,
+            caption="Level 3H multi-target circuit-diversity and property summary.",
+            label="tab:level3h-summary",
+        ),
+    }
+    paths.update(
+        _plot_and_save(
+            output,
+            "multitarget_properties",
+            lambda: plot_multitarget_circuit_diversity_properties(result),
+        )
+    )
+    return paths
+
+
+def summarize_angle_steering_artifacts(
+    diagnostics: dict[str, dict[str, CircuitDiversityResult]],
+    train_angle_by_source: dict[str, float],
+    cluster_radius: float = 0.15,
+    success_threshold: float = 0.99,
+    source_order: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Summarize Level 3I low-/high-angle training-policy diagnostics."""
+
+    rows: list[dict[str, Any]] = []
+    for target_name, result_map in diagnostics.items():
+        if source_order is None:
+            sources = tuple(result_map)
+        else:
+            sources = source_order
+        properties = compare_circuit_diversity_properties(
+            result_map,
+            cluster_radius=cluster_radius,
+            success_threshold=success_threshold,
+        )
+        property_by_source = {
+            row.source: row
+            for row in summarize_circuit_diversity_properties(properties, scope="cluster")
+        }
+        for source in sources:
+            diversity_summary = summarize_circuit_diversity(result_map[source])
+            property_summary = property_by_source[source]
+            rows.append(
+                {
+                    "target": target_name,
+                    "source": source,
+                    "train_angle_mean": train_angle_by_source.get(source, float("nan")),
+                    "success_fraction": diversity_summary.success_fraction,
+                    "cluster_count": property_summary.n,
+                    "output_angle_mean": property_summary.angle_mean,
+                    "output_angle_std": property_summary.angle_std,
+                    "refined_mean": property_summary.refined_mean,
+                    "refined_std": property_summary.refined_std,
+                }
+            )
+    return rows
+
+
+def _plot_angle_steering_rows(rows: list[dict[str, Any]]) -> None:
+    import matplotlib.pyplot as plt
+
+    targets = list(dict.fromkeys(row["target"] for row in rows))
+    sources = list(dict.fromkeys(row["source"] for row in rows))
+    xs = torch.arange(len(targets), dtype=torch.float32).numpy()
+    width = 0.8 / max(1, len(sources))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    for index, source in enumerate(sources):
+        group = {row["target"]: row for row in rows if row["source"] == source}
+        offset = (index - 0.5 * (len(sources) - 1)) * width
+        axes[0].bar(
+            xs + offset,
+            [group[target]["output_angle_mean"] for target in targets],
+            width,
+            label=source,
+        )
+        axes[1].bar(
+            xs + offset,
+            [group[target]["success_fraction"] for target in targets],
+            width,
+            label=source,
+        )
+    axes[0].set_title("output total local angle")
+    axes[0].set_ylabel("radians")
+    axes[1].set_title("refined success")
+    axes[1].set_ylabel("fraction with F >= threshold")
+    axes[1].set_ylim(0.0, 1.05)
+    for axis in axes:
+        axis.set_xticks(xs)
+        axis.set_xticklabels(targets, rotation=20, ha="right")
+        axis.legend()
+    fig.suptitle("Angle-steering ablation")
+    fig.tight_layout()
+
+
+def save_level3i_angle_steering_artifacts(
+    diagnostics: dict[str, dict[str, CircuitDiversityResult]],
+    train_angle_by_source: dict[str, float],
+    output_dir: str | Path,
+    cluster_radius: float = 0.15,
+    success_threshold: float = 0.99,
+    source_order: tuple[str, ...] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Path]:
+    """Export Level 3I angle-steering ablation summaries and figures."""
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    rows = summarize_angle_steering_artifacts(
+        diagnostics,
+        train_angle_by_source,
+        cluster_radius=cluster_radius,
+        success_threshold=success_threshold,
+        source_order=source_order,
+    )
+    paths = {
+        "metadata": _write_json(
+            output / "metadata.json",
+            _artifact_metadata(
+                "level3i_angle_steering",
+                metadata,
+                cluster_radius=cluster_radius,
+                success_threshold=success_threshold,
+                train_angle_by_source=train_angle_by_source,
+                targets=list(diagnostics),
+            ),
+        ),
+        "summary_csv": _write_csv(output / "summary.csv", rows),
+        "summary_tex": _write_latex_table(
+            output / "summary.tex",
+            rows,
+            caption="Level 3I low-/high-angle training-policy ablation.",
+            label="tab:level3i-angle-steering",
+        ),
+    }
+    paths.update(
+        _plot_and_save(
+            output,
+            "angle_steering",
+            lambda: _plot_angle_steering_rows(rows),
+        )
+    )
+    return paths
