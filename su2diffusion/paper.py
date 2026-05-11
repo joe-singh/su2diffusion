@@ -437,8 +437,17 @@ def _plot_and_save(output_dir: Path, stem: str, plotter: Any) -> dict[str, Path]
     import matplotlib.pyplot as plt
 
     with plt.rc_context(paper_plot_rc()):
-        plotter()
-        return _save_current_figure(output_dir, stem)
+        original_show = plt.show
+        try:
+            # Notebook plotting helpers call ``plt.show()`` for interactive use.
+            # Some inline backends clear or replace the current figure after
+            # ``show()``, so suppress it while exporting and save the figure
+            # object while it is still live.
+            plt.show = lambda *args, **kwargs: None
+            plotter()
+            return _save_current_figure(output_dir, stem)
+        finally:
+            plt.show = original_show
 
 
 def _asdict_rows(rows: list[Any]) -> list[dict[str, Any]]:
