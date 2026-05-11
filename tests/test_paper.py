@@ -6,6 +6,9 @@ import torch
 from su2diffusion import (
     CircuitDiversityCandidateRow,
     CircuitDiversityResult,
+    ParetoCandidateRow,
+    ParetoCircuitResult,
+    ParetoScoringConfig,
     PaperBenchmarkSuiteResult,
     ThreeQubitTokenRepeatabilityResult,
     ThreeQubitTokenRepeatabilityRunRow,
@@ -22,6 +25,7 @@ from su2diffusion import (
     save_level3g_property_artifacts,
     save_level3h_multitarget_artifacts,
     save_level3i_angle_steering_artifacts,
+    save_level3j_pareto_artifacts,
     save_paper_benchmark_artifacts,
     summarize_angle_steering_artifacts,
 )
@@ -228,3 +232,63 @@ def test_save_angle_steering_artifacts(tmp_path: Path) -> None:
 
     assert set(paths) == {"metadata", "summary_csv", "summary_tex", "angle_steering_png", "angle_steering_pdf"}
     assert "high-angle-data" in paths["summary_csv"].read_text()
+
+
+def test_save_pareto_artifacts(tmp_path: Path) -> None:
+    target = make_hamiltonian_target(
+        [("XII", 0.05)],
+        time=0.1,
+        name="fake-pareto",
+        n_qubits=3,
+        device="cpu",
+    )
+    template = get_three_qubit_cz_template("line-4cz")
+    gates = torch.zeros(template.n_slots, 4)
+    gates[:, 0] = 1.0
+    rows = [
+        ParetoCandidateRow(
+            target=target.name,
+            template=template.name,
+            source="generated-search",
+            candidate_rank=1,
+            n_cz=len(template.edges),
+            n_local_gates=template.n_slots,
+            proposal_fidelity=0.4,
+            refined_fidelity=0.99,
+            steps_to_threshold=4,
+            movement_mean=0.1,
+            movement_max=0.2,
+            local_angle_sum=25.0,
+            hardware_cost=0.1,
+            regularized_score=0.89,
+            is_pareto=True,
+            slot_indices=tuple(range(template.n_slots)),
+            slot_labels=tuple("I" for _ in range(template.n_slots)),
+            refined_gates=gates,
+        )
+    ]
+    result = ParetoCircuitResult(
+        target=target,
+        templates=(template,),
+        source="generated-search",
+        scoring=ParetoScoringConfig(),
+        rows=rows,
+        reports={},
+        threshold=0.99,
+    )
+
+    paths = save_level3j_pareto_artifacts(result, tmp_path)
+
+    assert set(paths) == {
+        "metadata",
+        "candidates_csv",
+        "candidates_tex",
+        "template_summary_csv",
+        "template_summary_tex",
+        "frontier_csv",
+        "frontier_tex",
+        "pareto_candidate_cloud_png",
+        "pareto_candidate_cloud_pdf",
+    }
+    assert "line-4cz" in paths["template_summary_csv"].read_text()
+    assert "generated-search" not in paths["candidates_csv"].read_text()

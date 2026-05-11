@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -26,16 +26,20 @@ from .pareto import (
     CircuitDiversityPropertyResult,
     CircuitDiversityResult,
     CircuitUnitaryCrossFidelityResult,
+    ParetoCircuitResult,
     compare_circuit_diversity_properties,
+    pareto_frontier_rows,
     plot_circuit_diversity_coverage,
     plot_circuit_diversity_properties,
     plot_circuit_unitary_cross_fidelity,
     plot_multitarget_circuit_diversity_properties,
+    plot_pareto_circuit_sampling,
     summarize_circuit_diversity,
     summarize_circuit_diversity_coverage,
     summarize_circuit_diversity_properties,
     summarize_circuit_unitary_cross_fidelity,
     test_circuit_diversity_properties,
+    top_pareto_rows,
 )
 
 
@@ -745,6 +749,124 @@ def save_level3i_angle_steering_artifacts(
             output,
             "angle_steering",
             lambda: _plot_angle_steering_rows(rows),
+        )
+    )
+    return paths
+
+
+def _pareto_candidate_export_rows(
+    result: ParetoCircuitResult,
+    max_rows: int | None = None,
+) -> list[dict[str, Any]]:
+    rows = []
+    for row in top_pareto_rows(result, max_rows=max_rows):
+        rows.append(
+            {
+                "is_pareto": row.is_pareto,
+                "template": row.template,
+                "candidate_rank": row.candidate_rank,
+                "n_cz": row.n_cz,
+                "n_local_gates": row.n_local_gates,
+                "proposal_fidelity": row.proposal_fidelity,
+                "refined_fidelity": row.refined_fidelity,
+                "steps_to_threshold": row.steps_to_threshold,
+                "movement_mean": row.movement_mean,
+                "movement_max": row.movement_max,
+                "local_angle_sum": row.local_angle_sum,
+                "hardware_cost": row.hardware_cost,
+                "regularized_score": row.regularized_score,
+                "slot_labels": ", ".join(label or "" for label in row.slot_labels),
+            }
+        )
+    return rows
+
+
+def _pareto_template_summary_rows(result: ParetoCircuitResult) -> list[dict[str, Any]]:
+    rows = []
+    for template in [item.name for item in result.templates]:
+        group = [row for row in result.rows if row.template == template]
+        if not group:
+            continue
+        refined = torch.tensor([row.refined_fidelity for row in group], dtype=torch.float32)
+        proposal = torch.tensor([row.proposal_fidelity for row in group], dtype=torch.float32)
+        cost = torch.tensor([row.hardware_cost for row in group], dtype=torch.float32)
+        score = torch.tensor([row.regularized_score for row in group], dtype=torch.float32)
+        frontier = [row for row in group if row.is_pareto]
+        rows.append(
+            {
+                "template": template,
+                "n": len(group),
+                "n_cz": group[0].n_cz,
+                "n_local_gates": group[0].n_local_gates,
+                "proposal_mean": float(proposal.mean().item()),
+                "refined_best": float(refined.max().item()),
+                "refined_mean": float(refined.mean().item()),
+                "hardware_cost_min": float(cost.min().item()),
+                "hardware_cost_mean": float(cost.mean().item()),
+                "regularized_score_best": float(score.max().item()),
+                "frontier_count": len(frontier),
+            }
+        )
+    return rows
+
+
+def save_level3j_pareto_artifacts(
+    result: ParetoCircuitResult,
+    output_dir: str | Path,
+    metadata: dict[str, Any] | None = None,
+    max_candidate_rows: int | None = None,
+) -> dict[str, Path]:
+    """Export Level 3J Pareto candidate-cloud tables and figures."""
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    candidate_rows = _pareto_candidate_export_rows(result, max_rows=max_candidate_rows)
+    summary_rows = _pareto_template_summary_rows(result)
+    frontier_rows = _pareto_candidate_export_rows(
+        replace(result, rows=pareto_frontier_rows(result)),
+        max_rows=None,
+    )
+
+    paths = {
+        "metadata": _write_json(
+            output / "metadata.json",
+            _artifact_metadata(
+                "level3j_pareto",
+                metadata,
+                target=result.target.name,
+                source=result.source,
+                threshold=result.threshold,
+                templates=[template.name for template in result.templates],
+                scoring=asdict(result.scoring),
+            ),
+        ),
+        "candidates_csv": _write_csv(output / "candidates.csv", candidate_rows),
+        "candidates_tex": _write_latex_table(
+            output / "candidates.tex",
+            candidate_rows,
+            caption="Level 3J top Pareto candidate rows.",
+            label="tab:level3j-pareto-candidates",
+        ),
+        "template_summary_csv": _write_csv(output / "template_summary.csv", summary_rows),
+        "template_summary_tex": _write_latex_table(
+            output / "template_summary.tex",
+            summary_rows,
+            caption="Level 3J Pareto template summary.",
+            label="tab:level3j-pareto-summary",
+        ),
+        "frontier_csv": _write_csv(output / "frontier.csv", frontier_rows),
+        "frontier_tex": _write_latex_table(
+            output / "frontier.tex",
+            frontier_rows,
+            caption="Level 3J Pareto frontier rows.",
+            label="tab:level3j-pareto-frontier",
+        ),
+    }
+    paths.update(
+        _plot_and_save(
+            output,
+            "pareto_candidate_cloud",
+            lambda: plot_pareto_circuit_sampling(result),
         )
     )
     return paths

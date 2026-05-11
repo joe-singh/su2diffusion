@@ -337,6 +337,7 @@ from .paper import (
     save_level3g_property_artifacts,
     save_level3h_multitarget_artifacts,
     save_level3i_angle_steering_artifacts,
+    save_level3j_pareto_artifacts,
     save_paper_benchmark_artifacts,
     summarize_angle_steering_artifacts,
 )
@@ -831,6 +832,7 @@ __all__ = [
     "save_level3g_property_artifacts",
     "save_level3h_multitarget_artifacts",
     "save_level3i_angle_steering_artifacts",
+    "save_level3j_pareto_artifacts",
     "save_paper_benchmark_artifacts",
     "summarize_angle_steering_artifacts",
     "format_hamiltonian_demo_circuit",
