@@ -2120,13 +2120,20 @@ def plot_circuit_diversity_coverage(coverage: CircuitDiversityCoverageResult) ->
     axes[1].set_title("Mode coverage")
     axes[1].legend()
 
-    axes[2].scatter(labels, pairwise, label="pairwise", s=45)
-    axes[2].scatter(labels, within, label="within cluster", s=45)
-    axes[2].scatter(labels, across, label="across cluster", s=45)
+    def _scatter_finite(values: list[float], label: str) -> None:
+        finite_x = [index for index, value in enumerate(values) if math.isfinite(value)]
+        finite_y = [value for value in values if math.isfinite(value)]
+        if finite_x:
+            axes[2].scatter(finite_x, finite_y, label=label, s=45)
+
+    _scatter_finite(pairwise, "pairwise")
+    _scatter_finite(within, "within cluster")
+    _scatter_finite(across, "across cluster")
     axes[2].axhline(coverage.cluster_radius, linestyle="--", color="black", linewidth=1)
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(labels, rotation=20, ha="right")
     axes[2].set_ylabel("sign-invariant SU(2)^n distance")
     axes[2].set_title("Successful-sample diversity")
-    axes[2].tick_params(axis="x", rotation=20)
     axes[2].legend()
 
     fig.suptitle(f"Circuit diversity coverage: {coverage.reference.target.name}")

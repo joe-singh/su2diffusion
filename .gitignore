@@ -3,5 +3,7 @@ __pycache__/
 .DS_Store
 .pytest_cache/
 .venv/
+paper_artifacts/
+su2_gate_experiments/
 .ipynb_checkpoints/
 *.egg-info/
