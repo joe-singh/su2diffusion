@@ -12,6 +12,7 @@ from su2diffusion import (
     PaperBenchmarkSuiteResult,
     ThreeQubitTokenRepeatabilityResult,
     ThreeQubitTokenRepeatabilityRunRow,
+    build_tfim_circuit_demo,
     compare_circuit_diversity_coverage,
     compare_circuit_diversity_properties,
     compare_circuit_unitary_cross_fidelity,
@@ -27,7 +28,10 @@ from su2diffusion import (
     save_level3i_angle_steering_artifacts,
     save_level3j_pareto_artifacts,
     save_paper_benchmark_artifacts,
+    save_tfim_circuit_demo_artifacts,
     summarize_angle_steering_artifacts,
+    tfim_circuit_demo_gate_rows,
+    tfim_circuit_demo_summary_rows,
 )
 
 
@@ -232,6 +236,50 @@ def test_save_angle_steering_artifacts(tmp_path: Path) -> None:
 
     assert set(paths) == {"metadata", "summary_csv", "summary_tex", "angle_steering_png", "angle_steering_pdf"}
     assert "high-angle-data" in paths["summary_csv"].read_text()
+
+
+def test_tfim_circuit_demo_selects_and_exports(tmp_path: Path) -> None:
+    low = _fake_diversity_result("low-angle-data", offset=0.01)
+    high = _fake_diversity_result("high-angle-data", offset=0.08)
+    search = _fake_diversity_result("generated-search", offset=0.04)
+    result = build_tfim_circuit_demo(
+        low.target,
+        {
+            "low-angle-data": low,
+            "high-angle-data": high,
+            "generated-search": search,
+        },
+        trotter_steps=(1, 2),
+    )
+
+    assert [row.label for row in result.learned] == [
+        "low-angle diffusion",
+        "high-angle diffusion",
+        "generated search",
+    ]
+    assert [row.n_steps for row in result.trotter] == [1, 2]
+    assert result.learned[1].total_local_angle > result.learned[0].total_local_angle
+
+    summary = tfim_circuit_demo_summary_rows(result)
+    gates = tfim_circuit_demo_gate_rows(result)
+    assert len(summary) == 5
+    assert len(gates) == 3 * result.learned[0].n_local_gates
+    assert "R(" in gates[-1]["gate_text"] or gates[-1]["gate_text"] == "I"
+
+    paths = save_tfim_circuit_demo_artifacts(result, tmp_path)
+    assert set(paths) == {
+        "metadata",
+        "summary_csv",
+        "summary_tex",
+        "template_txt",
+        "gates_csv",
+        "gates_tex",
+        "tfim_circuit_demo_png",
+        "tfim_circuit_demo_pdf",
+    }
+    assert "low-angle diffusion" in paths["summary_csv"].read_text()
+    assert "line-4cz" in paths["template_txt"].read_text()
+    assert "G00" in paths["gates_csv"].read_text()
 
 
 def test_save_pareto_artifacts(tmp_path: Path) -> None:
