@@ -1739,6 +1739,30 @@ def generate_skeleton_conditioned_hamiltonian_solution_dataset(
     )
 
 
+def skeleton_conditioned_dataset_for_template(
+    dataset: SkeletonConditionedHamiltonianSolutionDataset,
+    template: str | ThreeQubitCZTemplate,
+) -> HamiltonianSolutionDataset:
+    template = _coerce_three_qubit_template(template)
+    try:
+        template_id = dataset.template_names.index(template.name)
+    except ValueError as exc:
+        known = ", ".join(dataset.template_names)
+        raise ValueError(f"Template {template.name!r} was not in dataset templates: {known}") from exc
+    rows = torch.nonzero(dataset.template_ids == template_id, as_tuple=False).flatten()
+    if rows.numel() == 0:
+        raise ValueError(f"Dataset has no rows for template {template.name!r}")
+    row_ids = rows.detach().cpu().tolist()
+    return HamiltonianSolutionDataset(
+        targets=[dataset.targets[index] for index in row_ids],
+        benchmarks=[dataset.benchmarks[index] for index in row_ids],
+        refinements=[dataset.refinements[index] for index in row_ids],
+        stacks=dataset.stacks[rows, : template.n_slots, :].clone(),
+        initial_fidelities=dataset.initial_fidelities[rows].clone(),
+        refined_fidelities=dataset.refined_fidelities[rows].clone(),
+    )
+
+
 def _local_rotation_energy(q_stack: torch.Tensor) -> float:
     q_stack = q_normalize(q_stack)
     q_stack = torch.where(q_stack[..., :1] < 0.0, -q_stack, q_stack)
