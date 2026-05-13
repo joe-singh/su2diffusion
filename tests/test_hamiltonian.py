@@ -9,6 +9,7 @@ from su2diffusion.hamiltonian import (
     HamiltonianDenoiseDiagnosticResult,
     HamiltonianDenoiseNormalizationResult,
     HamiltonianSkeletonDenoiseComparisonResult,
+    HamiltonianSkeletonSelectorTrainConfig,
     HamiltonianSlotwiseDenoiseComparisonResult,
     HamiltonianTokenDenoiseComparisonResult,
     HamiltonianTokenDataScaleResult,
@@ -27,6 +28,7 @@ from su2diffusion.hamiltonian import (
     HamiltonianStackPredictor,
     HamiltonianPriorTrainConfig,
     HamiltonianSupervisedTrainConfig,
+    SkeletonConditionedHamiltonianSolutionDataset,
     compose_three_qubit_template_units,
     cz_on_qubits,
     estimate_hamiltonian_denoise_target_scale,
@@ -43,6 +45,7 @@ from su2diffusion.hamiltonian import (
     hamiltonian_from_terms,
     hamiltonian_target_features,
     make_hamiltonian_target,
+    make_hamiltonian_skeleton_selector_labels,
     make_random_pauli_hamiltonian_targets,
     parse_pauli_string,
     pauli_string_matrix,
@@ -125,6 +128,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_template_comparison,
     run_hamiltonian_two_entangler_benchmark,
     run_three_qubit_template_benchmark,
+    rank_hamiltonian_skeletons,
     sample_hamiltonian_conditioned_circuit_reverse,
     sample_skeleton_conditioned_hamiltonian_reverse,
     skeleton_conditioned_dataset_for_template,
@@ -152,6 +156,7 @@ from su2diffusion.hamiltonian import (
     summarize_hamiltonian_conditioned_overfit_diagnostic,
     summarize_hamiltonian_suite,
     train_hamiltonian_conditioned_circuit_diffusion,
+    train_hamiltonian_skeleton_selector,
     train_hamiltonian_skeleton_conditioned_circuit_diffusion,
     train_hamiltonian_slotwise_circuit_diffusion,
     train_hamiltonian_token_circuit_diffusion,
@@ -192,6 +197,72 @@ def test_select_refined_solutions_supports_max_local_rotation() -> None:
     )
 
     assert selected[0].slot_labels == ("high",)
+
+
+def test_hamiltonian_skeleton_selector_labels_and_training_smoke() -> None:
+    first = make_hamiltonian_target(
+        [("XII", 0.10)],
+        time=0.2,
+        name="selector-0",
+        n_qubits=3,
+    )
+    second = make_hamiltonian_target(
+        [("IZZ", -0.12)],
+        time=0.3,
+        name="selector-1",
+        n_qubits=3,
+    )
+    template_names = ("line-2cz-a", "line-4cz")
+    max_slots = 15
+
+    def padded_identity(n_slots: int) -> torch.Tensor:
+        stack = torch.zeros(max_slots, 4)
+        stack[:, 0] = 1.0
+        stack[n_slots:, 0] = 1.0
+        return stack
+
+    def active_mask(n_slots: int) -> torch.Tensor:
+        mask = torch.zeros(max_slots, dtype=torch.bool)
+        mask[:n_slots] = True
+        return mask
+
+    dataset = SkeletonConditionedHamiltonianSolutionDataset(
+        targets=[first, first, second, second],
+        benchmarks=[],
+        refinements=[],
+        stacks=torch.stack(
+            [
+                padded_identity(9),
+                padded_identity(15),
+                padded_identity(9),
+                padded_identity(15),
+            ]
+        ),
+        template_ids=torch.tensor([0, 1, 0, 1], dtype=torch.long),
+        active_masks=torch.stack([active_mask(9), active_mask(15), active_mask(9), active_mask(15)]),
+        template_names=template_names,
+        initial_fidelities=torch.zeros(4),
+        refined_fidelities=torch.tensor([0.995, 0.999, 0.55, 0.88]),
+    )
+
+    labels = make_hamiltonian_skeleton_selector_labels(dataset, success_threshold=0.99)
+    assert [row.target for row in labels] == ["selector-0", "selector-1"]
+    assert [row.template for row in labels] == ["line-2cz-a", "line-4cz"]
+
+    result = train_hamiltonian_skeleton_selector(
+        dataset,
+        train_config=HamiltonianSkeletonSelectorTrainConfig(hidden=16, num_steps=3, seed=7),
+        success_threshold=0.99,
+        device="cpu",
+    )
+    ranked = rank_hamiltonian_skeletons(result.model, [first, second], top_k=2, device="cpu")
+
+    assert result.template_names == template_names
+    assert len(result.losses) == 3
+    assert 0.0 <= result.train_accuracy <= 1.0
+    assert set(ranked) == {"selector-0", "selector-1"}
+    assert all(len(rows) == 2 for rows in ranked.values())
+    assert ranked["selector-0"][0].template in template_names
 
 
 def test_parse_pauli_string_accepts_compact_and_subscript_notation():

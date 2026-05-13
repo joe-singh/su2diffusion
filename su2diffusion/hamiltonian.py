@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from .circuit import CircuitExperimentConfig, CircuitTrainConfig, circuit_forward_heat_target
 from .diffusion import DiffusionSchedule
 from .model import (
+    HamiltonianSkeletonSelector,
     SkeletonConditionedCircuitTokenDenoiser,
     SlotwiseTargetConditionedCircuitDenoiser,
     TargetConditionedCircuitDenoiser,
@@ -85,6 +86,46 @@ class SkeletonConditionedHamiltonianSolutionDataset:
     template_names: tuple[str, ...]
     initial_fidelities: torch.Tensor
     refined_fidelities: torch.Tensor
+
+
+@dataclass(frozen=True)
+class HamiltonianSkeletonSelectorTrainConfig:
+    hidden: int = 128
+    num_steps: int = 250
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    seed: int = 0
+
+
+@dataclass(frozen=True)
+class HamiltonianSkeletonSelectorLabelRow:
+    target: str
+    template: str
+    template_id: int
+    refined_fidelity: float
+    local_angle_sum: float
+    is_success: bool
+    n_cz: int
+    n_slots: int
+
+
+@dataclass
+class HamiltonianSkeletonSelectorResult:
+    model: HamiltonianSkeletonSelector
+    losses: list[float]
+    template_names: tuple[str, ...]
+    label_rows: list[HamiltonianSkeletonSelectorLabelRow]
+    train_accuracy: float
+    success_threshold: float
+
+
+@dataclass(frozen=True)
+class HamiltonianSkeletonSelectionRow:
+    target: str
+    template: str
+    template_id: int
+    rank: int
+    probability: float
 
 
 @dataclass
@@ -1761,6 +1802,192 @@ def skeleton_conditioned_dataset_for_template(
         initial_fidelities=dataset.initial_fidelities[rows].clone(),
         refined_fidelities=dataset.refined_fidelities[rows].clone(),
     )
+
+
+def _selector_local_angle_sum(q_stack: torch.Tensor) -> float:
+    q_stack = q_normalize(q_stack)
+    w = q_stack[..., 0].abs().clamp(max=1.0)
+    angles = 2.0 * torch.acos(w)
+    return float(angles.sum().detach().cpu())
+
+
+def make_hamiltonian_skeleton_selector_labels(
+    dataset: SkeletonConditionedHamiltonianSolutionDataset,
+    success_threshold: float = 0.99,
+) -> list[HamiltonianSkeletonSelectorLabelRow]:
+    """Choose one preferred skeleton per Hamiltonian from a multi-template dataset.
+
+    The rule is intentionally conservative: if at least one template reaches the
+    success threshold, prefer the successful template with the fewest CZs and use
+    refined fidelity only as a tie-breaker. If no template succeeds, choose the
+    template with the highest refined fidelity.
+    """
+
+    if not (0.0 <= success_threshold <= 1.0):
+        raise ValueError("success_threshold must be between 0 and 1")
+    if dataset.stacks.shape[0] == 0:
+        raise ValueError("dataset must contain at least one stack")
+
+    templates = tuple(_coerce_three_qubit_template(name) for name in dataset.template_names)
+    best_by_target_template: dict[tuple[str, int], HamiltonianSkeletonSelectorLabelRow] = {}
+    target_order: list[str] = []
+    seen_targets: set[str] = set()
+
+    for row_index, target in enumerate(dataset.targets):
+        target_name = target.name
+        if target_name not in seen_targets:
+            seen_targets.add(target_name)
+            target_order.append(target_name)
+        template_id = int(dataset.template_ids[row_index].detach().cpu().item())
+        template = templates[template_id]
+        refined_fidelity = float(dataset.refined_fidelities[row_index].detach().cpu().item())
+        active_stack = dataset.stacks[row_index, : template.n_slots, :]
+        candidate = HamiltonianSkeletonSelectorLabelRow(
+            target=target_name,
+            template=template.name,
+            template_id=template_id,
+            refined_fidelity=refined_fidelity,
+            local_angle_sum=_selector_local_angle_sum(active_stack),
+            is_success=refined_fidelity >= success_threshold,
+            n_cz=len(template.edges),
+            n_slots=template.n_slots,
+        )
+        key = (target_name, template_id)
+        current = best_by_target_template.get(key)
+        if current is None or candidate.refined_fidelity > current.refined_fidelity:
+            best_by_target_template[key] = candidate
+
+    labels: list[HamiltonianSkeletonSelectorLabelRow] = []
+    for target_name in target_order:
+        candidates = [
+            row
+            for (candidate_target, _), row in best_by_target_template.items()
+            if candidate_target == target_name
+        ]
+        if not candidates:
+            continue
+        successful = [row for row in candidates if row.is_success]
+        if successful:
+            choice = min(
+                successful,
+                key=lambda row: (
+                    row.n_cz,
+                    row.n_slots,
+                    -row.refined_fidelity,
+                    row.local_angle_sum,
+                ),
+            )
+        else:
+            choice = min(
+                candidates,
+                key=lambda row: (
+                    -row.refined_fidelity,
+                    row.n_cz,
+                    row.n_slots,
+                    row.local_angle_sum,
+                ),
+            )
+        labels.append(choice)
+
+    if not labels:
+        raise ValueError("could not construct any skeleton selector labels")
+    return labels
+
+
+def train_hamiltonian_skeleton_selector(
+    dataset: SkeletonConditionedHamiltonianSolutionDataset,
+    train_config: HamiltonianSkeletonSelectorTrainConfig | None = None,
+    success_threshold: float = 0.99,
+    device: torch.device | str | None = None,
+    show_progress: bool = False,
+) -> HamiltonianSkeletonSelectorResult:
+    train_config = train_config or HamiltonianSkeletonSelectorTrainConfig()
+    device = torch.device(device) if device is not None else dataset.stacks.device
+    label_rows = make_hamiltonian_skeleton_selector_labels(dataset, success_threshold=success_threshold)
+    target_by_name: dict[str, HamiltonianTarget] = {}
+    for target in dataset.targets:
+        target_by_name.setdefault(target.name, target)
+    targets = [target_by_name[row.target] for row in label_rows]
+    features = hamiltonian_target_features(targets).to(device=device)
+    labels = torch.tensor([row.template_id for row in label_rows], dtype=torch.long, device=device)
+
+    torch.manual_seed(train_config.seed)
+    model = HamiltonianSkeletonSelector(
+        target_dim=features.shape[1],
+        num_templates=len(dataset.template_names),
+        hidden=train_config.hidden,
+    ).to(device)
+    model.template_names = dataset.template_names
+    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+
+    losses: list[float] = []
+    iterator = range(1, train_config.num_steps + 1)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(iterator, desc="Training Hamiltonian skeleton selector", dynamic_ncols=True)
+    for _ in iterator:
+        logits = model(features)
+        loss = F.cross_entropy(logits, labels)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        loss_value = float(loss.item())
+        losses.append(loss_value)
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix({"loss": f"{loss_value:.4f}"})
+
+    with torch.no_grad():
+        preds = model(features).argmax(dim=-1)
+        train_accuracy = float((preds == labels).float().mean().item())
+
+    return HamiltonianSkeletonSelectorResult(
+        model=model,
+        losses=losses,
+        template_names=dataset.template_names,
+        label_rows=label_rows,
+        train_accuracy=train_accuracy,
+        success_threshold=success_threshold,
+    )
+
+
+@torch.no_grad()
+def rank_hamiltonian_skeletons(
+    selector: HamiltonianSkeletonSelector,
+    targets: list[HamiltonianTarget],
+    template_names: tuple[str, ...] | list[str] | None = None,
+    top_k: int | None = None,
+    device: torch.device | str | None = None,
+) -> dict[str, list[HamiltonianSkeletonSelectionRow]]:
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    names = tuple(template_names or getattr(selector, "template_names", ()))
+    if not names:
+        raise ValueError("template_names must be provided or attached to selector")
+    if len(names) != selector.num_templates:
+        raise ValueError("template_names length must match selector.num_templates")
+    if top_k is not None and top_k <= 0:
+        raise ValueError("top_k must be positive when provided")
+
+    device = torch.device(device) if device is not None else next(selector.parameters()).device
+    features = hamiltonian_target_features(targets).to(device=device)
+    probs = F.softmax(selector(features), dim=-1).detach().cpu()
+    k = len(names) if top_k is None else min(top_k, len(names))
+
+    ranked: dict[str, list[HamiltonianSkeletonSelectionRow]] = {}
+    for target_index, target in enumerate(targets):
+        values, indices = torch.topk(probs[target_index], k=k)
+        ranked[target.name] = [
+            HamiltonianSkeletonSelectionRow(
+                target=target.name,
+                template=names[int(index)],
+                template_id=int(index),
+                rank=rank,
+                probability=float(value),
+            )
+            for rank, (value, index) in enumerate(zip(values.tolist(), indices.tolist()), start=1)
+        ]
+    return ranked
 
 
 def _local_rotation_energy(q_stack: torch.Tensor) -> float:
