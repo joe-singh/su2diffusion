@@ -270,6 +270,102 @@ class TargetConditionedCircuitTokenDenoiser(nn.Module):
         return self.head(encoded[:, 1:, :]).reshape(batch, self.n_slots, 3)
 
 
+class SkeletonConditionedCircuitTokenDenoiser(nn.Module):
+    def __init__(
+        self,
+        T: int = 200,
+        n_slots: int = 6,
+        num_templates: int = 1,
+        target_dim: int = 32,
+        time_dim: int = 64,
+        hidden: int = 256,
+        num_layers: int = 4,
+        num_heads: int = 4,
+        ff_mult: int = 4,
+    ):
+        super().__init__()
+        if hidden % num_heads != 0:
+            raise ValueError("hidden must be divisible by num_heads")
+        if num_templates <= 0:
+            raise ValueError("num_templates must be positive")
+
+        self.T = T
+        self.n_slots = n_slots
+        self.num_templates = num_templates
+        self.target_dim = target_dim
+        self.time_dim = time_dim
+        self.hidden = hidden
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+
+        self.q_proj = nn.Linear(4, hidden)
+        self.target_proj = nn.Linear(target_dim, hidden)
+        self.time_proj = nn.Linear(time_dim, hidden)
+        self.slot_embedding = nn.Embedding(n_slots, hidden)
+        self.template_embedding = nn.Embedding(num_templates, hidden)
+        self.active_embedding = nn.Embedding(2, hidden)
+        self.target_token = nn.Parameter(torch.zeros(hidden))
+        self.template_token = nn.Parameter(torch.zeros(hidden))
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=num_heads,
+            dim_feedforward=ff_mult * hidden,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(hidden)
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 3),
+        )
+
+    def forward(
+        self,
+        q_stack: torch.Tensor,
+        t_idx: torch.Tensor,
+        target_features: torch.Tensor,
+        template_ids: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if q_stack.ndim != 3 or q_stack.shape[1:] != (self.n_slots, 4):
+            raise ValueError(f"Expected q_stack with shape (batch, {self.n_slots}, 4)")
+        if target_features.ndim != 2 or target_features.shape != (q_stack.shape[0], self.target_dim):
+            raise ValueError(f"Expected target_features with shape (batch, {self.target_dim})")
+        if template_ids.ndim != 1 or template_ids.shape[0] != q_stack.shape[0]:
+            raise ValueError("Expected template_ids with shape (batch,)")
+        if active_mask.shape != q_stack.shape[:2]:
+            raise ValueError(f"Expected active_mask with shape (batch, {self.n_slots})")
+
+        batch = q_stack.shape[0]
+        active_mask = active_mask.to(device=q_stack.device, dtype=torch.bool)
+        template_ids = template_ids.to(device=q_stack.device, dtype=torch.long)
+        t_scaled = t_idx.float() / self.T
+        temb = self.time_proj(timestep_embedding(t_scaled, self.time_dim))
+        slot_ids = torch.arange(self.n_slots, device=q_stack.device)
+
+        template_emb = self.template_embedding(template_ids)
+        gate_tokens = self.q_proj(q_stack)
+        gate_tokens = (
+            gate_tokens
+            + self.slot_embedding(slot_ids)[None, :, :]
+            + self.active_embedding(active_mask.long())
+            + template_emb[:, None, :]
+            + temb[:, None, :]
+        )
+        target_token = self.target_proj(target_features) + template_emb + temb + self.target_token[None, :]
+        template_token = template_emb + temb + self.template_token[None, :]
+        tokens = torch.cat([target_token[:, None, :], template_token[:, None, :], gate_tokens], dim=1)
+
+        encoded = self.norm(self.encoder(tokens))
+        eps = self.head(encoded[:, 2:, :]).reshape(batch, self.n_slots, 3)
+        return eps * active_mask[:, :, None].to(dtype=eps.dtype)
+
+
 class TargetLabelConditionedCircuitDenoiser(nn.Module):
     def __init__(
         self,

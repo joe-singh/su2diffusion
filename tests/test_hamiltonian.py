@@ -35,6 +35,7 @@ from su2diffusion.hamiltonian import (
     evaluate_hamiltonian_stack_predictor,
     format_hamiltonian_demo_circuit,
     format_su2_axis_angle,
+    generate_skeleton_conditioned_hamiltonian_solution_dataset,
     generate_three_qubit_hamiltonian_solution_dataset,
     generate_hamiltonian_solution_dataset,
     get_three_qubit_cz_template,
@@ -125,6 +126,7 @@ from su2diffusion.hamiltonian import (
     run_hamiltonian_two_entangler_benchmark,
     run_three_qubit_template_benchmark,
     sample_hamiltonian_conditioned_circuit_reverse,
+    sample_skeleton_conditioned_hamiltonian_reverse,
     su2_axis_angle,
     synthesize_three_qubit_template_stack_report,
     summarize_hamiltonian_denoise_diagnostic,
@@ -152,6 +154,7 @@ from su2diffusion.hamiltonian import (
     train_hamiltonian_skeleton_conditioned_circuit_diffusion,
     train_hamiltonian_slotwise_circuit_diffusion,
     train_hamiltonian_token_circuit_diffusion,
+    train_skeleton_conditioned_hamiltonian_token_diffusion,
     train_hamiltonian_slot_prior,
     unitary_from_hamiltonian,
     _select_refined_solutions,
@@ -421,6 +424,70 @@ def test_three_qubit_hamiltonian_solution_dataset_and_stack_report_smoke():
     assert dataset.refined_fidelities.shape == (1,)
     assert len(report.candidates) == 1
     assert 0.0 <= report.candidates[0].fidelity <= 1.0001
+
+
+def test_skeleton_conditioned_solution_dataset_train_and_sample_smoke():
+    data_config = DataConfig(kind="clifford")
+    centers = centers_for_config(data_config, device="cpu")
+    labels = center_names_for_config(data_config)
+    targets = make_random_pauli_hamiltonian_targets(
+        n_targets=1,
+        terms=("XII", "IZI", "IZZ"),
+        coefficient_scale=0.1,
+        time=0.3,
+        n_qubits=3,
+        seed=444,
+    )
+
+    dataset = generate_skeleton_conditioned_hamiltonian_solution_dataset(
+        targets,
+        generated_gates=centers,
+        generated_labels=labels,
+        templates=("line-2cz-a", "line-3cz-a"),
+        max_slots=12,
+        n_random_candidates=4,
+        top_k=1,
+        seed=445,
+        refinement_steps=1,
+        refinement_lr=0.02,
+        show_progress=False,
+    )
+    config = CircuitExperimentConfig(
+        name="test-skeleton-conditioned-token",
+        schedule=DiffusionSchedule(T=2, beta_start=1e-4, beta_end=0.005, kind="linear"),
+        train=CircuitTrainConfig(batch_size=2, num_steps=1, hidden=16, n_terms=4),
+        sample_count=2,
+        eta=0.0,
+        n_slots=12,
+    )
+    model, losses = train_skeleton_conditioned_hamiltonian_token_diffusion(
+        dataset,
+        train_config=config.train,
+        schedule=config.schedule,
+        device="cpu",
+        show_progress=False,
+    )
+    samples = sample_skeleton_conditioned_hamiltonian_reverse(
+        model,
+        config.schedule,
+        targets,
+        template="line-2cz-a",
+        n_samples_per_target=2,
+        eta=0.0,
+        device="cpu",
+        show_progress=False,
+    )
+
+    assert dataset.stacks.shape == (2, 12, 4)
+    assert dataset.active_masks.shape == (2, 12)
+    assert dataset.template_names == ("line-2cz-a", "line-3cz-a")
+    assert torch.equal(dataset.active_masks[0, :9], torch.ones(9, dtype=torch.bool))
+    assert torch.equal(dataset.active_masks[0, 9:], torch.zeros(3, dtype=torch.bool))
+    assert len(losses) == 1
+    assert samples.shape == (1, 2, 12, 4)
+    assert torch.allclose(samples[..., :9, :].norm(dim=-1), torch.ones(1, 2, 9), atol=1e-5)
+    assert torch.allclose(samples[..., 9:, 0], torch.ones(1, 2, 3), atol=1e-5)
+    assert torch.allclose(samples[..., 9:, 1:], torch.zeros(1, 2, 3, 3), atol=1e-5)
 
 
 def test_three_qubit_hamiltonian_demo_generated_and_token_paths(capsys):

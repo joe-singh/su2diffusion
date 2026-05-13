@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from .circuit import CircuitExperimentConfig, CircuitTrainConfig, circuit_forward_heat_target
 from .diffusion import DiffusionSchedule
 from .model import (
+    SkeletonConditionedCircuitTokenDenoiser,
     SlotwiseTargetConditionedCircuitDenoiser,
     TargetConditionedCircuitDenoiser,
     TargetConditionedCircuitTokenDenoiser,
@@ -69,6 +70,19 @@ class HamiltonianSolutionDataset:
     benchmarks: list[HamiltonianSynthesisBenchmark]
     refinements: list[RefinementResult]
     stacks: torch.Tensor
+    initial_fidelities: torch.Tensor
+    refined_fidelities: torch.Tensor
+
+
+@dataclass(frozen=True)
+class SkeletonConditionedHamiltonianSolutionDataset:
+    targets: list[HamiltonianTarget]
+    benchmarks: list[HamiltonianSynthesisBenchmark]
+    refinements: list[RefinementResult]
+    stacks: torch.Tensor
+    template_ids: torch.Tensor
+    active_masks: torch.Tensor
+    template_names: tuple[str, ...]
     initial_fidelities: torch.Tensor
     refined_fidelities: torch.Tensor
 
@@ -1603,6 +1617,128 @@ def generate_three_qubit_hamiltonian_solution_dataset(
     )
 
 
+def _identity_padded_stack(stack: torch.Tensor, max_slots: int) -> torch.Tensor:
+    if stack.ndim != 2 or stack.shape[-1] != 4:
+        raise ValueError("stack must have shape (n_slots, 4)")
+    if max_slots < stack.shape[0]:
+        raise ValueError("max_slots must be at least the stack slot count")
+    padded = torch.zeros(max_slots, 4, dtype=stack.dtype, device=stack.device)
+    padded[:, 0] = 1.0
+    padded[: stack.shape[0]] = stack
+    return padded
+
+
+def _template_active_mask(template: ThreeQubitCZTemplate, max_slots: int, device: torch.device | str | None = None) -> torch.Tensor:
+    if max_slots < template.n_slots:
+        raise ValueError("max_slots must be at least template.n_slots")
+    mask = torch.zeros(max_slots, dtype=torch.bool, device=device)
+    mask[: template.n_slots] = True
+    return mask
+
+
+def generate_skeleton_conditioned_hamiltonian_solution_dataset(
+    targets: list[HamiltonianTarget],
+    generated_gates: torch.Tensor,
+    generated_labels: list[str],
+    templates: tuple[str | ThreeQubitCZTemplate, ...] | list[str | ThreeQubitCZTemplate] = ("line-3cz-a", "line-4cz"),
+    max_slots: int | None = None,
+    n_random_candidates: int = 10_000,
+    top_k: int = 3,
+    seed: int = 0,
+    refinement_steps: int = 80,
+    refinement_lr: float = 0.05,
+    fidelity_threshold: float = 0.0,
+    solutions_per_target: int = 1,
+    solution_selection: str = "top",
+    selection_pool_size: int | None = None,
+    show_progress: bool = False,
+) -> SkeletonConditionedHamiltonianSolutionDataset:
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    coerced_templates = tuple(_coerce_three_qubit_template(template) for template in templates)
+    if not coerced_templates:
+        raise ValueError("templates must contain at least one template")
+    names = tuple(template.name for template in coerced_templates)
+    if len(set(names)) != len(names):
+        raise ValueError("templates must be unique")
+    max_slots = max_slots or max(template.n_slots for template in coerced_templates)
+    if max_slots < max(template.n_slots for template in coerced_templates):
+        raise ValueError("max_slots must cover every requested template")
+
+    kept_targets: list[HamiltonianTarget] = []
+    kept_benchmarks: list[HamiltonianSynthesisBenchmark] = []
+    refinements: list[RefinementResult] = []
+    padded_stacks: list[torch.Tensor] = []
+    template_ids: list[int] = []
+    masks: list[torch.Tensor] = []
+    initial_fidelities: list[float] = []
+    refined_fidelities: list[float] = []
+
+    template_iterator = enumerate(coerced_templates)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        template_iterator = tqdm(
+            template_iterator,
+            total=len(coerced_templates),
+            desc="Building skeleton-conditioned solution stacks",
+            dynamic_ncols=True,
+        )
+
+    for template_id, template in template_iterator:
+        if show_progress and hasattr(template_iterator, "set_postfix"):
+            template_iterator.set_postfix(template=template.name, slots=template.n_slots)
+        dataset = generate_three_qubit_hamiltonian_solution_dataset(
+            targets,
+            generated_gates=generated_gates,
+            generated_labels=generated_labels,
+            template=template,
+            n_random_candidates=n_random_candidates,
+            top_k=top_k,
+            seed=seed + 10_000 * template_id,
+            refinement_steps=refinement_steps,
+            refinement_lr=refinement_lr,
+            fidelity_threshold=fidelity_threshold,
+            solutions_per_target=solutions_per_target,
+            solution_selection=solution_selection,
+            selection_pool_size=selection_pool_size,
+            show_progress=show_progress,
+        )
+        active_mask = _template_active_mask(template, max_slots, device=generated_gates.device)
+        for target, benchmark, refinement, stack, initial_fidelity, refined_fidelity in zip(
+            dataset.targets,
+            dataset.benchmarks,
+            dataset.refinements,
+            dataset.stacks,
+            dataset.initial_fidelities.tolist(),
+            dataset.refined_fidelities.tolist(),
+        ):
+            kept_targets.append(target)
+            kept_benchmarks.append(benchmark)
+            refinements.append(refinement)
+            padded_stacks.append(_identity_padded_stack(stack, max_slots))
+            template_ids.append(template_id)
+            masks.append(active_mask)
+            initial_fidelities.append(float(initial_fidelity))
+            refined_fidelities.append(float(refined_fidelity))
+
+    if not padded_stacks:
+        raise RuntimeError("No skeleton-conditioned solution stacks met the fidelity threshold")
+
+    device = generated_gates.device
+    return SkeletonConditionedHamiltonianSolutionDataset(
+        targets=kept_targets,
+        benchmarks=kept_benchmarks,
+        refinements=refinements,
+        stacks=torch.stack(padded_stacks),
+        template_ids=torch.tensor(template_ids, dtype=torch.long, device=device),
+        active_masks=torch.stack(masks),
+        template_names=names,
+        initial_fidelities=torch.tensor(initial_fidelities, dtype=torch.float32, device=device),
+        refined_fidelities=torch.tensor(refined_fidelities, dtype=torch.float32, device=device),
+    )
+
+
 def _local_rotation_energy(q_stack: torch.Tensor) -> float:
     q_stack = q_normalize(q_stack)
     q_stack = torch.where(q_stack[..., :1] < 0.0, -q_stack, q_stack)
@@ -2505,6 +2641,106 @@ def train_hamiltonian_token_circuit_diffusion(
     return model, losses
 
 
+def train_skeleton_conditioned_hamiltonian_token_diffusion(
+    dataset: SkeletonConditionedHamiltonianSolutionDataset,
+    train_config: CircuitTrainConfig | None = None,
+    schedule: DiffusionSchedule | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+    target_scale: float = 1.0,
+) -> tuple[SkeletonConditionedCircuitTokenDenoiser, list[float]]:
+    if not dataset.targets:
+        raise ValueError("dataset must contain at least one Hamiltonian target")
+    n_slots = _validate_solution_stacks(dataset.stacks)
+    if dataset.stacks.shape[0] != len(dataset.targets):
+        raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
+    if dataset.template_ids.shape != (dataset.stacks.shape[0],):
+        raise ValueError("dataset.template_ids must have one id per stack")
+    if dataset.active_masks.shape != dataset.stacks.shape[:2]:
+        raise ValueError("dataset.active_masks must have shape (n_stacks, n_slots)")
+
+    train_config = train_config or CircuitTrainConfig()
+    schedule = schedule or DiffusionSchedule()
+    if target_scale <= 0:
+        raise ValueError("target_scale must be positive")
+    device = torch.device(device) if device is not None else dataset.stacks.device
+    stacks = q_normalize(dataset.stacks.to(device=device))
+    features = hamiltonian_target_features(dataset.targets).to(device=device)
+    template_ids = dataset.template_ids.to(device=device)
+    active_masks = dataset.active_masks.to(device=device, dtype=torch.bool)
+    identity = torch.zeros(4, dtype=stacks.dtype, device=device)
+    identity[0] = 1.0
+
+    torch.manual_seed(train_config.seed)
+    model = SkeletonConditionedCircuitTokenDenoiser(
+        T=schedule.T,
+        n_slots=n_slots,
+        num_templates=len(dataset.template_names),
+        target_dim=features.shape[1],
+        hidden=train_config.hidden,
+    ).to(device)
+    model.eps_output_scale = float(target_scale)
+    model.template_names = dataset.template_names
+    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+
+    losses: list[float] = []
+    iterator = range(1, train_config.num_steps + 1)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(iterator, desc="Training skeleton-conditioned token diffusion", dynamic_ncols=True)
+
+    for _ in iterator:
+        rows = torch.randint(
+            low=0,
+            high=stacks.shape[0],
+            size=(train_config.batch_size,),
+            device=device,
+        )
+        q0_stack = stacks[rows]
+        batch_features = features[rows]
+        batch_template_ids = template_ids[rows]
+        batch_mask = active_masks[rows]
+        t_idx = torch.randint(1, schedule.T + 1, (train_config.batch_size,), device=device)
+
+        with torch.no_grad():
+            qt_stack, eps_target = circuit_forward_heat_target(
+                q0_stack,
+                t_idx,
+                schedule=schedule,
+                n_terms=train_config.n_terms,
+            )
+            qt_stack = torch.where(batch_mask[:, :, None], qt_stack, identity[None, None, :])
+            eps_target = eps_target * batch_mask[:, :, None].to(dtype=eps_target.dtype)
+
+        eps_pred = model(qt_stack, t_idx, batch_features, batch_template_ids, batch_mask)
+        active = batch_mask[:, :, None].to(dtype=eps_pred.dtype)
+        loss = ((eps_pred - eps_target / target_scale).square() * active).sum()
+        loss = loss / active.sum().mul(3.0).clamp_min(1.0)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        loss_value = float(loss.item())
+        losses.append(loss_value)
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix({"loss": f"{loss_value:.5f}"})
+
+    return model, losses
+
+
+def _predict_skeleton_conditioned_hamiltonian_eps(
+    model: SkeletonConditionedCircuitTokenDenoiser,
+    q_stack: torch.Tensor,
+    t_idx: torch.Tensor,
+    features: torch.Tensor,
+    template_ids: torch.Tensor,
+    active_mask: torch.Tensor,
+) -> torch.Tensor:
+    return model(q_stack, t_idx, features, template_ids, active_mask) * _eps_output_scale(model)
+
+
 @torch.no_grad()
 def sample_hamiltonian_conditioned_circuit_reverse(
     model: TargetConditionedCircuitDenoiser,
@@ -2563,6 +2799,105 @@ def sample_hamiltonian_conditioned_circuit_reverse(
             chunks,
             total=(n_total + chunk_size - 1) // chunk_size,
             desc=progress_desc or "Sampling Hamiltonian-conditioned circuits",
+            dynamic_ncols=True,
+        )
+
+    sampled_chunks = []
+    for start in chunks:
+        end = min(start + chunk_size, n_total)
+        flat_ids = torch.arange(start, end, device=device)
+        target_ids = torch.div(flat_ids, n_samples_per_target, rounding_mode="floor")
+        sampled_chunks.append(sample_chunk(target_features[target_ids]))
+
+    q_stack = torch.cat(sampled_chunks, dim=0)
+    return q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
+
+
+@torch.no_grad()
+def sample_skeleton_conditioned_hamiltonian_reverse(
+    model: SkeletonConditionedCircuitTokenDenoiser,
+    schedule: DiffusionSchedule,
+    targets: list[HamiltonianTarget],
+    template: str | ThreeQubitCZTemplate,
+    n_samples_per_target: int = 1000,
+    eta: float = 1.0,
+    device: torch.device | str | None = None,
+    max_batch_size: int | None = 8192,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+) -> torch.Tensor:
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    if n_samples_per_target <= 0:
+        raise ValueError("n_samples_per_target must be positive")
+    if max_batch_size is not None and max_batch_size <= 0:
+        raise ValueError("max_batch_size must be positive when provided")
+    template = _coerce_three_qubit_template(template)
+    if template.n_slots > model.n_slots:
+        raise ValueError("template has more active slots than the skeleton-conditioned model")
+    template_names = tuple(getattr(model, "template_names", ()))
+    if not template_names:
+        raise ValueError("model is missing template_names metadata")
+    try:
+        template_id_value = template_names.index(template.name)
+    except ValueError as exc:
+        known = ", ".join(template_names)
+        raise ValueError(f"Template {template.name!r} was not in the training templates: {known}") from exc
+
+    device = torch.device(device) if device is not None else next(model.parameters()).device
+    n_targets = len(targets)
+    n_slots = model.n_slots
+    n_total = n_targets * n_samples_per_target
+    target_features = hamiltonian_target_features(targets).to(device=device)
+    if target_features.shape[1] != model.target_dim:
+        raise ValueError(f"Model expects {model.target_dim} Hamiltonian features, got {target_features.shape[1]}")
+
+    active_mask = _template_active_mask(template, n_slots, device=device)
+    identity = torch.zeros(4, dtype=torch.float32, device=device)
+    identity[0] = 1.0
+    betas, _, sigmas = schedule.tensors(device)
+
+    def sample_chunk(features: torch.Tensor) -> torch.Tensor:
+        n_chunk = features.shape[0]
+        q_stack = sample_haar(n_chunk * n_slots, device=device).reshape(n_chunk, n_slots, 4)
+        q_stack = torch.where(active_mask[None, :, None], q_stack, identity[None, None, :])
+        template_ids = torch.full((n_chunk,), template_id_value, device=device, dtype=torch.long)
+        batch_mask = active_mask[None, :].expand(n_chunk, n_slots)
+        for s in reversed(range(schedule.T)):
+            t_idx = torch.full((n_chunk,), s + 1, device=device, dtype=torch.long)
+            eps_pred = _predict_skeleton_conditioned_hamiltonian_eps(
+                model,
+                q_stack,
+                t_idx,
+                features,
+                template_ids,
+                batch_mask,
+            )
+
+            beta = betas[s]
+            sigma = sigmas[s]
+            drift = -(beta / sigma.clamp_min(1e-8)) * eps_pred
+
+            if s > 0 and eta > 0:
+                noise = eta * torch.sqrt(beta) * torch.randn(n_chunk, n_slots, 3, device=device)
+            else:
+                noise = torch.zeros_like(drift)
+            update = (drift + noise) * batch_mask[:, :, None].to(dtype=drift.dtype)
+
+            q_stack = q_mul(q_stack, q_exp(update))
+            q_stack = q_normalize(q_stack)
+            q_stack = torch.where(active_mask[None, :, None], q_stack, identity[None, None, :])
+        return q_stack
+
+    chunk_size = n_total if max_batch_size is None else min(max_batch_size, n_total)
+    chunks = range(0, n_total, chunk_size)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        chunks = tqdm(
+            chunks,
+            total=(n_total + chunk_size - 1) // chunk_size,
+            desc=progress_desc or f"Sampling skeleton-conditioned {template.name}",
             dynamic_ncols=True,
         )
 
