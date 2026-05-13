@@ -7,3 +7,5 @@ paper_artifacts/
 su2_gate_experiments/
 .ipynb_checkpoints/
 *.egg-info/
+docs/project_context.md
+paper/su2diffusion_hamiltonian_synthesis.*
