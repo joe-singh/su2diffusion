@@ -366,6 +366,34 @@ class SkeletonConditionedCircuitTokenDenoiser(nn.Module):
         return eps * active_mask[:, :, None].to(dtype=eps.dtype)
 
 
+class HamiltonianSkeletonSelector(nn.Module):
+    def __init__(
+        self,
+        target_dim: int = 129,
+        num_templates: int = 4,
+        hidden: int = 128,
+    ):
+        super().__init__()
+        if num_templates <= 0:
+            raise ValueError("num_templates must be positive")
+
+        self.target_dim = target_dim
+        self.num_templates = num_templates
+        self.hidden = hidden
+        self.net = nn.Sequential(
+            nn.Linear(target_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, num_templates),
+        )
+
+    def forward(self, target_features: torch.Tensor) -> torch.Tensor:
+        if target_features.ndim != 2 or target_features.shape[1] != self.target_dim:
+            raise ValueError(f"Expected target_features with shape (batch, {self.target_dim})")
+        return self.net(target_features)
+
+
 class TargetLabelConditionedCircuitDenoiser(nn.Module):
     def __init__(
         self,
