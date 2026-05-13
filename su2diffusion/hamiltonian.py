@@ -98,6 +98,13 @@ class HamiltonianSkeletonSelectorTrainConfig:
 
 
 @dataclass(frozen=True)
+class HamiltonianSkeletonCostConfig:
+    cz_weight: float = 0.015
+    local_gate_weight: float = 0.0005
+    angle_weight: float = 0.001
+
+
+@dataclass(frozen=True)
 class HamiltonianSkeletonSelectorLabelRow:
     target: str
     template: str
@@ -107,6 +114,8 @@ class HamiltonianSkeletonSelectorLabelRow:
     is_success: bool
     n_cz: int
     n_slots: int
+    hardware_cost: float = 0.0
+    regularized_score: float = 0.0
 
 
 @dataclass
@@ -117,6 +126,7 @@ class HamiltonianSkeletonSelectorResult:
     label_rows: list[HamiltonianSkeletonSelectorLabelRow]
     train_accuracy: float
     success_threshold: float
+    cost_config: HamiltonianSkeletonCostConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -1811,16 +1821,36 @@ def _selector_local_angle_sum(q_stack: torch.Tensor) -> float:
     return float(angles.sum().detach().cpu())
 
 
+def hamiltonian_skeleton_hardware_cost(
+    n_cz: int,
+    n_slots: int,
+    local_angle_sum: float,
+    cost_config: HamiltonianSkeletonCostConfig | None = None,
+) -> float:
+    cost_config = cost_config or HamiltonianSkeletonCostConfig()
+    return (
+        cost_config.cz_weight * n_cz
+        + cost_config.local_gate_weight * n_slots
+        + cost_config.angle_weight * local_angle_sum
+    )
+
+
 def make_hamiltonian_skeleton_selector_labels(
     dataset: SkeletonConditionedHamiltonianSolutionDataset,
     success_threshold: float = 0.99,
+    cost_config: HamiltonianSkeletonCostConfig | None = None,
 ) -> list[HamiltonianSkeletonSelectorLabelRow]:
     """Choose one preferred skeleton per Hamiltonian from a multi-template dataset.
 
-    The rule is intentionally conservative: if at least one template reaches the
-    success threshold, prefer the successful template with the fewest CZs and use
-    refined fidelity only as a tie-breaker. If no template succeeds, choose the
-    template with the highest refined fidelity.
+    Without a cost configuration, the rule is intentionally conservative: if at
+    least one template reaches the success threshold, prefer the successful
+    template with the fewest CZs and use refined fidelity only as a tie-breaker.
+    If no template succeeds, choose the template with the highest refined
+    fidelity.
+
+    With a cost configuration, the rule remains success-constrained when possible
+    but ranks successful templates by a regularized score
+    ``refined_fidelity - hardware_cost``.
     """
 
     if not (0.0 <= success_threshold <= 1.0):
@@ -1842,19 +1872,44 @@ def make_hamiltonian_skeleton_selector_labels(
         template = templates[template_id]
         refined_fidelity = float(dataset.refined_fidelities[row_index].detach().cpu().item())
         active_stack = dataset.stacks[row_index, : template.n_slots, :]
+        local_angle_sum = _selector_local_angle_sum(active_stack)
+        hardware_cost = (
+            hamiltonian_skeleton_hardware_cost(
+                n_cz=len(template.edges),
+                n_slots=template.n_slots,
+                local_angle_sum=local_angle_sum,
+                cost_config=cost_config,
+            )
+            if cost_config is not None
+            else 0.0
+        )
         candidate = HamiltonianSkeletonSelectorLabelRow(
             target=target_name,
             template=template.name,
             template_id=template_id,
             refined_fidelity=refined_fidelity,
-            local_angle_sum=_selector_local_angle_sum(active_stack),
+            local_angle_sum=local_angle_sum,
             is_success=refined_fidelity >= success_threshold,
             n_cz=len(template.edges),
             n_slots=template.n_slots,
+            hardware_cost=hardware_cost,
+            regularized_score=refined_fidelity - hardware_cost,
         )
         key = (target_name, template_id)
         current = best_by_target_template.get(key)
-        if current is None or candidate.refined_fidelity > current.refined_fidelity:
+        if cost_config is None:
+            is_better = current is None or candidate.refined_fidelity > current.refined_fidelity
+        else:
+            is_better = current is None or (
+                candidate.is_success,
+                candidate.regularized_score,
+                candidate.refined_fidelity,
+            ) > (
+                current.is_success,
+                current.regularized_score,
+                current.refined_fidelity,
+            )
+        if is_better:
             best_by_target_template[key] = candidate
 
     labels: list[HamiltonianSkeletonSelectorLabelRow] = []
@@ -1866,27 +1921,38 @@ def make_hamiltonian_skeleton_selector_labels(
         ]
         if not candidates:
             continue
-        successful = [row for row in candidates if row.is_success]
-        if successful:
-            choice = min(
-                successful,
+        if cost_config is not None:
+            choice = max(
+                candidates,
                 key=lambda row: (
-                    row.n_cz,
-                    row.n_slots,
-                    -row.refined_fidelity,
-                    row.local_angle_sum,
+                    row.is_success,
+                    row.regularized_score,
+                    row.refined_fidelity,
+                    -row.hardware_cost,
                 ),
             )
         else:
-            choice = min(
-                candidates,
-                key=lambda row: (
-                    -row.refined_fidelity,
-                    row.n_cz,
-                    row.n_slots,
-                    row.local_angle_sum,
-                ),
-            )
+            successful = [row for row in candidates if row.is_success]
+            if successful:
+                choice = min(
+                    successful,
+                    key=lambda row: (
+                        row.n_cz,
+                        row.n_slots,
+                        -row.refined_fidelity,
+                        row.local_angle_sum,
+                    ),
+                )
+            else:
+                choice = min(
+                    candidates,
+                    key=lambda row: (
+                        -row.refined_fidelity,
+                        row.n_cz,
+                        row.n_slots,
+                        row.local_angle_sum,
+                    ),
+                )
         labels.append(choice)
 
     if not labels:
@@ -1898,12 +1964,17 @@ def train_hamiltonian_skeleton_selector(
     dataset: SkeletonConditionedHamiltonianSolutionDataset,
     train_config: HamiltonianSkeletonSelectorTrainConfig | None = None,
     success_threshold: float = 0.99,
+    cost_config: HamiltonianSkeletonCostConfig | None = None,
     device: torch.device | str | None = None,
     show_progress: bool = False,
 ) -> HamiltonianSkeletonSelectorResult:
     train_config = train_config or HamiltonianSkeletonSelectorTrainConfig()
     device = torch.device(device) if device is not None else dataset.stacks.device
-    label_rows = make_hamiltonian_skeleton_selector_labels(dataset, success_threshold=success_threshold)
+    label_rows = make_hamiltonian_skeleton_selector_labels(
+        dataset,
+        success_threshold=success_threshold,
+        cost_config=cost_config,
+    )
     target_by_name: dict[str, HamiltonianTarget] = {}
     for target in dataset.targets:
         target_by_name.setdefault(target.name, target)
@@ -1948,6 +2019,7 @@ def train_hamiltonian_skeleton_selector(
         label_rows=label_rows,
         train_accuracy=train_accuracy,
         success_threshold=success_threshold,
+        cost_config=cost_config,
     )
 
 
