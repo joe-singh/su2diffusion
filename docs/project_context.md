@@ -1,6 +1,6 @@
 # SU(2) Diffusion Project Context
 
-Last updated: 2026-05-09
+Last updated: 2026-05-13
 
 This memo is a checkpoint for the `su2diffusion` project. It is meant to let a
 new conversation, collaborator, or future version of us recover the state of the
@@ -593,6 +593,66 @@ These examples are useful because the generated circuit can look non-obvious
 internally, but multiplying out all local `SU(2)` gates and CZs recovers the
 same unitary as the hand-computed Hamiltonian evolution.
 
+### Skeleton-Conditioned Template Diffusion
+
+Until recently, the Hamiltonian-conditioned circuit-token model was trained for
+one fixed entangling skeleton at a time, usually the three-qubit `line-4cz`
+template. The new skeleton-conditioned branch tests a more compiler-like setup:
+train one shared denoiser on padded local-gate stacks from several CZ templates,
+then condition the sampler on the requested template.
+
+The first smoke test (Level 3L in `SU2GateExperiments.ipynb`) used one shared
+model over:
+
+```text
+line-2cz-a, line-3cz-a, line-4cz, line-5cz-a
+```
+
+and verified that the plumbing works: the same model can be asked to sample
+under different skeletons, with only the active slots used for the requested
+template. On a transverse-Ising-style target, the cheap 2CZ/3CZ templates did
+not reach `F >= 0.99` after refinement, while the 4CZ/5CZ templates did.
+
+The scaled pilot (Level 3M) trains the same kind of shared
+skeleton-conditioned model on 64 random three-qubit Hamiltonians and compares
+it with a fixed-template `line-4cz` token model trained on the same `line-4cz`
+slice of the solution-stack dataset. The A100 run reported:
+
+```text
+source                    target                  CZs   proposal   refined   success
+fixed-token-line-4cz      scale-mixed-pauli       4       0.2828    0.9927     95.0%
+skeleton-token-line-4cz   scale-mixed-pauli       4       0.2526    0.9918     95.0%
+skeleton-token-line-5cz-a scale-mixed-pauli       5       0.2493    0.9943    100.0%
+
+fixed-token-line-4cz      scale-tfim              4       0.4181    0.9685     85.0%
+skeleton-token-line-4cz   scale-tfim              4       0.2561    0.9829     90.0%
+skeleton-token-line-5cz-a scale-tfim              5       0.2352    0.9838     90.0%
+
+fixed-token-line-4cz      scale-weak-heisenberg   4       0.4860    0.9945    100.0%
+skeleton-token-line-4cz   scale-weak-heisenberg   4       0.2538    0.9797     95.0%
+skeleton-token-line-5cz-a scale-weak-heisenberg   5       0.2725    0.9352     80.0%
+```
+
+The full Level 3M table also includes 2CZ and 3CZ shared-template rows. Those
+remained below threshold on all three targets, which is useful: the shared model
+is not magically solving under insufficient skeletons. It recovers the same
+expressivity hierarchy seen in direct template search.
+
+Interpretation:
+
+- template conditioning now works end to end;
+- the shared model can produce useful 4CZ/5CZ proposals after refinement;
+- fixed-template `line-4cz` still has sharper raw proposal fidelity;
+- the shared model's `line-4cz` refined performance is comparable on two
+  targets and close on the third;
+- this is a pilot, not yet a final skeleton-selection result.
+
+This opens the path from "enumerate templates outside the model" toward
+"condition one Lie-group denoiser on a requested skeleton." The next natural
+upgrade is more capacity or explicit attention to template metadata, because
+the current shared model seems to pay a proposal-sharpness penalty for serving
+multiple skeletons at once.
+
 ## What Failed Or Was Deprioritized
 
 ### Flat Hamiltonian-Conditioned MLP Denoiser
@@ -820,13 +880,18 @@ The 3-qubit model is promising but still modest. Potential next upgrades:
 
 ### 5. Template And Skeleton Selection
 
-The current skeleton is fixed. The eventual compiler needs either:
+The original skeleton was fixed. We now have a first skeleton-conditioned
+prototype that trains one denoiser over several padded CZ templates and samples
+under a requested template. The eventual compiler still needs either:
 
 - a small library of skeletons and a selector;
 - a learned skeleton prior;
 - or a search loop over skeleton families.
 
-This is separate from local-gate diffusion.
+This is no longer completely separate from local-gate diffusion: template
+conditioning is now in the model. What remains open is how much template-aware
+capacity is needed before the shared model matches or beats specialized
+fixed-template models on raw proposal quality.
 
 ### 6. Compare More Carefully To Classical Baselines
 
