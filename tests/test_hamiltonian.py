@@ -127,6 +127,7 @@ from su2diffusion.hamiltonian import (
     run_three_qubit_template_benchmark,
     sample_hamiltonian_conditioned_circuit_reverse,
     sample_skeleton_conditioned_hamiltonian_reverse,
+    skeleton_conditioned_dataset_for_template,
     su2_axis_angle,
     synthesize_three_qubit_template_stack_report,
     summarize_hamiltonian_denoise_diagnostic,
@@ -483,6 +484,9 @@ def test_skeleton_conditioned_solution_dataset_train_and_sample_smoke():
     assert dataset.template_names == ("line-2cz-a", "line-3cz-a")
     assert torch.equal(dataset.active_masks[0, :9], torch.ones(9, dtype=torch.bool))
     assert torch.equal(dataset.active_masks[0, 9:], torch.zeros(3, dtype=torch.bool))
+    line3_dataset = skeleton_conditioned_dataset_for_template(dataset, "line-3cz-a")
+    assert line3_dataset.stacks.shape == (1, 12, 4)
+    assert line3_dataset.targets[0].name == targets[0].name
     assert len(losses) == 1
     assert samples.shape == (1, 2, 12, 4)
     assert torch.allclose(samples[..., :9, :].norm(dim=-1), torch.ones(1, 2, 9), atol=1e-5)
