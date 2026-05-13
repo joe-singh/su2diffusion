@@ -9,6 +9,7 @@ from su2diffusion.hamiltonian import (
     HamiltonianDenoiseDiagnosticResult,
     HamiltonianDenoiseNormalizationResult,
     HamiltonianSkeletonDenoiseComparisonResult,
+    HamiltonianSkeletonCostConfig,
     HamiltonianSkeletonSelectorTrainConfig,
     HamiltonianSlotwiseDenoiseComparisonResult,
     HamiltonianTokenDenoiseComparisonResult,
@@ -43,6 +44,7 @@ from su2diffusion.hamiltonian import (
     get_three_qubit_cz_template,
     hamiltonian_denoise_diagnostic_from_model,
     hamiltonian_from_terms,
+    hamiltonian_skeleton_hardware_cost,
     hamiltonian_target_features,
     make_hamiltonian_target,
     make_hamiltonian_skeleton_selector_labels,
@@ -249,10 +251,30 @@ def test_hamiltonian_skeleton_selector_labels_and_training_smoke() -> None:
     assert [row.target for row in labels] == ["selector-0", "selector-1"]
     assert [row.template for row in labels] == ["line-2cz-a", "line-4cz"]
 
+    low_penalty = HamiltonianSkeletonCostConfig(cz_weight=0.0, local_gate_weight=0.0, angle_weight=0.0)
+    low_penalty_labels = make_hamiltonian_skeleton_selector_labels(
+        dataset,
+        success_threshold=0.99,
+        cost_config=low_penalty,
+    )
+    high_penalty = HamiltonianSkeletonCostConfig(cz_weight=0.01, local_gate_weight=0.0, angle_weight=0.0)
+    high_penalty_labels = make_hamiltonian_skeleton_selector_labels(
+        dataset,
+        success_threshold=0.99,
+        cost_config=high_penalty,
+    )
+
+    assert hamiltonian_skeleton_hardware_cost(2, 9, 0.0, high_penalty) == 0.02
+    assert [row.template for row in low_penalty_labels] == ["line-4cz", "line-4cz"]
+    assert [row.template for row in high_penalty_labels] == ["line-2cz-a", "line-4cz"]
+    assert low_penalty_labels[0].regularized_score == low_penalty_labels[0].refined_fidelity
+    assert high_penalty_labels[0].regularized_score < high_penalty_labels[0].refined_fidelity
+
     result = train_hamiltonian_skeleton_selector(
         dataset,
         train_config=HamiltonianSkeletonSelectorTrainConfig(hidden=16, num_steps=3, seed=7),
         success_threshold=0.99,
+        cost_config=high_penalty,
         device="cpu",
     )
     ranked = rank_hamiltonian_skeletons(result.model, [first, second], top_k=2, device="cpu")
