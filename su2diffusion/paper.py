@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -12,22 +13,29 @@ import torch
 
 from .circuit import CircuitExperimentConfig, get_circuit_experiment_config
 from .hamiltonian import (
+    HamiltonianTarget,
     ThreeQubitTokenRepeatabilityResult,
     ThreeQubitTokenRepeatabilityRunRow,
+    format_su2_axis_angle,
+    pauli_string_matrix,
     plot_three_qubit_token_repeatability,
     print_three_qubit_token_repeatability,
     print_three_qubit_token_repeatability_summary,
     run_three_qubit_hamiltonian_token_repeatability_benchmark,
+    su2_axis_angle,
     summarize_three_qubit_token_repeatability,
 )
 from .pareto import (
+    CircuitDiversityCandidateRow,
     CircuitDiversityCoverageResult,
     CircuitDiversityMultiTargetPropertyResult,
     CircuitDiversityPropertyResult,
     CircuitDiversityResult,
     CircuitUnitaryCrossFidelityResult,
     ParetoCircuitResult,
+    ParetoScoringConfig,
     compare_circuit_diversity_properties,
+    pareto_hardware_cost,
     pareto_frontier_rows,
     plot_circuit_diversity_coverage,
     plot_circuit_diversity_properties,
@@ -41,6 +49,8 @@ from .pareto import (
     test_circuit_diversity_properties,
     top_pareto_rows,
 )
+from .quaternion import q_normalize
+from .synthesis import unitary_fidelity
 
 
 @dataclass(frozen=True)
@@ -77,6 +87,54 @@ class PaperBenchmarkSuiteResult:
 
     config: PaperBenchmarkConfig
     repeatability: ThreeQubitTokenRepeatabilityResult
+
+
+@dataclass(frozen=True)
+class TfimLearnedCircuitExample:
+    """One selected fixed-template circuit for the TFIM paper demo."""
+
+    label: str
+    source: str
+    selection_rule: str
+    proposal_fidelity: float
+    refined_fidelity: float
+    steps_to_threshold: int
+    n_entanglers: int
+    n_local_gates: int
+    total_local_angle: float
+    movement_mean: float
+    movement_max: float
+    hardware_cost: float
+    regularized_score: float
+    slot_labels: tuple[str | None, ...]
+    refined_gates: torch.Tensor
+
+
+@dataclass(frozen=True)
+class TfimTrotterExample:
+    """One analytic first-order product-formula baseline for the TFIM demo."""
+
+    label: str
+    n_steps: int
+    fidelity: float
+    n_entanglers: int
+    n_local_rotations: int
+    total_local_angle: float
+    hardware_cost: float
+
+
+@dataclass(frozen=True)
+class TfimCircuitDemoResult:
+    """Paper-facing TFIM example circuits and product-formula baselines."""
+
+    target: HamiltonianTarget
+    template: str
+    template_edges: tuple[tuple[int, int], ...]
+    n_qubits: int
+    threshold: float
+    scoring: ParetoScoringConfig
+    learned: tuple[TfimLearnedCircuitExample, ...]
+    trotter: tuple[TfimTrotterExample, ...]
 
 
 @dataclass(frozen=True)
@@ -351,6 +409,11 @@ def _write_json(path: Path, payload: dict[str, Any]) -> Path:
     return path
 
 
+def _write_text(path: Path, text: str) -> Path:
+    path.write_text(text)
+    return path
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()) if rows else [])
@@ -463,6 +526,423 @@ def _artifact_metadata(
     if metadata:
         payload["metadata"] = dict(metadata)
     return payload
+
+
+def _target_n_qubits(target: HamiltonianTarget) -> int:
+    dim = target.unitary.shape[-1]
+    n_qubits = int(round(math.log2(dim)))
+    if 2**n_qubits != dim:
+        raise ValueError("target unitary dimension must be a power of two")
+    return n_qubits
+
+
+def _stack_total_local_angle(q_stack: torch.Tensor) -> float:
+    q_stack = q_normalize(q_stack.detach().to(device="cpu", dtype=torch.float32))
+    w = q_stack[..., 0].abs().clamp(max=1.0)
+    return float((2.0 * torch.acos(w)).sum().item())
+
+
+def _successful_diversity_rows(
+    result: CircuitDiversityResult,
+    threshold: float,
+) -> list[CircuitDiversityCandidateRow]:
+    return [row for row in result.rows if row.refined_fidelity >= threshold]
+
+
+def _select_median_angle_diversity_row(
+    result: CircuitDiversityResult,
+    threshold: float,
+) -> tuple[CircuitDiversityCandidateRow, float]:
+    successful = _successful_diversity_rows(result, threshold)
+    if not successful:
+        raise ValueError(f"{result.source!r} has no rows with refined fidelity >= {threshold:g}")
+    angles = sorted(_stack_total_local_angle(row.refined_gates) for row in successful)
+    median_angle = angles[len(angles) // 2]
+    row = min(
+        successful,
+        key=lambda item: (
+            abs(_stack_total_local_angle(item.refined_gates) - median_angle),
+            -item.refined_fidelity,
+            item.candidate_rank,
+        ),
+    )
+    return row, median_angle
+
+
+def _pauli_weight(pauli: str) -> int:
+    return sum(char != "I" for char in pauli)
+
+
+def _trotter_unitary(target: HamiltonianTarget, n_steps: int) -> torch.Tensor:
+    if n_steps <= 0:
+        raise ValueError("n_steps must be positive")
+    n_qubits = _target_n_qubits(target)
+    device = target.unitary.device
+    dim = 2**n_qubits
+    dt = target.time / n_steps
+    step = torch.eye(dim, dtype=torch.complex64, device=device)
+    for term in target.terms:
+        pauli = pauli_string_matrix(term.pauli, n_qubits=n_qubits, device=device).to(dtype=torch.complex64)
+        term_unitary = torch.linalg.matrix_exp(-1j * float(term.coefficient) * dt * pauli)
+        step = term_unitary @ step
+    unitary = torch.eye(dim, dtype=torch.complex64, device=device)
+    for _ in range(n_steps):
+        unitary = step @ unitary
+    return unitary
+
+
+def _trotter_entangler_count(target: HamiltonianTarget, n_steps: int) -> int:
+    entanglers_per_step = sum(max(0, 2 * (_pauli_weight(term.pauli) - 1)) for term in target.terms)
+    return int(n_steps * entanglers_per_step)
+
+
+def _trotter_local_rotation_count(target: HamiltonianTarget, n_steps: int) -> int:
+    return int(n_steps * len(target.terms))
+
+
+def _trotter_total_local_angle(target: HamiltonianTarget, n_steps: int) -> float:
+    dt = target.time / n_steps
+    per_step = sum(2.0 * abs(float(term.coefficient)) * dt for term in target.terms)
+    return float(n_steps * per_step)
+
+
+def build_tfim_circuit_demo(
+    target: HamiltonianTarget,
+    diversity_results: dict[str, CircuitDiversityResult],
+    *,
+    threshold: float = 0.99,
+    scoring: ParetoScoringConfig | None = None,
+    source_order: tuple[str, ...] = ("low-angle-data", "high-angle-data", "generated-search"),
+    source_labels: dict[str, str] | None = None,
+    trotter_steps: tuple[int, ...] = (1, 2, 4),
+) -> TfimCircuitDemoResult:
+    """Select representative TFIM circuits and analytic product-formula baselines.
+
+    The learned/template circuits are selected by a fixed, non-cherry-picked rule:
+    among successful rows for each source, choose the refined circuit whose total
+    local angle is closest to that source's median successful total local angle.
+    """
+
+    scoring = scoring or ParetoScoringConfig()
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("threshold must be between 0 and 1")
+    if not diversity_results:
+        raise ValueError("diversity_results must contain at least one source")
+    first = next(iter(diversity_results.values()))
+    template = first.template
+    for source, result in diversity_results.items():
+        if result.target.name != target.name:
+            raise ValueError(f"{source!r} target {result.target.name!r} does not match {target.name!r}")
+        if result.template.name != template.name:
+            raise ValueError(f"{source!r} uses template {result.template.name!r}, expected {template.name!r}")
+
+    labels = {
+        "low-angle-data": "low-angle diffusion",
+        "high-angle-data": "high-angle diffusion",
+        "generated-search": "generated search",
+        **(source_labels or {}),
+    }
+    learned: list[TfimLearnedCircuitExample] = []
+    for source in source_order:
+        if source not in diversity_results:
+            raise ValueError(f"missing diversity result for source {source!r}")
+        row, median_angle = _select_median_angle_diversity_row(diversity_results[source], threshold)
+        total_angle = _stack_total_local_angle(row.refined_gates)
+        hardware_cost = pareto_hardware_cost(
+            n_cz=len(template.edges),
+            n_local_gates=template.n_slots,
+            movement_mean=row.movement_mean,
+            local_angle_sum=total_angle,
+            scoring=scoring,
+        )
+        learned.append(
+            TfimLearnedCircuitExample(
+                label=labels.get(source, source),
+                source=source,
+                selection_rule=f"successful row closest to median A={median_angle:.3f}",
+                proposal_fidelity=row.proposal_fidelity,
+                refined_fidelity=row.refined_fidelity,
+                steps_to_threshold=row.steps_to_threshold,
+                n_entanglers=len(template.edges),
+                n_local_gates=template.n_slots,
+                total_local_angle=total_angle,
+                movement_mean=row.movement_mean,
+                movement_max=row.movement_max,
+                hardware_cost=hardware_cost,
+                regularized_score=float(row.refined_fidelity - hardware_cost),
+                slot_labels=row.slot_labels,
+                refined_gates=q_normalize(row.refined_gates.detach()).cpu(),
+            )
+        )
+
+    trotter: list[TfimTrotterExample] = []
+    for n_steps in trotter_steps:
+        unitary = _trotter_unitary(target, n_steps)
+        total_angle = _trotter_total_local_angle(target, n_steps)
+        n_entanglers = _trotter_entangler_count(target, n_steps)
+        n_local = _trotter_local_rotation_count(target, n_steps)
+        hardware_cost = pareto_hardware_cost(
+            n_cz=n_entanglers,
+            n_local_gates=n_local,
+            movement_mean=0.0,
+            local_angle_sum=total_angle,
+            scoring=scoring,
+        )
+        trotter.append(
+            TfimTrotterExample(
+                label=f"Trotter {n_steps} step" + ("" if n_steps == 1 else "s"),
+                n_steps=n_steps,
+                fidelity=unitary_fidelity(unitary, target.unitary),
+                n_entanglers=n_entanglers,
+                n_local_rotations=n_local,
+                total_local_angle=total_angle,
+                hardware_cost=hardware_cost,
+            )
+        )
+
+    return TfimCircuitDemoResult(
+        target=target,
+        template=template.name,
+        template_edges=tuple(tuple(edge) for edge in template.edges),
+        n_qubits=template.n_qubits,
+        threshold=threshold,
+        scoring=scoring,
+        learned=tuple(learned),
+        trotter=tuple(trotter),
+    )
+
+
+def tfim_circuit_demo_summary_rows(result: TfimCircuitDemoResult) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in result.learned:
+        rows.append(
+            {
+                "method": row.label,
+                "source": row.source,
+                "kind": "learned-template",
+                "fidelity": row.refined_fidelity,
+                "proposal_fidelity": row.proposal_fidelity,
+                "entanglers": row.n_entanglers,
+                "local_rotations": row.n_local_gates,
+                "total_local_angle": row.total_local_angle,
+                "hardware_cost": row.hardware_cost,
+                "steps_to_threshold": row.steps_to_threshold,
+                "selection_rule": row.selection_rule,
+            }
+        )
+    for row in result.trotter:
+        rows.append(
+            {
+                "method": row.label,
+                "source": "analytic-trotter",
+                "kind": "product-formula",
+                "fidelity": row.fidelity,
+                "proposal_fidelity": float("nan"),
+                "entanglers": row.n_entanglers,
+                "local_rotations": row.n_local_rotations,
+                "total_local_angle": row.total_local_angle,
+                "hardware_cost": row.hardware_cost,
+                "steps_to_threshold": "n/a",
+                "selection_rule": f"{row.n_steps} first-order Trotter step(s)",
+            }
+        )
+    return rows
+
+
+def tfim_circuit_demo_gate_rows(result: TfimCircuitDemoResult) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for example in result.learned:
+        gates = q_normalize(example.refined_gates)
+        for slot, gate in enumerate(gates):
+            layer = slot // 3
+            qubit = slot % 3
+            angle, axis = su2_axis_angle(gate)
+            rows.append(
+                {
+                    "method": example.label,
+                    "source": example.source,
+                    "gate": f"G{slot:02d}",
+                    "layer": layer,
+                    "qubit": qubit,
+                    "slot": f"L{layer} q{qubit}",
+                    "source_label": example.slot_labels[slot] if slot < len(example.slot_labels) else None,
+                    "axis_x": axis[0],
+                    "axis_y": axis[1],
+                    "axis_z": axis[2],
+                    "angle": angle,
+                    "gate_text": format_su2_axis_angle(gate),
+                }
+            )
+    return rows
+
+
+def _tfim_gate_name(slot: int) -> str:
+    return f"G{slot:02d}"
+
+
+def format_tfim_circuit_demo_template(result: TfimCircuitDemoResult) -> str:
+    """Return a readable fixed-template layout for the selected TFIM gates."""
+
+    n_layers = len(result.template_edges) + 1
+    lines = [
+        f"{result.template}: "
+        + " - ".join(
+            f"L{layer}" if layer == n_layers - 1 else f"L{layer} - CZ{a}{b}"
+            for layer, (a, b) in enumerate((*result.template_edges, (-1, -1)))
+        )
+    ]
+    for layer in range(n_layers):
+        entries = []
+        for qubit in range(result.n_qubits):
+            slot = layer * result.n_qubits + qubit
+            entries.append(f"q{qubit}={_tfim_gate_name(slot)}")
+        lines.append(f"  L{layer}: " + "; ".join(entries))
+        if layer < len(result.template_edges):
+            a, b = result.template_edges[layer]
+            lines.append(f"       CZ q{a}-q{b}")
+    return "\n".join(lines)
+
+
+def print_tfim_circuit_demo(result: TfimCircuitDemoResult) -> None:
+    print(f"target:   {result.target.name}")
+    print(f"time:     {result.target.time:g}")
+    print("terms:")
+    for term in result.target.terms:
+        print(f"  {term.coefficient:+.4f} {term.pauli}")
+    print()
+    print(f"template: {result.template}")
+    print(f"success threshold for learned circuits: F >= {result.threshold:g}")
+    print()
+
+    header = "method                 kind              F exact   entanglers   A total   cost    steps"
+    print(header)
+    print("-" * len(header))
+    for row in tfim_circuit_demo_summary_rows(result):
+        steps = row["steps_to_threshold"]
+        steps_text = str(steps) if isinstance(steps, str) else f"{steps:d}"
+        print(
+            f"{row['method']:<22} {row['kind']:<16} "
+            f"{row['fidelity']:>7.4f} "
+            f"{row['entanglers']:>11} "
+            f"{row['total_local_angle']:>9.3f} "
+            f"{row['hardware_cost']:>7.3f} "
+            f"{steps_text:>7}"
+        )
+
+    print()
+    print("fixed template circuit")
+    print(format_tfim_circuit_demo_template(result))
+    print()
+    print("selected learned/template gate lists")
+    for example in result.learned:
+        print()
+        print(f"{example.label} ({example.source})")
+        print(f"selection: {example.selection_rule}")
+        header = "gate  slot    source label         refined local gate                  angle"
+        print(header)
+        print("-" * len(header))
+        for row in [item for item in tfim_circuit_demo_gate_rows(result) if item["method"] == example.label]:
+            source_label = row["source_label"] if row["source_label"] is not None else "continuous"
+            print(
+                f"{row['gate']:<5} "
+                f"{row['slot']:<7} "
+                f"{str(source_label):<18} "
+                f"{row['gate_text']:<35} "
+                f"{row['angle']:>7.3f}"
+            )
+
+
+def plot_tfim_circuit_demo(result: TfimCircuitDemoResult) -> None:
+    import matplotlib.pyplot as plt
+
+    summary = tfim_circuit_demo_summary_rows(result)
+    learned = list(result.learned)
+    labels = [row["method"] for row in summary]
+    x = torch.arange(len(labels), dtype=torch.float32).numpy()
+    fidelities = [row["fidelity"] for row in summary]
+    angles = [row["total_local_angle"] for row in summary]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    axes[0].bar(x, fidelities, color="tab:blue")
+    axes[0].axhline(result.threshold, linestyle="--", linewidth=1, color="black")
+    axes[0].set_ylim(0.0, 1.02)
+    axes[0].set_ylabel("fidelity to exact exp(-iHt)")
+    axes[0].set_title("Exact-target fidelity")
+
+    axes[1].bar(x, angles, color="tab:orange")
+    axes[1].set_ylabel("total local angle A (rad)")
+    axes[1].set_title("Local-rotation budget")
+
+    angle_grid = torch.tensor(
+        [[su2_axis_angle(gate)[0] for gate in example.refined_gates] for example in learned],
+        dtype=torch.float32,
+    )
+    image = axes[2].imshow(angle_grid.numpy(), aspect="auto", cmap="viridis")
+    axes[2].set_yticks(range(len(learned)))
+    axes[2].set_yticklabels([example.label for example in learned])
+    axes[2].set_xticks(range(angle_grid.shape[1]))
+    axes[2].set_xticklabels([f"G{slot:02d}" for slot in range(angle_grid.shape[1])], rotation=90)
+    axes[2].set_title("Selected template-circuit local gates")
+    axes[2].set_xlabel("local gate slot")
+    fig.colorbar(image, ax=axes[2], label="rotation angle (rad)")
+
+    for axis in axes[:2]:
+        axis.set_xticks(x)
+        axis.set_xticklabels(labels, rotation=25, ha="right")
+
+    fig.suptitle(f"TFIM circuit demo: {result.target.name}")
+    fig.tight_layout()
+
+
+def save_tfim_circuit_demo_artifacts(
+    result: TfimCircuitDemoResult,
+    output_dir: str | Path,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Path]:
+    """Export the TFIM example-circuit summary, gate table, and figure."""
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    summary_rows = tfim_circuit_demo_summary_rows(result)
+    gate_rows = tfim_circuit_demo_gate_rows(result)
+    paths = {
+        "metadata": _write_json(
+            output / "metadata.json",
+            _artifact_metadata(
+                "tfim_circuit_demo",
+                metadata,
+                target=result.target.name,
+                template=result.template,
+                threshold=result.threshold,
+            ),
+        ),
+        "summary_csv": _write_csv(output / "summary.csv", summary_rows),
+        "summary_tex": _write_latex_table(
+            output / "summary.tex",
+            summary_rows,
+            caption="TFIM example-circuit comparison.",
+            label="tab:tfim-circuit-demo",
+        ),
+        "template_txt": _write_text(
+            output / "fixed_template.txt",
+            format_tfim_circuit_demo_template(result) + "\n",
+        ),
+        "gates_csv": _write_csv(output / "gates.csv", gate_rows),
+        "gates_tex": _write_latex_table(
+            output / "gates.tex",
+            gate_rows,
+            caption="Selected TFIM fixed-template local gates.",
+            label="tab:tfim-circuit-demo-gates",
+        ),
+    }
+    paths.update(
+        _plot_and_save(
+            output,
+            "tfim_circuit_demo",
+            lambda: plot_tfim_circuit_demo(result),
+        )
+    )
+    return paths
 
 
 def save_level3f_diversity_artifacts(
