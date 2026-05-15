@@ -287,6 +287,50 @@ def test_hamiltonian_skeleton_selector_labels_and_training_smoke() -> None:
     assert ranked["selector-0"][0].template in template_names
 
 
+def test_skeleton_selector_failed_cost_labels_fall_back_to_fidelity() -> None:
+    target = make_hamiltonian_target(
+        [("ZZI", 0.20), ("IZZ", 0.20)],
+        time=0.4,
+        name="selector-near-miss",
+        n_qubits=3,
+    )
+    template_names = ("local-0cz", "line-4cz")
+    max_slots = 15
+
+    def padded_identity(n_slots: int) -> torch.Tensor:
+        stack = torch.zeros(max_slots, 4)
+        stack[:, 0] = 1.0
+        stack[n_slots:, 0] = 1.0
+        return stack
+
+    def active_mask(n_slots: int) -> torch.Tensor:
+        mask = torch.zeros(max_slots, dtype=torch.bool)
+        mask[:n_slots] = True
+        return mask
+
+    dataset = SkeletonConditionedHamiltonianSolutionDataset(
+        targets=[target, target],
+        benchmarks=[],
+        refinements=[],
+        stacks=torch.stack([padded_identity(3), padded_identity(15)]),
+        template_ids=torch.tensor([0, 1], dtype=torch.long),
+        active_masks=torch.stack([active_mask(3), active_mask(15)]),
+        template_names=template_names,
+        initial_fidelities=torch.zeros(2),
+        refined_fidelities=torch.tensor([0.985, 0.989]),
+    )
+    high_cost = HamiltonianSkeletonCostConfig(cz_weight=0.015, local_gate_weight=0.0005, angle_weight=0.0)
+
+    labels = make_hamiltonian_skeleton_selector_labels(
+        dataset,
+        success_threshold=0.99,
+        cost_config=high_cost,
+    )
+
+    assert labels[0].template == "line-4cz"
+    assert not labels[0].is_success
+
+
 def test_parse_pauli_string_accepts_compact_and_subscript_notation():
     assert parse_pauli_string("XI", n_qubits=2) == ("X", "I")
     assert parse_pauli_string("X0", n_qubits=2) == ("X", "I")

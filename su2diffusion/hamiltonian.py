@@ -1853,7 +1853,9 @@ def make_hamiltonian_skeleton_selector_labels(
 
     With a cost configuration, the rule remains success-constrained when possible
     but ranks successful templates by a regularized score
-    ``refined_fidelity - hardware_cost``.
+    ``refined_fidelity - hardware_cost``. If no template succeeds for a target,
+    fall back to refined fidelity rather than regularized score, so cheap
+    low-fidelity near-misses do not become selector labels.
     """
 
     if not (0.0 <= success_threshold <= 1.0):
@@ -1902,15 +1904,29 @@ def make_hamiltonian_skeleton_selector_labels(
         current = best_by_target_template.get(key)
         if cost_config is None:
             is_better = current is None or candidate.refined_fidelity > current.refined_fidelity
-        else:
-            is_better = current is None or (
-                candidate.is_success,
+        elif current is None:
+            is_better = True
+        elif candidate.is_success != current.is_success:
+            is_better = candidate.is_success
+        elif candidate.is_success:
+            is_better = (
                 candidate.regularized_score,
                 candidate.refined_fidelity,
+                -candidate.hardware_cost,
             ) > (
-                current.is_success,
                 current.regularized_score,
                 current.refined_fidelity,
+                -current.hardware_cost,
+            )
+        else:
+            is_better = (
+                candidate.refined_fidelity,
+                candidate.regularized_score,
+                -candidate.hardware_cost,
+            ) > (
+                current.refined_fidelity,
+                current.regularized_score,
+                -current.hardware_cost,
             )
         if is_better:
             best_by_target_template[key] = candidate
@@ -1925,15 +1941,25 @@ def make_hamiltonian_skeleton_selector_labels(
         if not candidates:
             continue
         if cost_config is not None:
-            choice = max(
-                candidates,
-                key=lambda row: (
-                    row.is_success,
-                    row.regularized_score,
-                    row.refined_fidelity,
-                    -row.hardware_cost,
-                ),
-            )
+            successful = [row for row in candidates if row.is_success]
+            if successful:
+                choice = max(
+                    successful,
+                    key=lambda row: (
+                        row.regularized_score,
+                        row.refined_fidelity,
+                        -row.hardware_cost,
+                    ),
+                )
+            else:
+                choice = max(
+                    candidates,
+                    key=lambda row: (
+                        row.refined_fidelity,
+                        row.regularized_score,
+                        -row.hardware_cost,
+                    ),
+                )
         else:
             successful = [row for row in candidates if row.is_success]
             if successful:
