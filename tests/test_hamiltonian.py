@@ -425,6 +425,9 @@ def test_three_qubit_pauli_targets_and_template_composition():
 
 def test_three_qubit_template_library_has_line_depth_variants():
     expected = {
+        "local-0cz": (0, 3),
+        "line-1cz-01": (1, 6),
+        "line-1cz-12": (1, 6),
         "line-2cz-a": (2, 9),
         "line-2cz-b": (2, 9),
         "line-3cz-a": (3, 12),
@@ -440,6 +443,21 @@ def test_three_qubit_template_library_has_line_depth_variants():
         template = get_three_qubit_cz_template(name)
         assert len(template.edges) == n_edges
         assert template.n_slots == n_slots
+
+
+def test_local_zero_cz_template_is_single_local_layer():
+    local_units = torch.eye(2, dtype=torch.complex64).expand(3, 2, 2).clone()
+    x90 = torch.tensor(
+        [[2**-0.5, -1j * 2**-0.5], [-1j * 2**-0.5, 2**-0.5]],
+        dtype=torch.complex64,
+    )
+    local_units[0] = x90
+
+    composed = compose_three_qubit_template_units(local_units, "local-0cz")
+    identity = torch.eye(2, dtype=torch.complex64)
+    expected = torch.kron(torch.kron(x90, identity), identity)
+
+    assert torch.allclose(composed, expected, atol=1e-6)
 
 
 def test_three_qubit_template_benchmark_smoke(capsys):
