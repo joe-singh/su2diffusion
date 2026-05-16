@@ -103,6 +103,34 @@ class HamiltonianSkeletonCostConfig:
     local_gate_weight: float = 0.0005
     angle_weight: float = 0.001
 
+    @classmethod
+    def count_depolarizing(
+        cls,
+        *,
+        cz_error_probability: float = 0.01,
+        local_gate_error_probability: float = 0.001,
+    ) -> "HamiltonianSkeletonCostConfig":
+        """Build a count-only depolarizing survival-cost proxy.
+
+        The weight for a gate with depolarizing error probability ``p`` is
+        ``-log(1 - p)``, so the total cost is the negative log probability that
+        no depolarizing error occurs anywhere in the circuit.
+        """
+
+        return cls(
+            cz_weight=depolarizing_error_to_log_cost(cz_error_probability),
+            local_gate_weight=depolarizing_error_to_log_cost(local_gate_error_probability),
+            angle_weight=0.0,
+        )
+
+
+def depolarizing_error_to_log_cost(error_probability: float) -> float:
+    """Convert a depolarizing error probability into an additive log cost."""
+
+    if not (0.0 <= error_probability < 1.0):
+        raise ValueError("error_probability must satisfy 0 <= p < 1")
+    return -math.log1p(-float(error_probability))
+
 
 @dataclass(frozen=True)
 class HamiltonianSkeletonSelectorLabelRow:

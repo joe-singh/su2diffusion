@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from su2diffusion.circuit import CircuitExperimentConfig, CircuitTrainConfig
@@ -32,6 +34,7 @@ from su2diffusion.hamiltonian import (
     SkeletonConditionedHamiltonianSolutionDataset,
     compose_three_qubit_template_units,
     cz_on_qubits,
+    depolarizing_error_to_log_cost,
     estimate_hamiltonian_denoise_target_scale,
     evaluate_hamiltonian_conditioned_denoising,
     evaluate_hamiltonian_skeleton_conditioned_denoising,
@@ -331,6 +334,33 @@ def test_skeleton_selector_failed_cost_labels_fall_back_to_fidelity() -> None:
 
     assert labels[0].template == "line-4cz"
     assert not labels[0].is_success
+
+
+def test_hamiltonian_skeleton_count_depolarizing_cost_config() -> None:
+    config = HamiltonianSkeletonCostConfig.count_depolarizing(
+        cz_error_probability=0.01,
+        local_gate_error_probability=0.001,
+    )
+
+    assert config.angle_weight == 0.0
+    assert config.cz_weight == depolarizing_error_to_log_cost(0.01)
+    assert config.local_gate_weight == depolarizing_error_to_log_cost(0.001)
+
+    cost = hamiltonian_skeleton_hardware_cost(
+        n_cz=4,
+        n_slots=15,
+        local_angle_sum=123.0,
+        cost_config=config,
+    )
+    expected = 4 * -math.log1p(-0.01) + 15 * -math.log1p(-0.001)
+    assert math.isclose(cost, expected)
+
+    try:
+        depolarizing_error_to_log_cost(1.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected invalid depolarizing probability to fail")
 
 
 def test_parse_pauli_string_accepts_compact_and_subscript_notation():
