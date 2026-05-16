@@ -38,6 +38,7 @@ from su2diffusion.hamiltonian import (
     evaluate_hamiltonian_stack_predictor,
     format_hamiltonian_demo_circuit,
     format_su2_axis_angle,
+    format_three_qubit_template_gate_table,
     generate_skeleton_conditioned_hamiltonian_solution_dataset,
     generate_three_qubit_hamiltonian_solution_dataset,
     generate_hamiltonian_solution_dataset,
@@ -72,6 +73,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_repeatability_refinement,
     print_hamiltonian_repeatability_refinement_summary,
     print_hamiltonian_level1_headline_table,
+    print_three_qubit_template_gate_table,
     print_hamiltonian_conditioned_overfit_diagnostic,
     print_hamiltonian_conditioned_overfit_summary,
     print_hamiltonian_mixture_refinement_summary,
@@ -712,6 +714,28 @@ def test_su2_axis_angle_format_is_readable():
     assert "R(" in format_su2_axis_angle(x90)
     assert abs(angle - float(torch.pi / 2)) < 1e-5
     assert axis[0] > 0.99
+
+
+def test_three_qubit_template_gate_table_is_readable(capsys):
+    gates = torch.zeros(3, 4)
+    gates[:, 0] = 1.0
+    gates[0] = torch.tensor([2.0**-0.5, 2.0**-0.5, 0.0, 0.0])
+
+    text = format_three_qubit_template_gate_table(
+        gates,
+        template="local-0cz",
+        slot_labels=("X90", "I", "I"),
+        source_label="token",
+    )
+    print_three_qubit_template_gate_table(gates, template="local-0cz", source_label="token")
+
+    captured = capsys.readouterr().out
+    assert "local-0cz: L0" in text
+    assert "G00" in text
+    assert "L0 q0" in text
+    assert "X90" in text
+    assert "R(" in text
+    assert "G02" in captured
 
 
 def test_three_qubit_hamiltonian_token_training_budget_smoke(capsys):
