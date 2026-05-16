@@ -8,6 +8,7 @@ from .hamiltonian import (
     HamiltonianTarget,
     ThreeQubitCZTemplate,
     compose_three_qubit_template_units,
+    depolarizing_error_to_log_cost,
     get_three_qubit_cz_template,
     refine_three_qubit_template_candidate,
     synthesize_three_qubit_template_random_report,
@@ -30,6 +31,26 @@ class ParetoScoringConfig:
     local_gate_weight: float = 0.0005
     movement_weight: float = 0.04
     angle_weight: float = 0.001
+
+    @classmethod
+    def count_depolarizing(
+        cls,
+        *,
+        cz_error_probability: float = 0.01,
+        local_gate_error_probability: float = 0.001,
+    ) -> "ParetoScoringConfig":
+        """Build a count-only depolarizing survival-cost proxy.
+
+        This sets the CZ/local weights to ``-log(1 - p)`` and leaves movement
+        and angle weights at zero, matching a gate-count depolarizing model.
+        """
+
+        return cls(
+            cz_weight=depolarizing_error_to_log_cost(cz_error_probability),
+            local_gate_weight=depolarizing_error_to_log_cost(local_gate_error_probability),
+            movement_weight=0.0,
+            angle_weight=0.0,
+        )
 
 
 @dataclass(frozen=True)

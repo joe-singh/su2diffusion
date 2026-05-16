@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from su2diffusion import (
@@ -77,6 +79,26 @@ def test_pareto_hardware_cost_uses_all_terms() -> None:
     )
 
     assert cost == 0.1 * 4 + 0.01 * 15 + 0.5 * 0.2 + 0.05 * 3.0
+
+
+def test_pareto_count_depolarizing_scoring_uses_gate_counts_only() -> None:
+    scoring = ParetoScoringConfig.count_depolarizing(
+        cz_error_probability=0.01,
+        local_gate_error_probability=0.001,
+    )
+
+    cost = pareto_hardware_cost(
+        n_cz=4,
+        n_local_gates=15,
+        movement_mean=999.0,
+        local_angle_sum=999.0,
+        scoring=scoring,
+    )
+    expected = 4 * -math.log1p(-0.01) + 15 * -math.log1p(-0.001)
+
+    assert scoring.movement_weight == 0.0
+    assert scoring.angle_weight == 0.0
+    assert math.isclose(cost, expected)
 
 
 def test_frontier_rows_drop_dominated_candidates() -> None:
