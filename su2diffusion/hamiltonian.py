@@ -1045,6 +1045,9 @@ def run_hamiltonian_suite_benchmark(
 
 
 THREE_QUBIT_CZ_TEMPLATES: dict[str, tuple[tuple[int, int], ...]] = {
+    "local-0cz": (),
+    "line-1cz-01": ((0, 1),),
+    "line-1cz-12": ((1, 2),),
     "line-2cz-a": ((0, 1), (1, 2)),
     "line-2cz-b": ((1, 2), (0, 1)),
     "line-3cz-a": ((0, 1), (1, 2), (0, 1)),
@@ -1850,7 +1853,9 @@ def make_hamiltonian_skeleton_selector_labels(
 
     With a cost configuration, the rule remains success-constrained when possible
     but ranks successful templates by a regularized score
-    ``refined_fidelity - hardware_cost``.
+    ``refined_fidelity - hardware_cost``. If no template succeeds for a target,
+    fall back to refined fidelity rather than regularized score, so cheap
+    low-fidelity near-misses do not become selector labels.
     """
 
     if not (0.0 <= success_threshold <= 1.0):
@@ -1899,15 +1904,29 @@ def make_hamiltonian_skeleton_selector_labels(
         current = best_by_target_template.get(key)
         if cost_config is None:
             is_better = current is None or candidate.refined_fidelity > current.refined_fidelity
-        else:
-            is_better = current is None or (
-                candidate.is_success,
+        elif current is None:
+            is_better = True
+        elif candidate.is_success != current.is_success:
+            is_better = candidate.is_success
+        elif candidate.is_success:
+            is_better = (
                 candidate.regularized_score,
                 candidate.refined_fidelity,
+                -candidate.hardware_cost,
             ) > (
-                current.is_success,
                 current.regularized_score,
                 current.refined_fidelity,
+                -current.hardware_cost,
+            )
+        else:
+            is_better = (
+                candidate.refined_fidelity,
+                candidate.regularized_score,
+                -candidate.hardware_cost,
+            ) > (
+                current.refined_fidelity,
+                current.regularized_score,
+                -current.hardware_cost,
             )
         if is_better:
             best_by_target_template[key] = candidate
@@ -1922,15 +1941,25 @@ def make_hamiltonian_skeleton_selector_labels(
         if not candidates:
             continue
         if cost_config is not None:
-            choice = max(
-                candidates,
-                key=lambda row: (
-                    row.is_success,
-                    row.regularized_score,
-                    row.refined_fidelity,
-                    -row.hardware_cost,
-                ),
-            )
+            successful = [row for row in candidates if row.is_success]
+            if successful:
+                choice = max(
+                    successful,
+                    key=lambda row: (
+                        row.regularized_score,
+                        row.refined_fidelity,
+                        -row.hardware_cost,
+                    ),
+                )
+            else:
+                choice = max(
+                    candidates,
+                    key=lambda row: (
+                        row.refined_fidelity,
+                        row.regularized_score,
+                        -row.hardware_cost,
+                    ),
+                )
         else:
             successful = [row for row in candidates if row.is_success]
             if successful:
@@ -6548,6 +6577,79 @@ def format_hamiltonian_demo_circuit(result: HamiltonianDemoResult) -> str:
             a, b = result.template.edges[layer]
             lines.append(f"       CZ q{a}-q{b}")
     return "\n".join(lines)
+
+
+def format_three_qubit_template_gate_table(
+    gates: torch.Tensor,
+    template: str | ThreeQubitCZTemplate = "line-4cz",
+    *,
+    slot_labels: tuple[str | None, ...] | list[str | None] | None = None,
+    source_label: str | None = None,
+    precision: int = 3,
+) -> str:
+    """Format a three-qubit template stack as a G00/G01 local-gate table."""
+    template = _coerce_three_qubit_template(template)
+    gates = q_normalize(gates.detach())
+    if gates.ndim != 2 or gates.shape[-1] != 4:
+        raise ValueError("gates must have shape (n_slots, 4)")
+    if gates.shape[0] < template.n_slots:
+        raise ValueError(f"template {template.name!r} requires at least {template.n_slots} local gates")
+
+    gates = gates[: template.n_slots]
+    labels = tuple(slot_labels or ())
+    source = source_label if source_label is not None else "continuous"
+
+    n_layers = len(template.edges) + 1
+    lines = [
+        f"{template.name}: "
+        + " - ".join(
+            f"L{layer}" if layer == n_layers - 1 else f"L{layer} - CZ{a}{b}"
+            for layer, (a, b) in enumerate((*template.edges, (-1, -1)))
+        )
+    ]
+    for layer in range(n_layers):
+        entries = []
+        for qubit in range(template.n_qubits):
+            slot = layer * template.n_qubits + qubit
+            entries.append(f"q{qubit}={_demo_gate_name(slot)}")
+        lines.append(f"  L{layer}: " + "; ".join(entries))
+        if layer < len(template.edges):
+            a, b = template.edges[layer]
+            lines.append(f"       CZ q{a}-q{b}")
+
+    lines.append("")
+    header = "gate  slot    source label         refined local gate"
+    lines.append(header)
+    lines.append("-" * len(header))
+    for slot in range(template.n_slots):
+        label = labels[slot] if slot < len(labels) and labels[slot] is not None else source
+        gate = format_su2_axis_angle(gates[slot], precision=precision)
+        lines.append(
+            f"{_demo_gate_name(slot):<5} "
+            f"{_demo_slot_name(template, slot):<7} "
+            f"{str(label):<18} {gate}"
+        )
+    return "\n".join(lines)
+
+
+def print_three_qubit_template_gate_table(
+    gates: torch.Tensor,
+    template: str | ThreeQubitCZTemplate = "line-4cz",
+    *,
+    slot_labels: tuple[str | None, ...] | list[str | None] | None = None,
+    source_label: str | None = None,
+    precision: int = 3,
+) -> None:
+    """Print a readable G00/G01 table for an inferred three-qubit circuit."""
+    print(
+        format_three_qubit_template_gate_table(
+            gates,
+            template=template,
+            slot_labels=slot_labels,
+            source_label=source_label,
+            precision=precision,
+        )
+    )
 
 
 def print_hamiltonian_demo(result: HamiltonianDemoResult, max_slots: int | None = None) -> None:

@@ -38,6 +38,7 @@ from su2diffusion.hamiltonian import (
     evaluate_hamiltonian_stack_predictor,
     format_hamiltonian_demo_circuit,
     format_su2_axis_angle,
+    format_three_qubit_template_gate_table,
     generate_skeleton_conditioned_hamiltonian_solution_dataset,
     generate_three_qubit_hamiltonian_solution_dataset,
     generate_hamiltonian_solution_dataset,
@@ -72,6 +73,7 @@ from su2diffusion.hamiltonian import (
     print_hamiltonian_repeatability_refinement,
     print_hamiltonian_repeatability_refinement_summary,
     print_hamiltonian_level1_headline_table,
+    print_three_qubit_template_gate_table,
     print_hamiltonian_conditioned_overfit_diagnostic,
     print_hamiltonian_conditioned_overfit_summary,
     print_hamiltonian_mixture_refinement_summary,
@@ -287,6 +289,50 @@ def test_hamiltonian_skeleton_selector_labels_and_training_smoke() -> None:
     assert ranked["selector-0"][0].template in template_names
 
 
+def test_skeleton_selector_failed_cost_labels_fall_back_to_fidelity() -> None:
+    target = make_hamiltonian_target(
+        [("ZZI", 0.20), ("IZZ", 0.20)],
+        time=0.4,
+        name="selector-near-miss",
+        n_qubits=3,
+    )
+    template_names = ("local-0cz", "line-4cz")
+    max_slots = 15
+
+    def padded_identity(n_slots: int) -> torch.Tensor:
+        stack = torch.zeros(max_slots, 4)
+        stack[:, 0] = 1.0
+        stack[n_slots:, 0] = 1.0
+        return stack
+
+    def active_mask(n_slots: int) -> torch.Tensor:
+        mask = torch.zeros(max_slots, dtype=torch.bool)
+        mask[:n_slots] = True
+        return mask
+
+    dataset = SkeletonConditionedHamiltonianSolutionDataset(
+        targets=[target, target],
+        benchmarks=[],
+        refinements=[],
+        stacks=torch.stack([padded_identity(3), padded_identity(15)]),
+        template_ids=torch.tensor([0, 1], dtype=torch.long),
+        active_masks=torch.stack([active_mask(3), active_mask(15)]),
+        template_names=template_names,
+        initial_fidelities=torch.zeros(2),
+        refined_fidelities=torch.tensor([0.985, 0.989]),
+    )
+    high_cost = HamiltonianSkeletonCostConfig(cz_weight=0.015, local_gate_weight=0.0005, angle_weight=0.0)
+
+    labels = make_hamiltonian_skeleton_selector_labels(
+        dataset,
+        success_threshold=0.99,
+        cost_config=high_cost,
+    )
+
+    assert labels[0].template == "line-4cz"
+    assert not labels[0].is_success
+
+
 def test_parse_pauli_string_accepts_compact_and_subscript_notation():
     assert parse_pauli_string("XI", n_qubits=2) == ("X", "I")
     assert parse_pauli_string("X0", n_qubits=2) == ("X", "I")
@@ -425,6 +471,9 @@ def test_three_qubit_pauli_targets_and_template_composition():
 
 def test_three_qubit_template_library_has_line_depth_variants():
     expected = {
+        "local-0cz": (0, 3),
+        "line-1cz-01": (1, 6),
+        "line-1cz-12": (1, 6),
         "line-2cz-a": (2, 9),
         "line-2cz-b": (2, 9),
         "line-3cz-a": (3, 12),
@@ -440,6 +489,21 @@ def test_three_qubit_template_library_has_line_depth_variants():
         template = get_three_qubit_cz_template(name)
         assert len(template.edges) == n_edges
         assert template.n_slots == n_slots
+
+
+def test_local_zero_cz_template_is_single_local_layer():
+    local_units = torch.eye(2, dtype=torch.complex64).expand(3, 2, 2).clone()
+    x90 = torch.tensor(
+        [[2**-0.5, -1j * 2**-0.5], [-1j * 2**-0.5, 2**-0.5]],
+        dtype=torch.complex64,
+    )
+    local_units[0] = x90
+
+    composed = compose_three_qubit_template_units(local_units, "local-0cz")
+    identity = torch.eye(2, dtype=torch.complex64)
+    expected = torch.kron(torch.kron(x90, identity), identity)
+
+    assert torch.allclose(composed, expected, atol=1e-6)
 
 
 def test_three_qubit_template_benchmark_smoke(capsys):
@@ -650,6 +714,28 @@ def test_su2_axis_angle_format_is_readable():
     assert "R(" in format_su2_axis_angle(x90)
     assert abs(angle - float(torch.pi / 2)) < 1e-5
     assert axis[0] > 0.99
+
+
+def test_three_qubit_template_gate_table_is_readable(capsys):
+    gates = torch.zeros(3, 4)
+    gates[:, 0] = 1.0
+    gates[0] = torch.tensor([2.0**-0.5, 2.0**-0.5, 0.0, 0.0])
+
+    text = format_three_qubit_template_gate_table(
+        gates,
+        template="local-0cz",
+        slot_labels=("X90", "I", "I"),
+        source_label="token",
+    )
+    print_three_qubit_template_gate_table(gates, template="local-0cz", source_label="token")
+
+    captured = capsys.readouterr().out
+    assert "local-0cz: L0" in text
+    assert "G00" in text
+    assert "L0 q0" in text
+    assert "X90" in text
+    assert "R(" in text
+    assert "G02" in captured
 
 
 def test_three_qubit_hamiltonian_token_training_budget_smoke(capsys):
