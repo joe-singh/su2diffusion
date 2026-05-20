@@ -3205,7 +3205,8 @@ def sample_skeleton_conditioned_hamiltonian_reverse(
     max_batch_size: int | None = 8192,
     show_progress: bool = False,
     progress_desc: str | None = None,
-) -> torch.Tensor:
+    return_initial: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if not targets:
         raise ValueError("targets must contain at least one Hamiltonian target")
     if n_samples_per_target <= 0:
@@ -3237,10 +3238,11 @@ def sample_skeleton_conditioned_hamiltonian_reverse(
     identity[0] = 1.0
     betas, _, sigmas = schedule.tensors(device)
 
-    def sample_chunk(features: torch.Tensor) -> torch.Tensor:
+    def sample_chunk(features: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         n_chunk = features.shape[0]
         q_stack = sample_haar(n_chunk * n_slots, device=device).reshape(n_chunk, n_slots, 4)
         q_stack = torch.where(active_mask[None, :, None], q_stack, identity[None, None, :])
+        initial_stack = q_stack.detach().clone() if return_initial else None
         template_ids = torch.full((n_chunk,), template_id_value, device=device, dtype=torch.long)
         batch_mask = active_mask[None, :].expand(n_chunk, n_slots)
         for s in reversed(range(schedule.T)):
@@ -3267,6 +3269,8 @@ def sample_skeleton_conditioned_hamiltonian_reverse(
             q_stack = q_mul(q_stack, q_exp(update))
             q_stack = q_normalize(q_stack)
             q_stack = torch.where(active_mask[None, :, None], q_stack, identity[None, None, :])
+        if return_initial:
+            return q_stack, initial_stack
         return q_stack
 
     chunk_size = n_total if max_batch_size is None else min(max_batch_size, n_total)
@@ -3282,14 +3286,25 @@ def sample_skeleton_conditioned_hamiltonian_reverse(
         )
 
     sampled_chunks = []
+    initial_chunks = []
     for start in chunks:
         end = min(start + chunk_size, n_total)
         flat_ids = torch.arange(start, end, device=device)
         target_ids = torch.div(flat_ids, n_samples_per_target, rounding_mode="floor")
-        sampled_chunks.append(sample_chunk(target_features[target_ids]))
+        chunk = sample_chunk(target_features[target_ids])
+        if return_initial:
+            sampled_chunk, initial_chunk = chunk
+            sampled_chunks.append(sampled_chunk)
+            initial_chunks.append(initial_chunk)
+        else:
+            sampled_chunks.append(chunk)
 
     q_stack = torch.cat(sampled_chunks, dim=0)
-    return q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
+    q_stack = q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
+    if return_initial:
+        initial_stack = torch.cat(initial_chunks, dim=0).reshape(n_targets, n_samples_per_target, n_slots, 4)
+        return q_stack, initial_stack
+    return q_stack
 
 
 def run_hamiltonian_conditioned_diffusion_benchmark(
