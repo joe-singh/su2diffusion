@@ -665,6 +665,17 @@ def test_skeleton_conditioned_solution_dataset_train_and_sample_smoke():
         device="cpu",
         show_progress=False,
     )
+    samples_with_initial, initial_samples = sample_skeleton_conditioned_hamiltonian_reverse(
+        model,
+        config.schedule,
+        targets,
+        template="line-2cz-a",
+        n_samples_per_target=2,
+        eta=0.0,
+        device="cpu",
+        show_progress=False,
+        return_initial=True,
+    )
 
     assert dataset.stacks.shape == (2, 12, 4)
     assert dataset.active_masks.shape == (2, 12)
@@ -676,6 +687,11 @@ def test_skeleton_conditioned_solution_dataset_train_and_sample_smoke():
     assert line3_dataset.targets[0].name == targets[0].name
     assert len(losses) == 1
     assert samples.shape == (1, 2, 12, 4)
+    assert samples_with_initial.shape == samples.shape
+    assert initial_samples.shape == samples.shape
+    assert torch.allclose(initial_samples[..., :9, :].norm(dim=-1), torch.ones(1, 2, 9), atol=1e-5)
+    assert torch.allclose(initial_samples[..., 9:, 0], torch.ones(1, 2, 3), atol=1e-5)
+    assert torch.allclose(initial_samples[..., 9:, 1:], torch.zeros(1, 2, 3, 3), atol=1e-5)
     assert torch.allclose(samples[..., :9, :].norm(dim=-1), torch.ones(1, 2, 9), atol=1e-5)
     assert torch.allclose(samples[..., 9:, 0], torch.ones(1, 2, 3), atol=1e-5)
     assert torch.allclose(samples[..., 9:, 1:], torch.zeros(1, 2, 3, 3), atol=1e-5)
