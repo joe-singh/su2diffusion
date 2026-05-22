@@ -676,6 +676,17 @@ def test_skeleton_conditioned_solution_dataset_train_and_sample_smoke():
         show_progress=False,
         return_initial=True,
     )
+    samples_with_trajectory, trajectory = sample_skeleton_conditioned_hamiltonian_reverse(
+        model,
+        config.schedule,
+        targets,
+        template="line-2cz-a",
+        n_samples_per_target=2,
+        eta=0.0,
+        device="cpu",
+        show_progress=False,
+        trajectory_steps=(config.schedule.T, 1, 0),
+    )
 
     assert dataset.stacks.shape == (2, 12, 4)
     assert dataset.active_masks.shape == (2, 12)
@@ -689,6 +700,10 @@ def test_skeleton_conditioned_solution_dataset_train_and_sample_smoke():
     assert samples.shape == (1, 2, 12, 4)
     assert samples_with_initial.shape == samples.shape
     assert initial_samples.shape == samples.shape
+    assert samples_with_trajectory.shape == samples.shape
+    assert set(trajectory) == {config.schedule.T, 1, 0}
+    assert all(stack.shape == samples.shape for stack in trajectory.values())
+    assert torch.allclose(trajectory[0], samples_with_trajectory)
     assert torch.allclose(initial_samples[..., :9, :].norm(dim=-1), torch.ones(1, 2, 9), atol=1e-5)
     assert torch.allclose(initial_samples[..., 9:, 0], torch.ones(1, 2, 3), atol=1e-5)
     assert torch.allclose(initial_samples[..., 9:, 1:], torch.zeros(1, 2, 3, 3), atol=1e-5)

@@ -3206,7 +3206,13 @@ def sample_skeleton_conditioned_hamiltonian_reverse(
     show_progress: bool = False,
     progress_desc: str | None = None,
     return_initial: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    trajectory_steps: tuple[int, ...] | None = None,
+) -> (
+    torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, dict[int, torch.Tensor]]
+    | tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]
+):
     if not targets:
         raise ValueError("targets must contain at least one Hamiltonian target")
     if n_samples_per_target <= 0:
@@ -3237,12 +3243,20 @@ def sample_skeleton_conditioned_hamiltonian_reverse(
     identity = torch.zeros(4, dtype=torch.float32, device=device)
     identity[0] = 1.0
     betas, _, sigmas = schedule.tensors(device)
+    record_trajectory = trajectory_steps is not None
+    trajectory_step_values = tuple(dict.fromkeys(int(step) for step in (trajectory_steps or ())))
+    trajectory_step_set = set(trajectory_step_values)
+    if any(step < 0 or step > schedule.T for step in trajectory_step_set):
+        raise ValueError(f"trajectory_steps must be between 0 and schedule.T={schedule.T}")
 
-    def sample_chunk(features: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def sample_chunk(features: torch.Tensor) -> torch.Tensor | tuple:
         n_chunk = features.shape[0]
         q_stack = sample_haar(n_chunk * n_slots, device=device).reshape(n_chunk, n_slots, 4)
         q_stack = torch.where(active_mask[None, :, None], q_stack, identity[None, None, :])
         initial_stack = q_stack.detach().clone() if return_initial else None
+        trajectory = {} if record_trajectory else None
+        if record_trajectory and schedule.T in trajectory_step_set:
+            trajectory[schedule.T] = q_stack.detach().clone()
         template_ids = torch.full((n_chunk,), template_id_value, device=device, dtype=torch.long)
         batch_mask = active_mask[None, :].expand(n_chunk, n_slots)
         for s in reversed(range(schedule.T)):
@@ -3269,8 +3283,14 @@ def sample_skeleton_conditioned_hamiltonian_reverse(
             q_stack = q_mul(q_stack, q_exp(update))
             q_stack = q_normalize(q_stack)
             q_stack = torch.where(active_mask[None, :, None], q_stack, identity[None, None, :])
+            if record_trajectory and s in trajectory_step_set:
+                trajectory[s] = q_stack.detach().clone()
+        if return_initial and record_trajectory:
+            return q_stack, initial_stack, trajectory
         if return_initial:
             return q_stack, initial_stack
+        if record_trajectory:
+            return q_stack, trajectory
         return q_stack
 
     chunk_size = n_total if max_batch_size is None else min(max_batch_size, n_total)
@@ -3287,23 +3307,45 @@ def sample_skeleton_conditioned_hamiltonian_reverse(
 
     sampled_chunks = []
     initial_chunks = []
+    trajectory_chunks = {step: [] for step in trajectory_step_values} if record_trajectory else None
     for start in chunks:
         end = min(start + chunk_size, n_total)
         flat_ids = torch.arange(start, end, device=device)
         target_ids = torch.div(flat_ids, n_samples_per_target, rounding_mode="floor")
         chunk = sample_chunk(target_features[target_ids])
-        if return_initial:
+        if return_initial and record_trajectory:
+            sampled_chunk, initial_chunk, trajectory = chunk
+            sampled_chunks.append(sampled_chunk)
+            initial_chunks.append(initial_chunk)
+            for step in trajectory_step_values:
+                trajectory_chunks[step].append(trajectory[step])
+        elif return_initial:
             sampled_chunk, initial_chunk = chunk
             sampled_chunks.append(sampled_chunk)
             initial_chunks.append(initial_chunk)
+        elif record_trajectory:
+            sampled_chunk, trajectory = chunk
+            sampled_chunks.append(sampled_chunk)
+            for step in trajectory_step_values:
+                trajectory_chunks[step].append(trajectory[step])
         else:
             sampled_chunks.append(chunk)
 
     q_stack = torch.cat(sampled_chunks, dim=0)
     q_stack = q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
+    if record_trajectory:
+        trajectory = {
+            step: torch.cat(step_chunks, dim=0).reshape(n_targets, n_samples_per_target, n_slots, 4)
+            for step, step_chunks in trajectory_chunks.items()
+        }
+    if return_initial and record_trajectory:
+        initial_stack = torch.cat(initial_chunks, dim=0).reshape(n_targets, n_samples_per_target, n_slots, 4)
+        return q_stack, initial_stack, trajectory
     if return_initial:
         initial_stack = torch.cat(initial_chunks, dim=0).reshape(n_targets, n_samples_per_target, n_slots, 4)
         return q_stack, initial_stack
+    if record_trajectory:
+        return q_stack, trajectory
     return q_stack
 
 
