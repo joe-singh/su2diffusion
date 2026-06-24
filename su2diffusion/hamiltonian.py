@@ -3110,6 +3110,100 @@ def train_skeleton_conditioned_hamiltonian_token_diffusion(
     return model, losses
 
 
+def train_skeleton_conditioned_hamiltonian_euclidean_quaternion_diffusion(
+    dataset: SkeletonConditionedHamiltonianSolutionDataset,
+    train_config: CircuitTrainConfig | None = None,
+    schedule: DiffusionSchedule | None = None,
+    device: torch.device | str | None = None,
+    show_progress: bool = True,
+) -> tuple[SkeletonConditionedCircuitTokenDenoiser, list[float]]:
+    """Train a Euclidean DDPM baseline over quaternion coordinates.
+
+    This keeps the same Hamiltonian/template-conditioned token transformer used
+    by the Lie-group model, but replaces the SU(2) heat-kernel target with a
+    standard Euclidean epsilon-prediction objective in R^4 per local gate.
+    """
+
+    if not dataset.targets:
+        raise ValueError("dataset must contain at least one Hamiltonian target")
+    n_slots = _validate_solution_stacks(dataset.stacks)
+    if dataset.stacks.shape[0] != len(dataset.targets):
+        raise ValueError("dataset.stacks must contain one stack per Hamiltonian target")
+    if dataset.template_ids.shape != (dataset.stacks.shape[0],):
+        raise ValueError("dataset.template_ids must have one id per stack")
+    if dataset.active_masks.shape != dataset.stacks.shape[:2]:
+        raise ValueError("dataset.active_masks must have shape (n_stacks, n_slots)")
+
+    train_config = train_config or CircuitTrainConfig()
+    schedule = schedule or DiffusionSchedule()
+    device = torch.device(device) if device is not None else dataset.stacks.device
+    stacks = q_normalize(dataset.stacks.to(device=device))
+    features = hamiltonian_target_features(dataset.targets).to(device=device)
+    template_ids = dataset.template_ids.to(device=device)
+    active_masks = dataset.active_masks.to(device=device, dtype=torch.bool)
+    identity = torch.zeros(4, dtype=stacks.dtype, device=device)
+    identity[0] = 1.0
+
+    betas, _, _ = schedule.tensors(device)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+
+    torch.manual_seed(train_config.seed)
+    model = SkeletonConditionedCircuitTokenDenoiser(
+        T=schedule.T,
+        n_slots=n_slots,
+        num_templates=len(dataset.template_names),
+        target_dim=features.shape[1],
+        hidden=train_config.hidden,
+        output_dim=4,
+    ).to(device)
+    model.template_names = dataset.template_names
+    model.euclidean_quaternion_ddpm = True
+    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+
+    losses: list[float] = []
+    iterator = range(1, train_config.num_steps + 1)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(iterator, desc="Training Euclidean quaternion DDPM", dynamic_ncols=True)
+
+    for _ in iterator:
+        rows = torch.randint(
+            low=0,
+            high=stacks.shape[0],
+            size=(train_config.batch_size,),
+            device=device,
+        )
+        q0_stack = stacks[rows]
+        batch_features = features[rows]
+        batch_template_ids = template_ids[rows]
+        batch_mask = active_masks[rows]
+        t_idx = torch.randint(1, schedule.T + 1, (train_config.batch_size,), device=device)
+
+        alpha_bar_t = alpha_bars[t_idx - 1].view(-1, 1, 1)
+        noise = torch.randn_like(q0_stack)
+        noisy_stack = alpha_bar_t.sqrt() * q0_stack + (1.0 - alpha_bar_t).sqrt() * noise
+        noisy_stack = torch.where(batch_mask[:, :, None], noisy_stack, identity[None, None, :])
+        noise = noise * batch_mask[:, :, None].to(dtype=noise.dtype)
+
+        eps_pred = model(noisy_stack, t_idx, batch_features, batch_template_ids, batch_mask)
+        active = batch_mask[:, :, None].to(dtype=eps_pred.dtype)
+        loss = ((eps_pred - noise).square() * active).sum()
+        loss = loss / active.sum().mul(4.0).clamp_min(1.0)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        loss_value = float(loss.item())
+        losses.append(loss_value)
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix({"loss": f"{loss_value:.5f}"})
+
+    return model, losses
+
+
 def _predict_skeleton_conditioned_hamiltonian_eps(
     model: SkeletonConditionedCircuitTokenDenoiser,
     q_stack: torch.Tensor,
@@ -3119,6 +3213,17 @@ def _predict_skeleton_conditioned_hamiltonian_eps(
     active_mask: torch.Tensor,
 ) -> torch.Tensor:
     return model(q_stack, t_idx, features, template_ids, active_mask) * _eps_output_scale(model)
+
+
+def _predict_skeleton_conditioned_hamiltonian_euclidean_eps(
+    model: SkeletonConditionedCircuitTokenDenoiser,
+    q_stack: torch.Tensor,
+    t_idx: torch.Tensor,
+    features: torch.Tensor,
+    template_ids: torch.Tensor,
+    active_mask: torch.Tensor,
+) -> torch.Tensor:
+    return model(q_stack, t_idx, features, template_ids, active_mask)
 
 
 @torch.no_grad()
@@ -3305,6 +3410,118 @@ def sample_skeleton_conditioned_hamiltonian_reverse(
         initial_stack = torch.cat(initial_chunks, dim=0).reshape(n_targets, n_samples_per_target, n_slots, 4)
         return q_stack, initial_stack
     return q_stack
+
+
+@torch.no_grad()
+def sample_skeleton_conditioned_hamiltonian_euclidean_quaternion_reverse(
+    model: SkeletonConditionedCircuitTokenDenoiser,
+    schedule: DiffusionSchedule,
+    targets: list[HamiltonianTarget],
+    template: str | ThreeQubitCZTemplate,
+    n_samples_per_target: int = 1000,
+    device: torch.device | str | None = None,
+    max_batch_size: int | None = 8192,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+) -> torch.Tensor:
+    """Sample quaternion-gate stacks from a Euclidean DDPM baseline.
+
+    The reverse chain evolves unconstrained R^4 coordinates. The returned
+    stacks are normalized slotwise to unit quaternions so downstream fidelity
+    ranking and local refinement operate on valid SU(2) gates.
+    """
+
+    if not targets:
+        raise ValueError("targets must contain at least one Hamiltonian target")
+    if n_samples_per_target <= 0:
+        raise ValueError("n_samples_per_target must be positive")
+    if max_batch_size is not None and max_batch_size <= 0:
+        raise ValueError("max_batch_size must be positive when provided")
+    template = _coerce_three_qubit_template(template)
+    if template.n_slots > model.n_slots:
+        raise ValueError("template has more active slots than the Euclidean quaternion model")
+    template_names = tuple(getattr(model, "template_names", ()))
+    if not template_names:
+        raise ValueError("model is missing template_names metadata")
+    try:
+        template_id_value = template_names.index(template.name)
+    except ValueError as exc:
+        known = ", ".join(template_names)
+        raise ValueError(f"Template {template.name!r} was not in the training templates: {known}") from exc
+
+    device = torch.device(device) if device is not None else next(model.parameters()).device
+    n_targets = len(targets)
+    n_slots = model.n_slots
+    n_total = n_targets * n_samples_per_target
+    target_features = hamiltonian_target_features(targets).to(device=device)
+    if target_features.shape[1] != model.target_dim:
+        raise ValueError(f"Model expects {model.target_dim} Hamiltonian features, got {target_features.shape[1]}")
+
+    active_mask = _template_active_mask(template, n_slots, device=device)
+    identity = torch.zeros(4, dtype=torch.float32, device=device)
+    identity[0] = 1.0
+    betas, _, _ = schedule.tensors(device)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    posterior_variance = torch.empty_like(betas)
+    posterior_variance[0] = 0.0
+    posterior_variance[1:] = betas[1:] * (1.0 - alpha_bars[:-1]) / (1.0 - alpha_bars[1:]).clamp_min(1e-8)
+
+    def sample_chunk(features: torch.Tensor) -> torch.Tensor:
+        n_chunk = features.shape[0]
+        q_stack = torch.randn(n_chunk, n_slots, 4, device=device)
+        q_stack = torch.where(active_mask[None, :, None], q_stack, identity[None, None, :])
+        template_ids = torch.full((n_chunk,), template_id_value, device=device, dtype=torch.long)
+        batch_mask = active_mask[None, :].expand(n_chunk, n_slots)
+        active = batch_mask[:, :, None].to(dtype=q_stack.dtype)
+        for s in reversed(range(schedule.T)):
+            t_idx = torch.full((n_chunk,), s + 1, device=device, dtype=torch.long)
+            eps_pred = _predict_skeleton_conditioned_hamiltonian_euclidean_eps(
+                model,
+                q_stack,
+                t_idx,
+                features,
+                template_ids,
+                batch_mask,
+            )
+
+            beta = betas[s]
+            alpha = alphas[s]
+            alpha_bar = alpha_bars[s]
+            mean = (q_stack - beta * eps_pred / (1.0 - alpha_bar).sqrt().clamp_min(1e-8)) / alpha.sqrt()
+
+            if s > 0:
+                noise = torch.randn_like(q_stack)
+                q_stack = mean + posterior_variance[s].sqrt() * noise
+            else:
+                q_stack = mean
+            q_stack = torch.where(batch_mask[:, :, None], q_stack, identity[None, None, :])
+            q_stack = q_stack * active + identity[None, None, :] * (1.0 - active)
+
+        q_stack = q_normalize(q_stack)
+        return torch.where(active_mask[None, :, None], q_stack, identity[None, None, :])
+
+    chunk_size = n_total if max_batch_size is None else min(max_batch_size, n_total)
+    chunks = range(0, n_total, chunk_size)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        chunks = tqdm(
+            chunks,
+            total=(n_total + chunk_size - 1) // chunk_size,
+            desc=progress_desc or f"Sampling Euclidean quaternion DDPM {template.name}",
+            dynamic_ncols=True,
+        )
+
+    sampled_chunks = []
+    for start in chunks:
+        end = min(start + chunk_size, n_total)
+        flat_ids = torch.arange(start, end, device=device)
+        target_ids = torch.div(flat_ids, n_samples_per_target, rounding_mode="floor")
+        sampled_chunks.append(sample_chunk(target_features[target_ids]))
+
+    q_stack = torch.cat(sampled_chunks, dim=0)
+    return q_stack.reshape(n_targets, n_samples_per_target, n_slots, 4)
 
 
 def run_hamiltonian_conditioned_diffusion_benchmark(

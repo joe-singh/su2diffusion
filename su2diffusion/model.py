@@ -282,12 +282,15 @@ class SkeletonConditionedCircuitTokenDenoiser(nn.Module):
         num_layers: int = 4,
         num_heads: int = 4,
         ff_mult: int = 4,
+        output_dim: int = 3,
     ):
         super().__init__()
         if hidden % num_heads != 0:
             raise ValueError("hidden must be divisible by num_heads")
         if num_templates <= 0:
             raise ValueError("num_templates must be positive")
+        if output_dim <= 0:
+            raise ValueError("output_dim must be positive")
 
         self.T = T
         self.n_slots = n_slots
@@ -297,6 +300,7 @@ class SkeletonConditionedCircuitTokenDenoiser(nn.Module):
         self.hidden = hidden
         self.num_layers = num_layers
         self.num_heads = num_heads
+        self.output_dim = output_dim
 
         self.q_proj = nn.Linear(4, hidden)
         self.target_proj = nn.Linear(target_dim, hidden)
@@ -321,7 +325,7 @@ class SkeletonConditionedCircuitTokenDenoiser(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.SiLU(),
-            nn.Linear(hidden, 3),
+            nn.Linear(hidden, output_dim),
         )
 
     def forward(
@@ -362,7 +366,7 @@ class SkeletonConditionedCircuitTokenDenoiser(nn.Module):
         tokens = torch.cat([target_token[:, None, :], template_token[:, None, :], gate_tokens], dim=1)
 
         encoded = self.norm(self.encoder(tokens))
-        eps = self.head(encoded[:, 2:, :]).reshape(batch, self.n_slots, 3)
+        eps = self.head(encoded[:, 2:, :]).reshape(batch, self.n_slots, self.output_dim)
         return eps * active_mask[:, :, None].to(dtype=eps.dtype)
 
 
