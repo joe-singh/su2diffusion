@@ -52,4 +52,3 @@ Most experiment cells are disabled by default with a `RUN_EXPERIMENT_... = False
 
 - Full training/evaluation is intended for Colab or another GPU runtime.
 - The source package lives in `su2diffusion/`; tests live in `tests/`.
-- For a longer research-state log, see [`docs/project_context.md`](docs/project_context.md).
