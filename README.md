@@ -1,9 +1,12 @@
 # SU(2) Diffusion
 
-Toy diffusion experiments on `SU(2)` using a heat-kernel target.
+Lie-group diffusion experiments for hardware-aware quantum circuit synthesis.
 
-The repo is set up so the reusable math/model code lives in importable Python
-modules, while the notebook stays as a Colab runner for GPU experiments.
+For the paper experiments, open [`SU2GateExperiments.ipynb`](SU2GateExperiments.ipynb).
+That notebook has been trimmed to the runnable paper path only: local single-qubit
+gate setup, best-fidelity model training, held-out benchmarks, ablations, Pareto
+frontiers, diversity diagnostics, angle steering, and custom Hamiltonian inference.
+The reusable math/model code lives in the importable `su2diffusion` package.
 
 For a checkpoint of the current research state, architecture, benchmark results,
 and next steps, see [`docs/project_context.md`](docs/project_context.md).
