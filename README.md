@@ -27,7 +27,7 @@ To test a pull-request branch, temporarily replace `main` with that branch name.
 
 ## Paper Experiment Notebook
 
-Run order for a fresh Colab runtime:
+Run order for a fresh notebook runtime:
 
 1. Run the install/import setup cells.
 2. Train the local single-qubit gate generator to create `local_gates` and `local_labels`.
