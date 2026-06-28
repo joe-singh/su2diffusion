@@ -6,7 +6,7 @@ The public paper workflow is contained in one notebook:
 
 - [`SU2GateExperiments.ipynb`](SU2GateExperiments.ipynb)
 
-That notebook contains the local single-qubit gate setup plus the final paper experiments. Older exploratory notebooks have been removed from the root of the repo so the entry point is unambiguous.
+That notebook contains the local single-qubit gate setup plus the final paper experiments. 
 
 ## Setup
 
