@@ -1,6 +1,6 @@
-# SU(2) Diffusion
+# Lie Group Diffusion Models for Hardware-Aware Quantum Circuit Synthesis
 
-Lie-group diffusion experiments for hardware-aware quantum circuit synthesis.
+The code repository for the [paper](https://arxiv.org/abs/2606.29636).
 
 The public paper workflow is contained in one notebook:
 
